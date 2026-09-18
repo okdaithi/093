@@ -1,0 +1,79 @@
+# headliner source configuration.
+#
+# settings: global knobs applied to every source.
+# sources:  the sites to fetch. `type: rss` covers RSS and Atom feeds and needs
+#           only a `url`. `type: html` scrapes a listing page and needs CSS
+#           selectors — see the README section "Adding a new HTML source".
+
+settings:
+  # Seconds to wait for a single HTTP response before treating it as a timeout.
+  request_timeout: 15
+
+  # Minimum gap between two requests to the same domain. Be polite; a site's
+  # robots.txt Crawl-delay is honoured too when it asks for longer.
+  rate_limit_seconds: 1.0
+
+  # Identify yourself. Replace the contact address with your own before running
+  # this against anyone's servers at volume.
+  user_agent: "headliner/0.1 (+https://github.com/okdaithi/093; contact: you@example.com)"
+
+  # Cap on headlines kept per source per run.
+  max_items_per_source: 50
+
+  # How many sources to fetch at once. The per-domain rate limit still applies.
+  concurrency: 5
+
+sources:
+  - name: ABC News AU
+    url: https://www.abc.net.au/news/feed/51120/rss.xml
+    type: rss
+
+  - name: The Guardian AU
+    url: https://www.theguardian.com/au/rss
+    type: rss
+
+  # Reuters has wound down public RSS; this agency feed is the surviving one and
+  # may go away. Disable it rather than tolerating a permanent failure.
+  - name: Reuters World
+    url: https://www.reutersagency.com/feed/?best-topics=world&post_type=best
+    type: rss
+
+  - name: BBC News
+    url: https://feeds.bbci.co.uk/news/rss.xml
+    type: rss
+
+  - name: RTE News
+    url: https://www.rte.ie/feeds/rss/?index=/news/
+    type: rss
+
+  - name: Irish Times
+    url: https://www.irishtimes.com/arc/outboundfeeds/feed-irish-news/
+    type: rss
+
+  # AP retired its public RSS feeds; this is a community mirror, so treat it as
+  # less reliable than the first-party feeds above.
+  - name: AP News
+    url: https://rsshub.app/apnews/topics/apf-topnews
+    type: rss
+
+  - name: Al Jazeera
+    url: https://www.aljazeera.com/xml/rss/all.xml
+    type: rss
+
+  - name: NPR News
+    url: https://feeds.npr.org/1001/rss.xml
+    type: rss
+
+  - name: Sky News
+    url: https://feeds.skynews.com/feeds/rss/world.xml
+    type: rss
+
+  # An HTML source, so that code path is exercised by a real site. Text Media
+  # (the "lite" front page of a large newsroom) is stable, markup-light and
+  # explicitly published for low-bandwidth readers.
+  - name: NPR Text
+    url: https://text.npr.org/
+    type: html
+    article_selector: ".topic-container li"
+    title_selector: "a"
+    link_selector: "a"

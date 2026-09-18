@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Example Wire — Text Edition</title>
+</head>
+<body>
+  <header>
+    <h1>Example Wire</h1>
+    <nav><a href="/">Home</a> <a href="/about">About</a></nav>
+  </header>
+
+  <main>
+    <!-- Mirrors the shape of a low-bandwidth text edition front page:
+         a flat list of links, one per story. -->
+    <ul class="topic-container">
+      <li>
+        <a href="/story/1234/council-approves-new-tram-line">Council approves new tram line after decade of debate</a>
+        <time datetime="2025-03-04T09:00:00+00:00">4 March 2025</time>
+        <p class="teaser">Construction is due to begin in the autumn.</p>
+      </li>
+      <li>
+        <a href="https://example.org/story/5678/ferry-service-restored">Ferry service restored following engine repairs</a>
+        <time datetime="2025-03-04T06:30:00Z">4 March 2025</time>
+        <p class="teaser">Sailings resume on the morning timetable.</p>
+      </li>
+      <li>
+        <a href="/story/9012/budget-surplus-forecast">Budget surplus forecast revised   upward   again</a>
+        <time datetime="2025-03-03T17:45:00+00:00">3 March 2025</time>
+        <p class="teaser">Treasury cites stronger-than-expected receipts &amp; lower outlays.</p>
+      </li>
+      <li>
+        <!-- Duplicate of the first story; the parser must keep only one. -->
+        <a href="/story/1234/council-approves-new-tram-line">Council approves new tram line after decade of debate</a>
+        <time datetime="2025-03-04T09:00:00+00:00">4 March 2025</time>
+      </li>
+      <li>
+        <a href="/story/3456/short">More</a>
+        <time datetime="2025-03-03T10:00:00+00:00">3 March 2025</time>
+      </li>
+      <li>
+        <a href="#skip-to-content">Anchor-only link that must be ignored entirely</a>
+      </li>
+      <li>
+        <span>A list item with no anchor at all</span>
+      </li>
+    </ul>
+
+    <!-- Outside article_selector: must never be picked up. -->
+    <ul class="site-footer-links">
+      <li><a href="/terms">Terms and conditions of use</a></li>
+    </ul>
+  </main>
+</body>
+</html>

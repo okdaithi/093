@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel>
+    <title>Example Wire — Top Stories</title>
+    <link>https://example.org/news</link>
+    <description>Synthetic feed used by the headliner test suite.</description>
+    <language>en-GB</language>
+    <lastBuildDate>Tue, 04 Mar 2025 09:15:00 GMT</lastBuildDate>
+
+    <item>
+      <title>Parliament passes long-delayed housing bill</title>
+      <link>https://example.org/news/housing-bill?utm_source=rss&amp;utm_medium=feed</link>
+      <description>&lt;p&gt;The bill clears its final stage after   three years of
+      wrangling &amp;amp; two collapsed votes.&lt;/p&gt;</description>
+      <pubDate>Tue, 04 Mar 2025 08:30:00 GMT</pubDate>
+      <guid isPermaLink="true">https://example.org/news/housing-bill</guid>
+      <dc:creator>A Reporter</dc:creator>
+    </item>
+
+    <item>
+      <title>Storm warning issued for the western seaboard</title>
+      <link>https://example.org/news/storm-warning</link>
+      <description>Gusts of up to 120km/h are forecast overnight.</description>
+      <pubDate>Tue, 04 Mar 2025 07:05:00 +0000</pubDate>
+      <guid isPermaLink="true">https://example.org/news/storm-warning</guid>
+    </item>
+
+    <item>
+      <title>Relative link should resolve against the feed URL</title>
+      <link>/news/relative-story</link>
+      <description>This item deliberately uses a path-only link.</description>
+      <pubDate>Mon, 03 Mar 2025 22:45:00 GMT</pubDate>
+    </item>
+
+    <item>
+      <title>&amp;amp;quot;Double-escaped&amp;amp;quot; entities &amp;amp; extra   spacing</title>
+      <link>https://example.org/news/entities</link>
+      <description>Checks entity unescaping and whitespace collapsing.</description>
+      <pubDate>Mon, 03 Mar 2025 18:00:00 GMT</pubDate>
+    </item>
+
+    <item>
+      <title>Too short</title>
+      <link>https://example.org/news/too-short</link>
+      <description>Below the minimum title length, so it must be dropped.</description>
+      <pubDate>Mon, 03 Mar 2025 12:00:00 GMT</pubDate>
+    </item>
+
+    <item>
+      <title>Item with no link at all, which must be dropped</title>
+      <description>No link element and no permalink guid.</description>
+      <pubDate>Mon, 03 Mar 2025 11:00:00 GMT</pubDate>
+    </item>
+
+    <item>
+      <title>Undated story that still has a usable link</title>
+      <link>https://example.org/news/undated</link>
+      <description>No pubDate, so published_at should come back as None.</description>
+    </item>
+  </channel>
+</rss>
