@@ -39,6 +39,37 @@ instead — the HTML parser falls back to it automatically:
 pip install -e '.[bs4]'
 ```
 
+## Deploy on Ubuntu
+
+The deployment files install Headliner as a `systemd` oneshot service that runs
+four times daily (00:00, 06:00, 12:00 and 18:00 in the server's local timezone),
+with up to five minutes of timer jitter. No inbound ports or web server are
+required.
+
+On an Ubuntu 24.04 server, clone the repository and run:
+
+```bash
+sudo bash deploy/install-ubuntu.sh
+```
+
+The installer creates a restricted `headliner` system account, a Python virtual
+environment in `/opt/headliner/venv`, a persistent database at
+`/var/lib/headliner/headlines.db`, and installs the service and timer units. It
+does not enable the timer automatically. First replace `you@example.com` in
+`/etc/headliner/sources.yaml` with a monitored contact address, then enable the
+schedule and optionally perform the initial run:
+
+```bash
+sudoedit /etc/headliner/sources.yaml
+sudo systemctl enable --now headliner.timer
+sudo systemctl start headliner.service
+```
+
+Inspect timer state with `systemctl list-timers headliner.timer` and logs with
+`journalctl -u headliner.service`. To deploy an update, rerun
+`sudo bash deploy/install-ubuntu.sh` from the updated checkout; it preserves the
+server's existing source configuration and database.
+
 ## Quickstart
 
 ```bash

@@ -1,0 +1,58 @@
+# Production defaults for the six-hour systemd deployment.
+# Replace the contact address before enabling the timer.
+settings:
+  request_timeout: 20
+  rate_limit_seconds: 2
+  user_agent: "headliner/0.1 (+https://github.com/okdaithi/093; contact: you@example.com)"
+  max_items_per_source: 50
+  concurrency: 3
+
+sources:
+  - name: ABC News AU
+    url: https://www.abc.net.au/news/feed/51120/rss.xml
+    type: rss
+
+  - name: The Guardian AU
+    url: https://www.theguardian.com/au/rss
+    type: rss
+
+  # Reuters has wound down public RSS; this agency feed may go away.
+  - name: Reuters World
+    url: https://www.reutersagency.com/feed/?best-topics=world&post_type=best
+    type: rss
+
+  - name: BBC News
+    url: https://feeds.bbci.co.uk/news/rss.xml
+    type: rss
+
+  - name: RTE News
+    url: https://www.rte.ie/feeds/rss/?index=/news/
+    type: rss
+
+  - name: Irish Times
+    url: https://www.irishtimes.com/arc/outboundfeeds/feed-irish-news/
+    type: rss
+
+  # AP retired its public RSS feeds; this is a community mirror.
+  - name: AP News
+    url: https://rsshub.app/apnews/topics/apf-topnews
+    type: rss
+
+  - name: Al Jazeera
+    url: https://www.aljazeera.com/xml/rss/all.xml
+    type: rss
+
+  - name: NPR News
+    url: https://feeds.npr.org/1001/rss.xml
+    type: rss
+
+  - name: Sky News
+    url: https://feeds.skynews.com/feeds/rss/world.xml
+    type: rss
+
+  - name: NPR Text
+    url: https://text.npr.org/
+    type: html
+    article_selector: ".topic-container li"
+    title_selector: "a"
+    link_selector: "a"
