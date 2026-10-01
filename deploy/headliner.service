@@ -1,0 +1,23 @@
+[Unit]
+Description=Fetch news headlines
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=headliner
+Group=headliner
+StateDirectory=headliner
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/headliner
+ExecStart=/opt/headliner/venv/bin/headliner fetch --sources /etc/headliner/sources.yaml --db /var/lib/headliner/headlines.db
+UMask=0077
+TimeoutStartSec=30min
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
