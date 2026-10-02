@@ -3,20 +3,26 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from headliner import store
 from headliner.models import Headline, utcnow
 from headliner.store import (
+    SCHEMA_VERSION,
     connect,
     has_fts,
     insert_headlines,
     list_headlines,
+    list_title_changes,
     migrate,
     record_fetch,
     search_headlines,
     source_status,
+    store_headlines,
+    upgrade_plan,
 )
 
 
@@ -34,6 +40,13 @@ def make_headline(
         url=url,
         published_at=published_at or datetime(2025, 3, 4, 9, 0, tzinfo=UTC),
         summary=summary,
+    )
+
+
+def without_fts5(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make `migrate` behave as on an SQLite build that lacks FTS5."""
+    monkeypatch.setattr(
+        store, "_FTS_SCHEMA", "CREATE VIRTUAL TABLE headlines_fts USING no_such_module(title);"
     )
 
 
@@ -164,38 +177,26 @@ def test_search_handles_punctuation_and_empty_queries(conn: sqlite3.Connection) 
     assert search_headlines(conn, "   ") == []
 
 
-def test_search_like_fallback_matches_fts(conn: sqlite3.Connection, tmp_path: Path) -> None:
+def test_search_like_fallback_matches_fts(
+    conn: sqlite3.Connection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     insert_headlines(conn, [make_headline(title="Ferry service restored today")])
     assert has_fts(conn)
 
     # Rebuild the same data without the FTS index to exercise the LIKE path.
-    plain = connect(tmp_path / "plain.db", migrate_schema=False)
-    plain.executescript(
-        """
-        CREATE TABLE headlines (
-            id INTEGER PRIMARY KEY, source TEXT NOT NULL, title TEXT NOT NULL,
-            url TEXT NOT NULL, published_at TEXT, fetched_at TEXT NOT NULL,
-            summary TEXT, content_hash TEXT NOT NULL UNIQUE
-        );
-        """
-    )
+    without_fts5(monkeypatch)
+    plain = connect(tmp_path / "plain.db")
     assert not has_fts(plain)
     insert_headlines(plain, [make_headline(title="Ferry service restored today")])
     assert [h.title for h in search_headlines(plain, "ferry")] == ["Ferry service restored today"]
     plain.close()
 
 
-def test_search_like_fallback_escapes_wildcards(conn: sqlite3.Connection, tmp_path: Path) -> None:
-    plain = connect(tmp_path / "plain2.db", migrate_schema=False)
-    plain.executescript(
-        """
-        CREATE TABLE headlines (
-            id INTEGER PRIMARY KEY, source TEXT NOT NULL, title TEXT NOT NULL,
-            url TEXT NOT NULL, published_at TEXT, fetched_at TEXT NOT NULL,
-            summary TEXT, content_hash TEXT NOT NULL UNIQUE
-        );
-        """
-    )
+def test_search_like_fallback_escapes_wildcards(
+    conn: sqlite3.Connection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    without_fts5(monkeypatch)
+    plain = connect(tmp_path / "plain2.db")
     insert_headlines(plain, [make_headline(title="A perfectly ordinary headline")])
     assert search_headlines(plain, "%") == []
     plain.close()
@@ -243,3 +244,225 @@ def test_connect_creates_parent_directories(tmp_path: Path) -> None:
     connection = connect(nested)
     connection.close()
     assert nested.exists()
+
+
+# --------------------------------------------------------------------------
+# title history
+# --------------------------------------------------------------------------
+
+STORY_URL = "https://example.org/news/quarantine-centre"
+T0 = datetime(2025, 3, 4, 9, 0, tzinfo=UTC)
+
+
+def seen(title: str, at: datetime, url: str = STORY_URL, source: str = "Example Wire") -> Headline:
+    return Headline.create(source=source, title=title, url=url, published_at=T0, fetched_at=at)
+
+
+def revision_titles(conn: sqlite3.Connection) -> list[str]:
+    rows = conn.execute("SELECT title FROM headline_revisions ORDER BY seen_at, id").fetchall()
+    return [row[0] for row in rows]
+
+
+def test_retitled_article_keeps_one_row_and_records_history(conn: sqlite3.Connection) -> None:
+    first = store_headlines(conn, [seen("Quarantine centre to become a prison", T0)])
+    second = store_headlines(
+        conn, [seen("Is this white elephant about to become a prison?", T0 + timedelta(hours=6))]
+    )
+
+    assert (first.new, first.retitled) == (1, 0)
+    assert (second.new, second.retitled) == (0, 1)
+    assert conn.execute("SELECT COUNT(*) FROM headlines").fetchone()[0] == 1
+    [current] = list_headlines(conn)
+    assert current.title == "Is this white elephant about to become a prison?"
+    assert revision_titles(conn) == [
+        "Quarantine centre to become a prison",
+        "Is this white elephant about to become a prison?",
+    ]
+
+
+def test_case_only_change_is_not_a_retitle(conn: sqlite3.Connection) -> None:
+    store_headlines(conn, [seen("Council approves the new tram line", T0)])
+    result = store_headlines(conn, [seen("COUNCIL APPROVES THE NEW TRAM LINE", T0)])
+    assert (result.new, result.retitled) == (0, 0)
+    assert len(revision_titles(conn)) == 1
+
+
+def test_title_flipping_back_updates_current_but_not_history(conn: sqlite3.Connection) -> None:
+    store_headlines(conn, [seen("First wording of the story", T0)])
+    store_headlines(conn, [seen("Second wording of the story", T0 + timedelta(hours=1))])
+    back = store_headlines(conn, [seen("First wording of the story", T0 + timedelta(hours=2))])
+
+    assert back.retitled == 0
+    assert list_headlines(conn)[0].title == "First wording of the story"
+    assert revision_titles(conn) == ["First wording of the story", "Second wording of the story"]
+
+
+def test_search_finds_the_current_title(conn: sqlite3.Connection) -> None:
+    store_headlines(conn, [seen("Ferry cancelled by storm", T0)])
+    store_headlines(conn, [seen("Ferry service restored after storm", T0 + timedelta(hours=1))])
+    assert [h.title for h in search_headlines(conn, "restored")] == [
+        "Ferry service restored after storm"
+    ]
+    assert search_headlines(conn, "cancelled") == []
+
+
+def test_list_title_changes_reports_old_and_new(conn: sqlite3.Connection) -> None:
+    later = T0 + timedelta(hours=6)
+    store_headlines(conn, [seen("Original headline wording", T0)])
+    store_headlines(conn, [seen("Rewritten headline wording", later)])
+    other = "https://example.org/other"
+    store_headlines(conn, [seen("Untouched other headline", T0, url=other, source="Other")])
+
+    [change] = list_title_changes(conn)
+    assert change.source == "Example Wire"
+    assert change.url == STORY_URL
+    assert change.changed_at == later
+    assert (change.old_title, change.new_title) == (
+        "Original headline wording",
+        "Rewritten headline wording",
+    )
+    assert list_title_changes(conn, since=later + timedelta(minutes=1)) == []
+    assert list_title_changes(conn, source="other") == []
+    assert len(list_title_changes(conn, source="EXAMPLE WIRE")) == 1
+
+
+def test_fresh_database_is_at_current_schema(tmp_path: Path) -> None:
+    path = tmp_path / "fresh.db"
+    connection = connect(path)
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    indexes = {row[1] for row in connection.execute("PRAGMA index_list(headlines)").fetchall()}
+    assert "idx_headlines_url" in indexes
+    connection.close()
+    assert not list(tmp_path.glob("*.bak"))
+
+
+# --------------------------------------------------------------------------
+# upgrade from schema 0 (dedup on url + title)
+# --------------------------------------------------------------------------
+
+_V0_SCHEMA = """
+CREATE TABLE headlines (
+    id INTEGER PRIMARY KEY, source TEXT NOT NULL, title TEXT NOT NULL,
+    url TEXT NOT NULL, published_at TEXT, fetched_at TEXT NOT NULL,
+    summary TEXT, content_hash TEXT NOT NULL UNIQUE
+);
+CREATE TABLE fetch_log (
+    id INTEGER PRIMARY KEY, source TEXT NOT NULL, started_at TEXT NOT NULL,
+    finished_at TEXT NOT NULL, status TEXT NOT NULL,
+    items_found INTEGER NOT NULL DEFAULT 0, items_new INTEGER NOT NULL DEFAULT 0, error TEXT
+);
+"""
+
+
+def make_v0_db(path: Path, headlines: list[Headline]) -> None:
+    """A database as the pre-history release left it: one row per url + title."""
+    with closing(sqlite3.connect(path)) as legacy:
+        legacy.executescript(_V0_SCHEMA)
+        legacy.executescript(store._FTS_SCHEMA)
+        legacy.executemany(
+            "INSERT INTO headlines (source, title, url, published_at, fetched_at, summary,"
+            " content_hash) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    h.source,
+                    h.title,
+                    h.url,
+                    h.published_at.isoformat() if h.published_at else None,
+                    h.fetched_at.isoformat(),
+                    h.summary,
+                    h.content_hash,
+                )
+                for h in headlines
+            ],
+        )
+        legacy.commit()
+
+
+V0_ROWS = [
+    seen("Quarantine centre to become a prison", T0),
+    seen("Unrelated story that never changed", T0, url="https://example.org/other"),
+    seen("Is this white elephant about to become a prison?", T0 + timedelta(hours=6)),
+    seen("White elephant centre will become WA's newest prison", T0 + timedelta(hours=12)),
+]
+
+
+def test_upgrade_plan_describes_v0_without_changing_it(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    make_v0_db(path, V0_ROWS)
+    with closing(connect(path, migrate_schema=False)) as legacy:
+        plan = upgrade_plan(legacy)
+        assert legacy.execute("PRAGMA user_version").fetchone()[0] == 0
+    assert plan.needed
+    assert (plan.headlines, plan.merged_urls, plan.rows_merged) == (4, 1, 2)
+
+
+def test_upgrade_from_v0_merges_rows_into_history(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    make_v0_db(path, V0_ROWS)
+
+    upgraded = connect(path)
+
+    assert upgraded.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert upgraded.execute("SELECT COUNT(*) FROM headlines").fetchone()[0] == 2
+    story = upgraded.execute(
+        "SELECT id, title, fetched_at FROM headlines WHERE url = ?", (STORY_URL,)
+    ).fetchone()
+    # The earliest row survives, carrying the latest title.
+    assert story["title"] == "White elephant centre will become WA's newest prison"
+    assert story["fetched_at"] == T0.isoformat()
+    assert len(revision_titles(upgraded)) == 4
+    assert [c.new_title for c in list_title_changes(upgraded)] == [
+        "White elephant centre will become WA's newest prison",
+        "Is this white elephant about to become a prison?",
+    ]
+    # The FTS index followed the deletes and the title update.
+    assert [h.title for h in search_headlines(upgraded, "newest")] == [story["title"]]
+    assert search_headlines(upgraded, "quarantine") == []
+    # fetch_log gained the new counter, and a URL is now unique.
+    store_headlines(upgraded, [seen("Another rewrite of the prison story", T0 + timedelta(days=1))])
+    record_fetch(
+        upgraded,
+        source="Example Wire",
+        started_at=T0,
+        finished_at=T0,
+        status="ok",
+        items_found=1,
+        items_new=0,
+        items_changed=1,
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        upgraded.execute(
+            "INSERT INTO headlines (source, title, url, fetched_at, content_hash)"
+            " VALUES ('x', 'y', ?, 'z', 'unique-hash')",
+            (STORY_URL,),
+        )
+    upgraded.close()
+
+    backup = tmp_path / "legacy.db.pre-v1.bak"
+    with closing(sqlite3.connect(backup)) as original:
+        assert original.execute("SELECT COUNT(*) FROM headlines").fetchone()[0] == 4
+        assert original.execute("PRAGMA user_version").fetchone()[0] == 0
+
+
+def test_upgrade_is_applied_once(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    make_v0_db(path, V0_ROWS)
+    connect(path).close()
+    backup = tmp_path / "legacy.db.pre-v1.bak"
+    stamp = backup.stat().st_mtime_ns
+
+    again = connect(path)
+    migrate(again)
+    assert again.execute("SELECT COUNT(*) FROM headline_revisions").fetchone()[0] == 4
+    assert not upgrade_plan(again).needed
+    again.close()
+    assert backup.stat().st_mtime_ns == stamp
+
+
+def test_upgrade_without_duplicates_takes_no_backup(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    make_v0_db(path, V0_ROWS[:2])
+    upgraded = connect(path)
+    assert revision_titles(upgraded) == [V0_ROWS[0].title, V0_ROWS[1].title]
+    upgraded.close()
+    assert not list(tmp_path.glob("*.bak"))

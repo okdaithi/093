@@ -11,7 +11,8 @@ download article bodies and is not a way around a paywall.
 - `robots.txt` is checked and cached per domain; disallowed paths are skipped
 - Retries on 429/5xx/timeouts with exponential backoff, jitter and `Retry-After`;
   a `Retry-After` longer than 30s skips the source until the next run
-- Idempotent storage: re-running never duplicates a headline
+- Idempotent storage: one row per article URL; re-running never duplicates a headline
+- Headline rewrites are kept: every distinct title an article carries is recorded
 - One failing source never aborts the run
 
 ## Requirements
@@ -98,6 +99,9 @@ headliner search "interest rates"
 
 # Which sources are configured and when each last worked
 headliner sources
+
+# Headlines that outlets rewrote after publication, over the last week
+headliner changes --since 7d
 ```
 
 Logs go to stderr, data goes to stdout, so piping works:
@@ -114,6 +118,8 @@ headliner list --since 6h --format json 2>/dev/null | jq '.[].title'
 | `headliner list` | Print stored headlines, newest first |
 | `headliner search QUERY` | Search stored titles and summaries |
 | `headliner sources` | Show each configured source with its last successful fetch and item count |
+| `headliner changes` | List headlines that were rewritten after publication, newest first |
+| `headliner migrate` | Upgrade the database schema (runs automatically; `--dry-run` previews) |
 
 Shared flags: `--sources PATH` (default `sources.yaml`), `--db PATH` (default
 `headlines.db`), `--verbose` for DEBUG logging, `--quiet` for errors only.
@@ -139,6 +145,14 @@ Shared flags: `--sources PATH` (default `sources.yaml`), `--db PATH` (default
 reads the database.
 
 **`sources`** takes `--format table|json`.
+
+**`changes`** takes the same `--since`, `--source`, `--limit` and `--format` flags
+as `list`, and needs no config file. Each row is one rewrite: the previous title,
+the new one, and when the new one was first seen.
+
+**`migrate`** upgrades an older database to the current schema. Every command
+does this on open, so running it by hand is only needed to preview an upgrade
+with `--dry-run`. See [Schema upgrades](#schema-upgrades).
 
 ### Exit codes
 
@@ -273,15 +287,29 @@ migration and is safe to re-run.
 **`headlines`** — `source`, `title`, `url`, `published_at`, `fetched_at`,
 `summary`, `content_hash`.
 
-`content_hash` is a sha256 over the normalised URL and the case-folded title,
-with a `UNIQUE` constraint, and inserts use `ON CONFLICT DO NOTHING`. URL
+There is one row per article, keyed on the normalised `url` (`UNIQUE`). URL
 normalisation lowercases the scheme and host, drops the fragment, strips tracking
 parameters (`utm_*`, `fbclid`, `gclid` and friends) and sorts the rest, so the
-same article arriving through two different links stores once.
+same article arriving through two different links stores once. `title`,
+`summary` and `content_hash` always hold the most recently seen version;
+`fetched_at` is when the article was first seen.
+
+`content_hash` is a sha256 over the normalised URL and the case-folded,
+whitespace-collapsed title. Two titles with the same hash count as the same
+title, so a change in case or spacing alone is not a rewrite.
+
+**`headline_revisions`** — every distinct title an article has carried:
+`headline_id`, `title`, `summary`, `content_hash` and `seen_at` (first seen).
+Each article has at least one revision. When a known URL comes back under a new
+title, the article's row takes the new title and a revision is added. If a title
+flips back to an earlier wording, the row follows it but no revision is added,
+so feeds that alternate between two titles do not grow the history every run.
+`headliner changes` reads this table.
 
 **`fetch_log`** — one row per source per run: `source`, `started_at`,
-`finished_at`, `status` (`ok`, `skipped`, `error`), `items_found`, `items_new`
-and `error`. This is what `headliner sources` reads.
+`finished_at`, `status` (`ok`, `skipped`, `error`), `items_found`, `items_new`,
+`items_changed` (rewrites seen) and `error`. This is what `headliner sources`
+reads.
 
 Search uses an FTS5 index over titles and summaries, kept current by triggers.
 On a SQLite build without FTS5 the index is not created and search falls back to
@@ -291,6 +319,26 @@ Querying it directly is fine:
 
 ```bash
 sqlite3 headlines.db "SELECT source, COUNT(*) FROM headlines GROUP BY 1 ORDER BY 2 DESC;"
+```
+
+Search matches an article's current title and summary only, not earlier titles.
+
+### Schema upgrades
+
+The schema version is stored in `PRAGMA user_version` and upgrades run when a
+database is opened. Version 1 introduced title history. Databases created before
+it stored a rewritten headline as a second row. The upgrade:
+
+1. copies the database to `<db>.pre-v1.bak` (only if there are rows to merge),
+2. records every existing row's title as a revision of the earliest row with the
+   same URL,
+3. keeps that earliest row, gives it the latest title, and deletes the others,
+4. adds the unique index on `url`.
+
+It runs in one transaction. To see what it will do first:
+
+```bash
+headliner migrate --dry-run --db /path/to/headlines.db
 ```
 
 ## Being a good citizen
