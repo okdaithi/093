@@ -353,3 +353,20 @@ def test_times_carry_utc_iso(get: Call) -> None:
     _, _, body = get("/?utc=1")
     stamps = re.findall(r'<time datetime="([^"]+)"', body)
     assert stamps and all(datetime.fromisoformat(s).tzinfo == UTC for s in stamps)
+
+
+def test_rewrites_hide_minor_changes(db_path: Path, config_path: Path) -> None:
+    with connect(db_path) as conn:
+        store_headlines(
+            conn, [headline("Harbour bridge to reopen, on Monday", "https://example.org/bridge")]
+        )
+        conn.commit()
+    get = make_client(WebApp(db_path, config_path))
+    _, _, body = get("/rewrites")
+    assert "1 minor change(s) hidden" in body
+    assert "badge minor" not in body
+    _, _, body = get("/rewrites?minor=1")
+    assert 'class="badge minor"' in body
+    assert "minor change(s) hidden" not in body
+    _, _, body = get("/article?url=https%3A%2F%2Fexample.org%2Fbridge")
+    assert "changed to (punctuation only)" in body

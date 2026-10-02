@@ -30,7 +30,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 from headliner.config import Config, ConfigError, load_config
-from headliner.models import Headline, utcnow
+from headliner.models import Headline, is_minor_change, utcnow
 from headliner.store import (
     SCHEMA_VERSION,
     LiveFilter,
@@ -38,7 +38,7 @@ from headliner.store import (
     TitleChange,
     article_history,
     connect_readonly,
-    count_title_changes,
+    hidden_changes,
     list_headlines,
     list_title_changes,
     recent_runs,
@@ -204,6 +204,9 @@ class Response:
 
 
 EMPTY: Final = Markup("")
+MINOR_BADGE: Final = Markup(
+    '<span class="badge minor" title="Only case, punctuation or spacing changed">minor</span>'
+)
 
 
 class HttpError(Exception):
@@ -730,6 +733,7 @@ class WebApp:
         if live not in LIVE_CHOICES:
             live = "exclude"
         oldest = request.get("oldest") == "1"
+        minor = request.get("minor") == "1"
         since = self.since(request, "7d")
         common: dict[str, Any] = {
             "since": since,
@@ -742,20 +746,18 @@ class WebApp:
             **common,
             live=live,
             oldest_first=oldest,
+            minor=minor,
             limit=PAGE_SIZE + 1,
             offset=(page - 1) * PAGE_SIZE,
         )
         has_more = len(changes) > PAGE_SIZE
-        hidden = (
-            count_title_changes(conn, **common, live="include")
-            - count_title_changes(conn, **common, live="exclude")
-            if live == "exclude"
-            else 0
-        )
+        hidden, hidden_minor = hidden_changes(conn, **common, live=live, minor=minor)
         live_select = render(
             '<label>Live blogs <select name="live">{o}</select></label>'
             '<label class="check"><input type="checkbox" name="oldest" value="1"{c}>'
-            "Oldest first</label>",
+            "Oldest first</label>"
+            '<label class="check"><input type="checkbox" name="minor" value="1"{m}>'
+            "Include punctuation-only changes</label>",
             o=join(
                 render(
                     '<option value="{v}"{s}>{label}</option>',
@@ -770,6 +772,17 @@ class WebApp:
                 )
             ),
             c=Markup(" checked") if oldest else Markup(""),
+            m=Markup(" checked") if minor else Markup(""),
+        )
+        minor_note = (
+            render(
+                '<p class="notice">{n} minor change(s) hidden: only case, punctuation or '
+                'spacing changed. <a href="{inc}">Show them</a>.</p>',
+                n=hidden_minor,
+                inc=self.link(request, "/rewrites", minor=True),
+            )
+            if hidden_minor
+            else Markup("")
         )
         note = (
             render(
@@ -788,10 +801,11 @@ class WebApp:
         else:
             intro = Markup("")
         return render(
-            "<h1>Rewritten headlines</h1>{form}{intro}{note}{items}{pager}",
+            "<h1>Rewritten headlines</h1>{form}{intro}{note}{minor_note}{items}{pager}",
             form=self.filter_form(request, filters, since="7d", extra=live_select),
             intro=intro,
             note=note,
+            minor_note=minor_note,
             items=self.change_items(request, changes[:PAGE_SIZE]),
             pager=self.pager(request, has_more),
         )
@@ -809,7 +823,7 @@ class WebApp:
             items.append(
                 render(
                     """<li class="item change">
-  <div class="meta">{time} <a class="source" href="{src}">{source}</a> {live}
+  <div class="meta">{time} <a class="source" href="{src}">{source}</a> {live}{minor}
     <a class="history" href="{hist}">all titles</a> {open}</div>
   <p class="diff">{text}</p>
   {was}
@@ -820,6 +834,7 @@ class WebApp:
                     live=Markup('<span class="badge live">LIVE</span>')
                     if change.is_live
                     else Markup(""),
+                    minor=MINOR_BADGE if change.is_minor else Markup(""),
                     hist=self.link(request, "/article", url=change.url, live=None, oldest=None),
                     open=external_link(change.url, "open article ↗", "history"),
                     text=text,
@@ -1011,7 +1026,11 @@ class WebApp:
                     '<li class="item"><div class="meta">{t} {label}</div>'
                     '<p class="diff">{text}</p>{summary}</li>',
                     t=clock.time(revision.seen_at),
-                    label="first seen" if previous is None else "changed to",
+                    label="first seen"
+                    if previous is None
+                    else "changed to (punctuation only)"
+                    if is_minor_change(previous.title, revision.title)
+                    else "changed to",
                     text=text,
                     summary=render('<p class="summary">{s}</p>', s=revision.summary)
                     if revision.summary

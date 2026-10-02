@@ -114,6 +114,7 @@ mark { background: var(--mark); color: inherit; border-radius: 2px; }
 
 .badge { font-size: 0.7rem; font-weight: 700; border-radius: 4px; padding: 0 0.35rem; letter-spacing: 0.03em; }
 .badge.live { background: var(--bad); color: #fff; }
+.badge.minor { background: var(--chip); color: var(--muted); font-weight: 600; }
 .badge.rewritten { background: var(--chip); color: var(--accent); }
 
 .notice { background: var(--panel); border-left: 3px solid var(--warn); padding: 0.4rem 0.7rem; font-size: 0.9rem; }

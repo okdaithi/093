@@ -916,3 +916,19 @@ def test_connect_readonly_cannot_write(tmp_path: Path) -> None:
             reader.execute("DELETE FROM headlines")
     with pytest.raises(sqlite3.OperationalError):
         store.connect_readonly(tmp_path / "absent.db").execute("SELECT 1")
+
+
+def test_minor_rewrites_are_counted_and_filtered(conn: sqlite3.Connection) -> None:
+    store_headlines(conn, [make_headline("Minister says no to the harbour plan")])
+    cosmetic = store_headlines(conn, [make_headline("Minister says 'no' to the harbour plan")])
+    real = store_headlines(conn, [make_headline("Minister rejects the harbour plan outright")])
+    assert (cosmetic.retitled, cosmetic.retitled_minor) == (1, 1)
+    assert (real.retitled, real.retitled_minor) == (1, 0)
+
+    every = list_title_changes(conn, oldest_first=True)
+    assert [change.is_minor for change in every] == [True, False]
+    [kept] = list_title_changes(conn, minor=False)
+    assert kept.new_title == "Minister rejects the harbour plan outright"
+    assert count_title_changes(conn, minor=False) == 1
+    assert store.hidden_changes(conn, live="exclude", minor=False) == (0, 1)
+    assert store.totals(conn).rewrites == 1

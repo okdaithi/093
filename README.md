@@ -103,7 +103,7 @@ merged, so check the diff if you have them.
 | Page | Shows |
 | --- | --- |
 | **Latest** | Headlines newest first, grouped by day, with links to the articles. A `LIVE` badge marks live blogs, and "N titles" marks rewritten articles. |
-| **Rewrites** | Each title change as a word-level diff (removed words struck through, added words highlighted), with the old title underneath. Live blogs are hidden by default, as in `changes`; the page says how many were hidden and lets you include them or show only them. |
+| **Rewrites** | Each title change as a word-level diff (removed words struck through, added words highlighted), with the old title underneath. Live blogs and minor (punctuation-only) changes are hidden by default, as in `changes`; the page says how many of each were hidden and lets you show them. |
 | **Search** | Full-text search over current titles and summaries, with matches highlighted. Tick *Include earlier titles* to search every version (like `search --history`). |
 | **Sources** | Each source's tags, item count, last success and last run status: `ok`, `failed` (with the error), `skipped`, `stale` (no success in 13 hours) or `never fetched`. Below it, the last 12 runs with their ok/skipped/failed counts and new and retitled items. |
 | **Article** | Every title one article has carried, oldest first, each diffed against the one before. Reached from "N titles" or "all titles". |
@@ -243,13 +243,18 @@ when `--tag` is given.
 **`changes`** takes the same `--since`, `--source`, `--limit` and `--format` flags
 as `list`, and needs no config file. Each row is one rewrite: the previous title,
 the new one, and when the new one was first seen. Live blogs are hidden by default
-(see [Live blogs](#live-blogs)); the table ends with a note saying how many were
-hidden.
+(see [Live blogs](#live-blogs)), and so are **minor rewrites**: changes of case,
+punctuation, quote style or spacing only, such as a comma moving inside a quote
+or "Attorney General" becoming "attorney-general". Words added, removed or
+swapped always count. The table ends with a note saying how many of each were
+hidden. JSON and CSV mark each row with `is_minor`, and the `fetch` summary
+counts them, e.g. `20 retitled (2 live, 3 minor)`.
 
 | Flag | Effect |
 | --- | --- |
 | `--include-live` | Show live blogs alongside other rewrites |
 | `--live-only` | Only live blogs, as a timeline that includes each blog's first headline (`(first seen)`) |
+| `--include-minor` | Also show minor rewrites, marked `[minor]` in the table |
 | `--oldest-first` | Chronological order. Reads best with `--live-only`. |
 
 ### Live blogs
