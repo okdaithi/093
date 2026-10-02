@@ -14,8 +14,10 @@ from typing import Any, Final, Literal
 from headliner.models import (
     Headline,
     compute_hash,
+    is_minor_change,
     looks_live,
     normalise_url,
+    title_key,
     to_utc,
     utcnow,
 )
@@ -191,6 +193,8 @@ class InsertResult:
     new: int
     retitled: int
     retitled_live: int = 0
+    # Rewrites that only changed case, punctuation or spacing (see `title_key`).
+    retitled_minor: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +208,8 @@ class TitleChange:
     old_title: str | None
     new_title: str
     is_live: bool = False
+    # Only case, punctuation or spacing changed (see `title_key`).
+    is_minor: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -539,6 +545,12 @@ def migrate(conn: sqlite3.Connection) -> None:
         _upgrade_to_v3(conn)
 
 
+def _prepare(conn: sqlite3.Connection) -> None:
+    """Row access by name, and `title_key` callable from SQL for minor-change filters."""
+    conn.row_factory = sqlite3.Row
+    conn.create_function("headliner_title_key", 1, title_key, deterministic=True)
+
+
 def connect(
     path: Path | str = DEFAULT_DB_PATH, *, migrate_schema: bool = True
 ) -> sqlite3.Connection:
@@ -547,7 +559,7 @@ def connect(
     if db_path.parent and str(db_path.parent) not in {"", "."}:
         db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=30.0)
-    conn.row_factory = sqlite3.Row
+    _prepare(conn)
     if migrate_schema:
         migrate(conn)
     return conn
@@ -560,7 +572,7 @@ def connect_readonly(path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     """
     uri = Path(path).resolve().as_uri() + "?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=30.0, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
+    _prepare(conn)
     return conn
 
 
@@ -609,11 +621,11 @@ def store_headlines(conn: sqlite3.Connection, headlines: Iterable[Headline]) -> 
     whitespace are the same title (see `compute_hash`). An article stays a
     live blog once any version of it looked like one.
     """
-    new = retitled = retitled_live = 0
+    new = retitled = retitled_live = retitled_minor = 0
     with conn:
         for headline in headlines:
             existing = conn.execute(
-                "SELECT id, content_hash, is_live FROM headlines WHERE url = ?",
+                "SELECT id, title, content_hash, is_live FROM headlines WHERE url = ?",
                 (headline.url,),
             ).fetchone()
             if existing is None:
@@ -652,6 +664,7 @@ def store_headlines(conn: sqlite3.Connection, headlines: Iterable[Headline]) -> 
             if _add_revision(conn, existing["id"], headline):
                 retitled += 1
                 retitled_live += int(is_live)
+                retitled_minor += int(is_minor_change(existing["title"], headline.title))
             conn.execute(
                 """
                 UPDATE headlines SET title = ?, summary = ?, content_hash = ?, is_live = ?
@@ -665,7 +678,9 @@ def store_headlines(conn: sqlite3.Connection, headlines: Iterable[Headline]) -> 
                     existing["id"],
                 ),
             )
-    return InsertResult(new=new, retitled=retitled, retitled_live=retitled_live)
+    return InsertResult(
+        new=new, retitled=retitled, retitled_live=retitled_live, retitled_minor=retitled_minor
+    )
 
 
 def insert_headlines(conn: sqlite3.Connection, headlines: Iterable[Headline]) -> int:
@@ -784,10 +799,16 @@ def _changes_query(
     source: str | None,
     live: LiveFilter,
     sources: Sequence[str] | None = None,
+    minor: bool = True,
 ) -> tuple[str, list[Any]]:
     """FROM/WHERE for `list_title_changes` and `count_title_changes`."""
     # A live blog's first headline is part of its timeline, so `only` keeps it.
     clauses = [] if live == "only" else ["r.old_title IS NOT NULL"]
+    if not minor:
+        clauses.append(
+            "(r.old_title IS NULL"
+            " OR headliner_title_key(r.old_title) <> headliner_title_key(r.title))"
+        )
     params: list[Any] = []
     if live == "exclude":
         clauses.append("h.is_live = 0")
@@ -826,13 +847,17 @@ def list_title_changes(
     live: LiveFilter = "include",
     oldest_first: bool = False,
     offset: int = 0,
+    minor: bool = True,
 ) -> list[TitleChange]:
     """Headline rewrites, most recent first: each revision after an article's first.
 
     `live` keeps, drops or isolates live blogs. With `"only"` the result is
     each live blog's timeline, its first headline included (`old_title` None).
+    `minor=False` drops rewrites that only changed case, punctuation or spacing.
     """
-    sql, params = _changes_query(since=since, source=source, live=live, sources=sources)
+    sql, params = _changes_query(
+        since=since, source=source, live=live, sources=sources, minor=minor
+    )
     order = "ASC" if oldest_first else "DESC"
     with closing(
         conn.execute(
@@ -852,6 +877,8 @@ def list_title_changes(
                 old_title=row["old_title"],
                 new_title=row["title"],
                 is_live=bool(row["is_live"]),
+                is_minor=row["old_title"] is not None
+                and is_minor_change(row["old_title"], row["title"]),
             )
             for row in cursor.fetchall()
         ]
@@ -864,10 +891,44 @@ def count_title_changes(
     source: str | None = None,
     sources: Sequence[str] | None = None,
     live: LiveFilter = "include",
+    minor: bool = True,
 ) -> int:
     """How many rows `list_title_changes` would return without a limit."""
-    sql, params = _changes_query(since=since, source=source, live=live, sources=sources)
+    sql, params = _changes_query(
+        since=since, source=source, live=live, sources=sources, minor=minor
+    )
     return int(conn.execute(f"SELECT COUNT(*) {sql}", params).fetchone()[0])
+
+
+def hidden_changes(
+    conn: sqlite3.Connection,
+    *,
+    since: datetime | None = None,
+    source: str | None = None,
+    sources: Sequence[str] | None = None,
+    live: LiveFilter = "exclude",
+    minor: bool = False,
+) -> tuple[int, int]:
+    """How many rewrites the `live` and `minor` filters hide: (live blogs, minor).
+
+    Each count is measured with the other filter as given, so the two add up
+    to what showing everything would add. A live blog's first headline is not
+    a rewrite, so it never counts.
+    """
+    scope: dict[str, Any] = {"since": since, "source": source, "sources": sources}
+    hidden_live = (
+        count_title_changes(conn, **scope, live="include", minor=minor)
+        - count_title_changes(conn, **scope, live="exclude", minor=minor)
+        if live == "exclude"
+        else 0
+    )
+    hidden_minor = (
+        count_title_changes(conn, **scope, live=live, minor=True)
+        - count_title_changes(conn, **scope, live=live, minor=False)
+        if not minor
+        else 0
+    )
+    return hidden_live, hidden_minor
 
 
 def _escape_like(term: str) -> str:
@@ -1186,6 +1247,7 @@ class Totals:
     """Database-wide counts for the web viewer's header."""
 
     articles: int
+    # As the Rewrites page counts them by default: no live blogs, no minor changes.
     rewrites: int
     live: int
     last_fetch: datetime | None
@@ -1196,11 +1258,10 @@ def totals(conn: sqlite3.Connection) -> Totals:
     articles, live = conn.execute(
         "SELECT COUNT(*), COALESCE(SUM(is_live), 0) FROM headlines"
     ).fetchone()
-    revisions = int(conn.execute("SELECT COUNT(*) FROM headline_revisions").fetchone()[0])
     last = conn.execute("SELECT MAX(finished_at) FROM fetch_log").fetchone()[0]
     return Totals(
         articles=int(articles),
-        rewrites=max(0, revisions - int(articles)),
+        rewrites=count_title_changes(conn, live="exclude", minor=False),
         live=int(live),
         last_fetch=_parse_iso(last),
     )

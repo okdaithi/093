@@ -35,7 +35,7 @@ from headliner.store import (
     LiveFilter,
     SourceStatus,
     TitleChange,
-    count_title_changes,
+    hidden_changes,
     list_headlines,
     list_title_changes,
     migrate,
@@ -123,6 +123,7 @@ def time_column(values: Sequence[datetime | None], *, utc: bool) -> tuple[list[s
 
 LIVE_TAG: Final = "[LIVE] "
 FIRST_SEEN: Final = "(first seen)"
+MINOR_TAG: Final = "[minor] "
 
 
 def _truncate(text: str, width: int) -> str:
@@ -216,7 +217,11 @@ def _summarise(results: list[SourceResult], *, dry_run: bool) -> None:
     new = sum(result.items_new for result in results)
     changed = sum(result.items_changed for result in results)
     changed_live = sum(result.items_changed_live for result in results)
-    live_note = f" ({changed_live} live)" if changed_live else ""
+    changed_minor = sum(result.items_changed_minor for result in results)
+    details = [f"{changed_live} live"] if changed_live else []
+    if changed_minor:
+        details.append(f"{changed_minor} minor")
+    live_note = f" ({', '.join(details)})" if details else ""
     suffix = " (dry run, nothing written)" if dry_run else ""
     logger.info(
         "done: %d ok, %d skipped, %d failed; %d item(s) found, %d new, %d retitled%s%s",
@@ -257,6 +262,7 @@ def cmd_fetch(args: argparse.Namespace, config: Config) -> int:
                     result.items_new = stored.new
                     result.items_changed = stored.retitled
                     result.items_changed_live = stored.retitled_live
+                    result.items_changed_minor = stored.retitled_minor
                 record_fetch(
                     conn,
                     source=result.source,
@@ -326,6 +332,7 @@ def output_changes(
                 "old_title": change.old_title,
                 "new_title": change.new_title,
                 "is_live": change.is_live,
+                "is_minor": change.is_minor,
             }
             for change in changes
         ]
@@ -335,7 +342,9 @@ def output_changes(
 
     if fmt == "csv":
         writer = csv.writer(stream, lineterminator="\n")
-        writer.writerow(["source", "changed_at", "old_title", "new_title", "url", "is_live"])
+        writer.writerow(
+            ["source", "changed_at", "old_title", "new_title", "url", "is_live", "is_minor"]
+        )
         for change in changes:
             writer.writerow(
                 [
@@ -345,6 +354,7 @@ def output_changes(
                     change.new_title,
                     change.url,
                     "1" if change.is_live else "0",
+                    "1" if change.is_minor else "0",
                 ]
             )
         return
@@ -357,7 +367,9 @@ def output_changes(
         [
             when,
             _truncate(change.source, 22),
-            _truncate(change.old_title or FIRST_SEEN, 60),
+            _truncate(
+                (MINOR_TAG if change.is_minor else "") + (change.old_title or FIRST_SEEN), 60
+            ),
             _truncate(change.new_title, 60),
         ]
         for change, when in zip(changes, changed, strict=True)
@@ -366,10 +378,11 @@ def output_changes(
 
 
 def cmd_changes(args: argparse.Namespace) -> int:
-    """Print headline rewrites; live blogs are hidden unless asked for."""
+    """Print headline rewrites; live blogs and minor rewrites are hidden unless asked for."""
     since = utcnow() - args.since if args.since else None
     tagged = _tag_sources(args)
     live: LiveFilter = "only" if args.live_only else "include" if args.include_live else "exclude"
+    minor = bool(args.include_minor)
     with open_db(args.db) as conn:
         changes = list_title_changes(
             conn,
@@ -379,21 +392,23 @@ def cmd_changes(args: argparse.Namespace) -> int:
             limit=args.limit,
             live=live,
             oldest_first=args.oldest_first,
+            minor=minor,
         )
-        # Live rewrites only; a live blog's first headline is not a change.
-        hidden = (
-            count_title_changes(
-                conn, since=since, source=args.source, sources=tagged, live="include"
-            )
-            - count_title_changes(
-                conn, since=since, source=args.source, sources=tagged, live="exclude"
-            )
-            if live == "exclude"
-            else 0
+        hidden_live, hidden_minor = hidden_changes(
+            conn, since=since, source=args.source, sources=tagged, live=live, minor=minor
         )
     output_changes(changes, args.format, sys.stdout, utc=args.utc)
-    if hidden:
-        note = f"{hidden} live-blog headline(s) hidden; use --include-live or --live-only"
+    notes = []
+    if hidden_live:
+        notes.append(
+            f"{hidden_live} live-blog headline(s) hidden; use --include-live or --live-only"
+        )
+    if hidden_minor:
+        notes.append(
+            f"{hidden_minor} minor rewrite(s) (case, punctuation or spacing only) hidden; "
+            "use --include-minor"
+        )
+    for note in notes:
         if args.format == "table":
             print(f"\n({note})", file=sys.stdout)
         else:
@@ -688,6 +703,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--live-only",
         action="store_true",
         help="only live blogs, as a timeline including each blog's first headline",
+    )
+    changes.add_argument(
+        "--include-minor",
+        action="store_true",
+        help="also show rewrites that only changed case, punctuation or spacing",
     )
     changes.add_argument(
         "--oldest-first",

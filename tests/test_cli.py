@@ -864,3 +864,39 @@ def test_sources_command_shows_and_filters_tags(
 def test_unknown_tag_exits_two(tagged_config: Path, db_path: Path) -> None:
     args = ["list", "--sources", str(tagged_config), "--db", str(db_path), "--quiet"]
     assert main([*args, "--tag", "NZ"]) == EXIT_FATAL
+
+
+# --------------------------------------------------------------------------
+# minor rewrites
+# --------------------------------------------------------------------------
+
+
+def test_changes_hides_minor_rewrites_unless_asked(
+    db_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed_retitled(db_path)
+    conn = connect(db_path)
+    store_headlines(
+        conn,
+        [
+            Headline.create(
+                source="ABC News AU",
+                title="White elephant may become WA’s newest prison",
+                url="https://example.org/quarantine-centre",
+            )
+        ],
+    )
+    conn.close()
+    base = ["changes", "--db", str(db_path), "--quiet"]
+
+    assert main(base) == EXIT_OK
+    out = capsys.readouterr().out
+    assert out.count("White elephant") == 1
+    assert "1 minor rewrite(s) (case, punctuation or spacing only) hidden" in out
+
+    assert main([*base, "--include-minor", "--format", "json"]) == EXIT_OK
+    items = json.loads(capsys.readouterr().out)
+    assert [item["is_minor"] for item in items] == [True, False]
+
+    assert main([*base, "--include-minor"]) == EXIT_OK
+    assert "[minor] White elephant" in capsys.readouterr().out

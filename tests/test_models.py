@@ -202,3 +202,47 @@ def test_bbc_campaign_change_no_longer_changes_the_hash() -> None:
     assert compute_hash(f"{base}?at_campaign=rss&at_medium=RSS", title) == compute_hash(
         f"{base}?at_campaign=newsletter", title
     )
+
+
+# --- Minor rewrites ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (
+            "‘No such thing as half a march’, says Mac Cionnaith",
+            "‘No such thing as half a march,’ says Mac Cionnaith",
+        ),
+        (
+            "Demands 'new deal' for Wales before conference",
+            "Demands 'new deal' for Wales, before conference",
+        ),
+        (
+            "New York Attorney General to oversee inquiry",
+            "New York attorney-general to oversee inquiry",
+        ),
+        ('Minister says "no" to plan', "Minister says “no” to plan"),
+        ("U.S. tariffs bite", "US tariffs bite"),
+        ("Leader quits", "Leader quits?"),
+        ("Fire - homes lost", "Fire – homes lost"),
+    ],
+)
+def test_cosmetic_rewrites_are_minor(old: str, new: str) -> None:
+    from headliner.models import is_minor_change
+
+    assert is_minor_change(old, new)
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("Man charged over crash", "Two men charged over crash"),
+        ("Police probe death", "Police probe deaths"),
+        ("PM to visit Perth", "PM to visit Perth today"),
+    ],
+)
+def test_word_changes_are_not_minor(old: str, new: str) -> None:
+    from headliner.models import is_minor_change
+
+    assert not is_minor_change(old, new)

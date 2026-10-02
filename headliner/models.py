@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import html
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -119,6 +120,29 @@ def looks_live(url: str, title: str, extra_url_pattern: re.Pattern[str] | None =
         or _LIVE_TITLE_RE.search(title)
         or (extra_url_pattern is not None and extra_url_pattern.search(url))
     )
+
+
+# Removed outright, so "U.S." matches "US" and "don't" matches "dont".
+_TITLE_KEY_DROP = re.compile(r"[\u2018\u2019\u201a\u201b'`\u00b4.]")
+# Every other punctuation mark (commas, quotes, dashes, colons) becomes a space.
+_TITLE_KEY_PUNCT = re.compile(r"[^\w\s]")
+
+
+def title_key(title: str) -> str:
+    """`title` reduced to its words, ignoring case, punctuation, quote style and spacing.
+
+    Two titles with the same key differ only cosmetically: a rewrite between
+    them is "minor" (a moved comma, curly for straight quotes, "Attorney
+    General" to "attorney-general").
+    """
+    text = unicodedata.normalize("NFKC", title).casefold()
+    text = _TITLE_KEY_PUNCT.sub(" ", _TITLE_KEY_DROP.sub("", text))
+    return " ".join(text.split())
+
+
+def is_minor_change(old: str, new: str) -> bool:
+    """True when `old` and `new` differ only in case, punctuation or spacing."""
+    return title_key(old) == title_key(new)
 
 
 def compute_hash(url: str, title: str) -> str:
