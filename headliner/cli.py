@@ -24,12 +24,16 @@ from headliner.models import Headline, utcnow
 from headliner.store import (
     DEFAULT_DB_PATH,
     SourceStatus,
-    insert_headlines,
+    TitleChange,
     list_headlines,
+    list_title_changes,
+    migrate,
     open_db,
     record_fetch,
     search_headlines,
     source_status,
+    store_headlines,
+    upgrade_plan,
 )
 
 logger = logging.getLogger("headliner")
@@ -142,14 +146,16 @@ def _summarise(results: list[SourceResult], *, dry_run: bool) -> None:
     failed = sum(1 for result in results if result.status == "error")
     found = sum(result.items_found for result in results)
     new = sum(result.items_new for result in results)
+    changed = sum(result.items_changed for result in results)
     suffix = " (dry run, nothing written)" if dry_run else ""
     logger.info(
-        "done: %d ok, %d skipped, %d failed; %d item(s) found, %d new%s",
+        "done: %d ok, %d skipped, %d failed; %d item(s) found, %d new, %d retitled%s",
         ok,
         skipped,
         failed,
         found,
         new,
+        changed,
         suffix,
     )
 
@@ -176,7 +182,9 @@ def cmd_fetch(args: argparse.Namespace, config: Config) -> int:
         with open_db(args.db) as conn:
             for result in results:
                 if result.headlines:
-                    result.items_new = insert_headlines(conn, result.headlines)
+                    stored = store_headlines(conn, result.headlines)
+                    result.items_new = stored.new
+                    result.items_changed = stored.retitled
                 record_fetch(
                     conn,
                     source=result.source,
@@ -185,6 +193,7 @@ def cmd_fetch(args: argparse.Namespace, config: Config) -> int:
                     status=result.status,
                     items_found=result.items_found,
                     items_new=result.items_new,
+                    items_changed=result.items_changed,
                     error=result.error,
                 )
         _summarise(results, dry_run=False)
@@ -208,6 +217,88 @@ def cmd_search(args: argparse.Namespace) -> int:
     with open_db(args.db) as conn:
         headlines = search_headlines(conn, args.query, limit=args.limit)
     output_headlines(headlines, args.format, sys.stdout)
+    return EXIT_OK
+
+
+def output_changes(changes: list[TitleChange], fmt: str, stream: TextIO) -> None:
+    """Write headline rewrites to `stream` as a table, JSON or CSV."""
+    if fmt == "json":
+        payload = [
+            {
+                "source": change.source,
+                "url": change.url,
+                "changed_at": change.changed_at.isoformat() if change.changed_at else None,
+                "old_title": change.old_title,
+                "new_title": change.new_title,
+            }
+            for change in changes
+        ]
+        json.dump(payload, stream, indent=2)
+        stream.write("\n")
+        return
+
+    if fmt == "csv":
+        writer = csv.writer(stream, lineterminator="\n")
+        writer.writerow(["source", "changed_at", "old_title", "new_title", "url"])
+        for change in changes:
+            writer.writerow(
+                [
+                    change.source,
+                    change.changed_at.isoformat() if change.changed_at else "",
+                    change.old_title,
+                    change.new_title,
+                    change.url,
+                ]
+            )
+        return
+
+    if not changes:
+        print("No headline changes found.", file=stream)
+        return
+    rows = [
+        [
+            _format_dt(change.changed_at),
+            _truncate(change.source, 22),
+            _truncate(change.old_title, 60),
+            _truncate(change.new_title, 60),
+        ]
+        for change in changes
+    ]
+    render_table(rows, ["CHANGED", "SOURCE", "OLD TITLE", "NEW TITLE"], stream)
+
+
+def cmd_changes(args: argparse.Namespace) -> int:
+    """Print headline rewrites."""
+    since = utcnow() - args.since if args.since else None
+    with open_db(args.db) as conn:
+        changes = list_title_changes(conn, since=since, source=args.source, limit=args.limit)
+    output_changes(changes, args.format, sys.stdout)
+    return EXIT_OK
+
+
+def cmd_migrate(args: argparse.Namespace) -> int:
+    """Upgrade the database schema, or with --dry-run describe the upgrade."""
+    if not args.db.exists():
+        logger.error("no database at %s", args.db)
+        return EXIT_FATAL
+    with open_db(args.db, migrate_schema=False) as conn:
+        plan = upgrade_plan(conn)
+    if not plan.needed:
+        print(f"{args.db}: schema version {plan.from_version} is current; nothing to do.")
+        return EXIT_OK
+
+    verb = "would merge" if args.dry_run else "merging"
+    print(
+        f"{args.db}: schema version {plan.from_version} -> {plan.to_version}; "
+        f"{plan.headlines} headline row(s); {verb} {plan.rows_merged} row(s) "
+        f"across {plan.merged_urls} URL(s) into title history."
+    )
+    if args.dry_run:
+        print("Dry run: nothing changed.")
+        return EXIT_OK
+    with open_db(args.db, migrate_schema=False) as conn:
+        migrate(conn)
+    print("Done.")
     return EXIT_OK
 
 
@@ -338,6 +429,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="output format (default: %(default)s)",
     )
 
+    changes = subparsers.add_parser(
+        "changes", parents=[common], help="list headlines that were rewritten after publication"
+    )
+    changes.add_argument(
+        "--since",
+        type=parse_duration,
+        metavar="DURATION",
+        help="only changes seen within this age, e.g. 24h, 7d",
+    )
+    changes.add_argument("--source", metavar="NAME", help="restrict to one source")
+    changes.add_argument(
+        "--limit", type=int, default=50, metavar="N", help="maximum rows (default: %(default)s)"
+    )
+    changes.add_argument(
+        "--format",
+        choices=("table", "json", "csv"),
+        default="table",
+        help="output format (default: %(default)s)",
+    )
+
+    migrate_cmd = subparsers.add_parser(
+        "migrate", parents=[common], help="upgrade the database schema (runs automatically)"
+    )
+    migrate_cmd.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="describe the upgrade without changing the database",
+    )
+
     sources_cmd = subparsers.add_parser(
         "sources", parents=[common], help="list configured sources and their last fetch"
     )
@@ -363,9 +483,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_FATAL
 
     try:
-        # `search` reads only the database, so it does not need a config file.
+        # These read only the database, so they do not need a config file.
         if args.command == "search":
             return cmd_search(args)
+        if args.command == "changes":
+            return cmd_changes(args)
+        if args.command == "migrate":
+            return cmd_migrate(args)
         config = load_config(args.sources)
         if args.command == "fetch":
             return cmd_fetch(args, config)

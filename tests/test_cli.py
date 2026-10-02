@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -343,3 +344,108 @@ def test_sources_table_before_any_fetch(
 def test_verbose_and_quiet_are_mutually_exclusive(config_path: Path) -> None:
     with pytest.raises(SystemExit):
         main(["list", "--sources", str(config_path), "--verbose", "--quiet"])
+
+
+# --------------------------------------------------------------------------
+# headline rewrites and schema upgrades
+# --------------------------------------------------------------------------
+
+
+@respx.mock
+def test_retitled_story_is_counted_and_listed_by_changes(
+    config_path: Path, db_path: Path, feed_body: bytes, capsys: pytest.CaptureFixture[str]
+) -> None:
+    args = ["fetch", "--sources", str(config_path), "--db", str(db_path), "--quiet"]
+    mock_feed(feed_body)
+    assert main(args) == EXIT_OK
+    rewritten = feed_body.replace(
+        b"Parliament passes long-delayed housing bill",
+        b"Housing bill finally clears parliament after delays",
+    )
+    mock_feed(rewritten)
+    assert main(args) == EXIT_OK
+
+    conn = connect(db_path)
+    assert conn.execute("SELECT COUNT(*) FROM headlines").fetchone()[0] == 5
+    log = conn.execute("SELECT items_new, items_changed FROM fetch_log ORDER BY id").fetchall()
+    assert [tuple(row) for row in log] == [(5, 0), (0, 1)]
+    conn.close()
+
+    capsys.readouterr()
+    assert main(["changes", "--db", str(db_path), "--format", "json", "--quiet"]) == EXIT_OK
+    [change] = json.loads(capsys.readouterr().out)
+    assert change["old_title"] == "Parliament passes long-delayed housing bill"
+    assert change["new_title"] == "Housing bill finally clears parliament after delays"
+
+    assert main(["changes", "--db", str(db_path), "--quiet"]) == EXIT_OK
+    table = capsys.readouterr().out
+    assert "OLD TITLE" in table
+    assert "Housing bill finally clears parliament" in table
+
+
+def test_changes_on_an_unchanged_database_is_not_an_error(
+    db_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed(db_path)
+    assert main(["changes", "--db", str(db_path), "--quiet"]) == EXIT_OK
+    assert "No headline changes found." in capsys.readouterr().out
+
+
+def make_legacy_db(path: Path) -> None:
+    """Two rows for one URL, as schema 0 stored a rewritten headline."""
+    conn = connect(path)
+    insert_headlines(
+        conn,
+        [
+            Headline.create(
+                source="Example Wire",
+                title="Ferry service restored following repairs",
+                url="https://example.org/ferry",
+            ),
+        ],
+    )
+    conn.execute("DROP INDEX idx_headlines_url")
+    conn.execute(
+        "INSERT INTO headlines (source, title, url, fetched_at, content_hash)"
+        " SELECT source, 'Ferry back in service after week of repairs', url, fetched_at,"
+        " 'legacy-hash' FROM headlines"
+    )
+    conn.execute("PRAGMA user_version = 0")
+    conn.commit()
+    conn.close()
+
+
+def test_migrate_dry_run_reports_and_changes_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "legacy.db"
+    make_legacy_db(path)
+    assert main(["migrate", "--dry-run", "--db", str(path), "--quiet"]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "schema version 0 -> 1" in out
+    assert "would merge 1 row(s) across 1 URL(s)" in out
+    assert "nothing changed" in out
+
+    conn = sqlite3.connect(path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM headlines").fetchone()[0] == 2
+    conn.close()
+    assert not list(tmp_path.glob("*.bak"))
+
+
+def test_migrate_applies_the_upgrade(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    path = tmp_path / "legacy.db"
+    make_legacy_db(path)
+    assert main(["migrate", "--db", str(path), "--quiet"]) == EXIT_OK
+    assert "Done." in capsys.readouterr().out
+    assert main(["migrate", "--db", str(path), "--quiet"]) == EXIT_OK
+    assert "nothing to do" in capsys.readouterr().out
+
+    conn = sqlite3.connect(path)
+    assert conn.execute("SELECT COUNT(*) FROM headlines").fetchone()[0] == 1
+    conn.close()
+    assert (tmp_path / "legacy.db.pre-v1.bak").exists()
+
+
+def test_migrate_without_a_database_exits_two(tmp_path: Path) -> None:
+    assert main(["migrate", "--db", str(tmp_path / "missing.db"), "--quiet"]) == EXIT_FATAL
