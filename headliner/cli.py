@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Final, TextIO
 from urllib.parse import urlsplit
 
-from headliner import __version__
+from headliner import __version__, local_timezone, tz_abbrev
 from headliner.backup import DEFAULT_KEEP_DAILY, DEFAULT_KEEP_WEEKLY, BackupError, run_backup
 from headliner.config import (
     DEFAULT_CONFIG_PATH,
@@ -109,23 +109,23 @@ def time_column(values: Sequence[datetime | None], *, utc: bool) -> tuple[list[s
     abbreviation and the header just says "local".
     """
     shown = [
-        (value.astimezone(UTC) if utc else value.astimezone()) if value else None
+        (value.astimezone(UTC) if utc else value.astimezone(local_timezone())) if value else None
         for value in values
     ]
-    zones = {value.tzname() or "local" for value in shown if value}
+    zones = {tz_abbrev(value) for value in shown if value}
     if utc:
         label = "UTC"
     elif len(zones) == 1:
         label = next(iter(zones))
     elif not zones:
-        label = datetime.now().astimezone().tzname() or "local"
+        label = tz_abbrev(local_timezone())
     else:
         label = "local"
     per_cell = label == "local" and len(zones) > 1
     cells = [
         "-"
         if value is None
-        else value.strftime("%Y-%m-%d %H:%M") + (f" {value.tzname()}" if per_cell else "")
+        else value.strftime("%Y-%m-%d %H:%M") + (f" {tz_abbrev(value)}" if per_cell else "")
         for value in shown
     ]
     return cells, label
