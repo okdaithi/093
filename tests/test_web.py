@@ -140,7 +140,7 @@ def titles(body: str) -> list[str]:
 
 
 def test_latest_lists_newest_first_with_badges(get: Call) -> None:
-    status, headers, body = get("/")
+    status, headers, body = get("/latest")
     assert status == "200 OK"
     assert headers["Content-Type"].startswith("text/html")
     shown = titles(body)
@@ -151,7 +151,7 @@ def test_latest_lists_newest_first_with_badges(get: Call) -> None:
 
 
 def test_titles_and_attributes_are_escaped(get: Call) -> None:
-    _, _, body = get("/")
+    _, _, body = get("/latest")
     assert "Cats &amp; dogs say &quot;1 &lt; 2&quot; in survey" in body
     _, _, body = get("/search?q=%22%3E%3Cb%3Ehi")
     assert "<b>hi" not in body
@@ -159,18 +159,18 @@ def test_titles_and_attributes_are_escaped(get: Call) -> None:
 
 
 def test_tag_and_source_filters(get: Call) -> None:
-    _, _, body = get("/?tag=ie")
+    _, _, body = get("/latest?tag=ie")
     assert titles(body) == ["Budget surplus forecast for Dublin council"]
     assert 'value="IE" checked' in body
-    _, _, body = get("/?source=Example+Wire&since=6h")
+    _, _, body = get("/latest?source=Example+Wire&since=6h")
     assert "Budget surplus" not in body
     assert "Harbour bridge" in body
-    _, _, body = get("/?tag=XX")
+    _, _, body = get("/latest?tag=XX")
     assert "Unknown tag(s) ignored: XX." in body
 
 
 def test_since_window_defaults_per_page(get: Call) -> None:
-    _, _, body = get("/")
+    _, _, body = get("/latest")
     assert '<option value="all" selected>' in body
     _, _, body = get("/rewrites")
     assert '<option value="7d" selected>' in body
@@ -186,11 +186,11 @@ def test_times_are_local_by_default_and_utc_on_request(
 
     time.tzset()
     try:
-        _, _, body = get("/")
-        assert "Times: AWST · show UTC" in body
+        _, _, body = get("/latest")
+        assert "AWST → UTC" in body
         assert re.search(r'<time datetime="[^"]+\+00:00" title="[^"]+Z">', body)
-        _, _, body = get("/?utc=1")
-        assert "Times: UTC · show AWST" in body
+        _, _, body = get("/latest?utc=1")
+        assert "UTC → AWST" in body
         assert 'name="utc" value="1"' in body  # the filter form keeps UTC
     finally:
         monkeypatch.delenv("TZ")
@@ -259,19 +259,19 @@ def test_pagination(db_path: Path, config_path: Path) -> None:
         )
         conn.commit()
     get = make_client(WebApp(db_path, config_path))
-    _, _, first = get("/")
+    _, _, first = get("/latest")
     assert "Older →" in first and "← Newer" not in first
-    _, _, second = get("/?page=2")
+    _, _, second = get("/latest?page=2")
     assert "← Newer" in second and "Older →" not in second
     assert set(titles(first)).isdisjoint(titles(second))
     assert len(titles(first)) + len(titles(second)) == 64
 
 
 def test_read_only_methods_headers_and_assets(get: Call) -> None:
-    status, headers, _ = get("/", method="POST")
+    status, headers, _ = get("/latest", method="POST")
     assert status == "405 Method Not Allowed"
     assert headers["Allow"] == "GET, HEAD"
-    status, headers, body = get("/", method="HEAD")
+    status, headers, body = get("/latest", method="HEAD")
     assert status == "200 OK" and body == "" and int(headers["Content-Length"]) > 0
     assert "default-src 'none'" in headers["Content-Security-Policy"]
     assert headers["Referrer-Policy"] == "no-referrer"
@@ -281,7 +281,7 @@ def test_read_only_methods_headers_and_assets(get: Call) -> None:
 
 
 def test_external_links_open_safely(get: Call) -> None:
-    _, _, body = get("/")
+    _, _, body = get("/latest")
     assert 'href="https://example.org/bridge" target="_blank" rel="noopener noreferrer"' in body
 
 
@@ -301,14 +301,14 @@ def test_database_is_never_written(db_path: Path, get: Call) -> None:
         return hashlib.sha256(db_path.read_bytes()).hexdigest()
 
     before = digest()
-    for path in ("/", "/rewrites", "/search?q=bridge&history=1", "/sources", "/healthz"):
+    for path in ("/", "/latest", "/rewrites", "/search?q=bridge&history=1", "/sources", "/healthz"):
         assert get(path)[0] == "200 OK"
     assert digest() == before
 
 
 def test_missing_or_old_database_explains_itself(tmp_path: Path, config_path: Path) -> None:
     get = make_client(WebApp(tmp_path / "absent.db", config_path))
-    status, _, body = get("/")
+    status, _, body = get("/latest")
     assert status == "503 Service Unavailable"
     assert "appears after the first fetch" in body
     assert json.loads(get("/healthz")[2])["status"] == "error"
@@ -317,14 +317,14 @@ def test_missing_or_old_database_explains_itself(tmp_path: Path, config_path: Pa
     with sqlite3.connect(old) as conn:
         conn.execute("CREATE TABLE headlines (id INTEGER PRIMARY KEY)")
     get = make_client(WebApp(old, config_path))
-    status, _, body = get("/")
+    status, _, body = get("/latest")
     assert status == "503 Service Unavailable"
     assert "schema version 0" in body and "headliner migrate" in body
 
 
 def test_works_without_a_config_file(db_path: Path, tmp_path: Path) -> None:
     get = make_client(WebApp(db_path, None))
-    status, _, body = get("/?tag=AU")
+    status, _, body = get("/latest?tag=AU")
     assert status == "200 OK"
     assert "Tag filters need the sources file" in body
     assert get("/sources")[0] == "503 Service Unavailable"
@@ -354,7 +354,7 @@ def test_cli_web_defaults_to_localhost() -> None:
 
 
 def test_times_carry_utc_iso(get: Call) -> None:
-    _, _, body = get("/?utc=1")
+    _, _, body = get("/latest?utc=1")
     stamps = re.findall(r'<time datetime="([^"]+)"', body)
     assert stamps and all(datetime.fromisoformat(s).tzinfo == UTC for s in stamps)
 
@@ -409,8 +409,8 @@ def test_stories_page_groups_outlets(db_path: Path, config_path: Path) -> None:
 def test_story_page_and_latest_badge(db_path: Path, config_path: Path) -> None:
     seed_story(db_path)
     get = make_client(WebApp(db_path, config_path))
-    _, _, body = get("/")
-    assert body.count('class="badge story"') == 2
+    _, _, body = get("/latest")
+    assert body.count('class="badge outlets"') == 2
     status, _, body = get("/story?url=https%3A%2F%2Fexample.org%2Fbridge")
     assert status == "200 OK"
     assert "2 headline(s), oldest first" in body and "Other Daily" in body
@@ -458,7 +458,7 @@ def test_frozen_feed_shows_content_stale(db_path: Path, config_path: Path) -> No
 def test_header_totals_are_cached_until_data_changes(db_path: Path, config_path: Path) -> None:
     app = WebApp(db_path, config_path)
     get = make_client(app)
-    assert "4 articles" in get("/")[2]
+    assert "4 articles" in get("/latest")[2]
     first = app._totals
     get("/rewrites")
     assert app._totals is first  # nothing written: reused
@@ -467,7 +467,7 @@ def test_header_totals_are_cached_until_data_changes(db_path: Path, config_path:
             conn, [headline("A brand new story for the cache", "https://example.org/n")]
         )
         conn.commit()
-    assert "5 articles" in get("/")[2]
+    assert "5 articles" in get("/latest")[2]
 
 
 def test_api_status_reports_runs_sources_and_backups(db_path: Path, config_path: Path) -> None:
@@ -499,3 +499,83 @@ def test_api_status_without_database(tmp_path: Path, config_path: Path) -> None:
     status, _, body = make_client(WebApp(tmp_path / "absent.db", config_path))("/api/status")
     assert status == "503 Service Unavailable"
     assert json.loads(body)["status"] == "error"
+
+
+def test_briefing_shows_health_top_stories_and_rewrites(get: Call, db_path: Path) -> None:
+    with connect(db_path) as conn:
+        store_headlines(
+            conn,
+            [
+                headline(
+                    "Kalbarri wildfire forces evacuation of coastal town",
+                    "https://example.org/kalbarri",
+                ),
+                headline(
+                    "Wildfire evacuation ordered for coastal town of Kalbarri",
+                    "https://other.example/kalbarri",
+                    source="Other Daily",
+                ),
+            ],
+        )
+        conn.commit()
+    status, _, body = get("/")
+    assert status == "200 OK"
+    assert "<h1>Briefing</h1>" in body
+    assert 'aria-current="page">Briefing' in body
+    # Other Daily's last fetch failed and there are no backups.
+    assert "Needs attention" in body
+    assert "no backups" in body
+    assert "Top stories" in body
+    assert "2 outlets" in body
+    assert "Kalbarri" in body
+    # Per-country sections only show stories not already at the top.
+    assert "By country" not in body
+    assert "<ins>to reopen on Monday</ins>" in body
+    assert 'href="/rewrites"' in body
+
+
+def test_briefing_with_no_stories_says_so(get: Call) -> None:
+    _, _, body = get("/")
+    assert "No story has been reported by two or more outlets yet." in body
+
+
+def test_api_new_counts_articles_first_seen_after_since(get: Call) -> None:
+    since = (utcnow() - timedelta(hours=2)).isoformat()
+    status, headers, body = get("/api/new?since=" + quote(since))
+    assert status == "200 OK"
+    assert headers["Content-Type"] == "application/json"
+    # Budget and Cats are new within 2 hours; Bridge and Election were first seen
+    # 3 hours ago and only retitled since.
+    assert json.loads(body)["latest"] == 2
+    assert get("/api/new?since=yesterday")[0] == "400 Bad Request"
+    assert get("/api/new?since=2026-10-01T00:00:00")[0] == "400 Bad Request"
+
+
+def test_filters_group_tags_and_show_removable_chips(get: Call) -> None:
+    _, _, body = get("/latest?tag=IE&source=Other+Daily")
+    assert "<legend>Countries</legend>" in body
+    assert "<legend>Regions &amp; topics</legend>" in body
+    assert body.index(">AU</label>") < body.index("<legend>Regions")
+    assert '<optgroup label="IE">' in body
+    assert "2 active" in body
+    assert 'class="active"' in body
+    assert 'href="/latest?source=Other+Daily" title="Remove this filter">IE' in body
+    assert 'href="/latest?tag=IE" title="Remove this filter">Other Daily' in body
+    _, _, body = get("/latest")
+    assert 'class="active"' not in body
+
+
+def test_items_carry_first_seen_times_for_new_markers(get: Call) -> None:
+    _, _, body = get("/latest")
+    assert re.search(r'<li class="item" data-seen="\d{4}-\d\d-\d\dT[^"]+\+00:00">', body)
+
+
+def test_script_is_served_and_allowed_only_from_self(get: Call) -> None:
+    status, headers, body = get("/static/app.js")
+    assert status == "200 OK"
+    assert headers["Content-Type"].startswith("text/javascript")
+    assert "lastVisit" in body
+    _, headers, page = get("/latest")
+    assert "script-src 'self'" in headers["Content-Security-Policy"]
+    assert '<script src="/static/app.js" defer></script>' in page
+    assert "<script>" not in page

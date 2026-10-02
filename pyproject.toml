@@ -47,7 +47,7 @@ Repository = "https://github.com/okdaithi/093"
 packages = ["headliner"]
 
 [tool.setuptools.package-data]
-headliner = ["py.typed", "static/*.css"]
+headliner = ["py.typed", "static/*.css", "static/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

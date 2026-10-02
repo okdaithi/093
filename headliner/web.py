@@ -2,9 +2,10 @@
 
 A small WSGI app on the standard library, so the deployment gains no
 dependencies. It opens the database read-only on every request and never
-writes; the fetch timer stays the only writer. Pages are plain HTML and CSS
-with no JavaScript: Latest, Rewrites, Search, Sources and one page per
-article showing every title it has carried.
+writes; the fetch timer stays the only writer. Pages are plain HTML and CSS:
+Briefing, Latest, Stories, Rewrites, Search, Trends, Sources, and one page per
+article and per story. `static/app.js` only enhances them (instant filters,
+"new since your last visit"); every page works without it.
 
 Times follow the CLI: local time (the process's `TZ` or system zone) with the
 zone named, UTC on request (`?utc=1`), and the UTC ISO timestamp on every
@@ -44,6 +45,7 @@ from headliner.store import (
     Totals,
     article_history,
     connect_readonly,
+    count_new,
     feed_turnover,
     first_seen,
     hidden_changes,
@@ -95,13 +97,18 @@ STORY_WINDOWS: Final = {
 # The window behind "N outlets" badges and /story links.
 STORY_LINK_WINDOW: Final = "3d"
 STORIES_PAGE_SIZE: Final = 30
+# The Briefing: stories active in this window, the top few, then a few per country.
+BRIEFING_WINDOW: Final = timedelta(hours=12)
+BRIEFING_TOP: Final = 8
+BRIEFING_PER_COUNTRY: Final = 3
 TREND_WINDOWS: Final = {"7d": 7, "14d": 14, "30d": 30}
 HEAT_LEVELS: Final = 5
 
 SECURITY_HEADERS: Final = [
     (
         "Content-Security-Policy",
-        "default-src 'none'; style-src 'self'; img-src 'self' data:; form-action 'self'; "
+        "default-src 'none'; style-src 'self'; script-src 'self'; connect-src 'self'; "
+        "img-src 'self' data:; form-action 'self'; "
         "base-uri 'none'; frame-ancestors 'none'",
     ),
     ("X-Content-Type-Options", "nosniff"),
@@ -324,9 +331,14 @@ class WebApp:
         self._config: Config | None = None
         self._config_mtime: float | None = None
         self._config_error: str | None = None
-        self._css = resources.files("headliner").joinpath("static/app.css").read_bytes()
+        static = resources.files("headliner").joinpath("static")
+        self._static = {
+            "/static/app.css": (static.joinpath("app.css").read_bytes(), "text/css"),
+            "/static/app.js": (static.joinpath("app.js").read_bytes(), "text/javascript"),
+        }
         self.routes: dict[str, Callable[[Request, sqlite3.Connection], Markup]] = {
-            "/": self.page_latest,
+            "/": self.page_briefing,
+            "/latest": self.page_latest,
             "/rewrites": self.page_rewrites,
             "/search": self.page_search,
             "/sources": self.page_sources,
@@ -364,16 +376,19 @@ class WebApp:
         return iter([b"" if method == "HEAD" else response.body])
 
     def dispatch(self, request: Request) -> Response:
-        if request.path == "/static/app.css":
+        if request.path in self._static:
+            content, kind = self._static[request.path]
             return Response(
-                self._css,
-                content_type="text/css; charset=utf-8",
+                content,
+                content_type=f"{kind}; charset=utf-8",
                 headers=[("Cache-Control", "max-age=3600")],
             )
         if request.path == "/healthz":
             return self.healthz()
         if request.path == "/api/status":
             return self.api_status()
+        if request.path == "/api/new":
+            return self.api_new(request)
         handler = self.routes.get(request.path)
         if handler is None:
             return self.error_page("404 Not Found", "No such page.", request)
@@ -416,50 +431,10 @@ class WebApp:
         )
 
     def api_status(self) -> Response:
-        """Everything the status check needs, as JSON, without sudo.
-
-        `status` is "ok", or "attention" with the reasons in `checks`. A source
-        that is skipped (robots.txt) is listed but does not need attention.
-        """
-        now = utcnow()
-        checks: list[str] = []
+        """Everything the status check needs, as JSON, without sudo."""
         try:
             with self.connection() as conn:
-                info = self.totals(conn)
-                version = schema_version(conn)
-                runs = recent_runs(conn, limit=8)
-                config = self.config
-                sources: dict[str, Any] | None = None
-                problems: list[dict[str, Any]] = []
-                if config is not None:
-                    names = [source.name for source in config.sources]
-                    statuses = {status.name: status for status in source_status(conn, names)}
-                    states: Counter[str] = Counter()
-                    for source in config.sources:
-                        status = statuses[source.name]
-                        state, _ = source_state(source.enabled, status, now)
-                        states[state] += 1
-                        if state in {"ok", "disabled"}:
-                            continue
-                        problems.append(
-                            {
-                                "name": source.name,
-                                "state": state,
-                                "error": status.last_error,
-                                "last_success": _iso_or_none(status.last_success),
-                                "newest_item": _iso_or_none(status.newest_item),
-                            }
-                        )
-                    sources = {
-                        "configured": len(config.sources),
-                        "enabled": sum(1 for source in config.sources if source.enabled),
-                        "states": dict(sorted(states.items())),
-                    }
-                    attention = [p["name"] for p in problems if p["state"] != "skipped"]
-                    if attention:
-                        checks.append(f"{len(attention)} source(s) need attention")
-                else:
-                    checks.append(f"sources file not loaded: {self._config_error}")
+                payload = self.status_report(conn)
         except HttpError as exc:
             return Response(
                 json.dumps({"status": "error", "error": exc.message}).encode(),
@@ -467,6 +442,55 @@ class WebApp:
                 content_type="application/json",
                 headers=[("Cache-Control", "no-store")],
             )
+        return Response(
+            json.dumps(payload, indent=2).encode(),
+            content_type="application/json",
+            headers=[("Cache-Control", "no-store")],
+        )
+
+    def status_report(self, conn: sqlite3.Connection) -> dict[str, Any]:
+        """Runs, source health, database and backups, for /api/status and the Briefing.
+
+        `status` is "ok", or "attention" with the reasons in `checks`. A source
+        that is skipped (robots.txt) is listed but does not need attention.
+        """
+        now = utcnow()
+        checks: list[str] = []
+        info = self.totals(conn)
+        version = schema_version(conn)
+        runs = recent_runs(conn, limit=8)
+        config = self.config
+        sources: dict[str, Any] | None = None
+        problems: list[dict[str, Any]] = []
+        if config is not None:
+            names = [source.name for source in config.sources]
+            statuses = {status.name: status for status in source_status(conn, names)}
+            states: Counter[str] = Counter()
+            for source in config.sources:
+                status = statuses[source.name]
+                state, _ = source_state(source.enabled, status, now)
+                states[state] += 1
+                if state in {"ok", "disabled"}:
+                    continue
+                problems.append(
+                    {
+                        "name": source.name,
+                        "state": state,
+                        "error": status.last_error,
+                        "last_success": _iso_or_none(status.last_success),
+                        "newest_item": _iso_or_none(status.newest_item),
+                    }
+                )
+            sources = {
+                "configured": len(config.sources),
+                "enabled": sum(1 for source in config.sources if source.enabled),
+                "states": dict(sorted(states.items())),
+            }
+            attention = [p["name"] for p in problems if p["state"] != "skipped"]
+            if attention:
+                checks.append(f"{len(attention)} source(s) need attention")
+        else:
+            checks.append(f"sources file not loaded: {self._config_error}")
         if not runs:
             checks.append("no fetch runs logged")
         else:
@@ -479,7 +503,7 @@ class WebApp:
             checks.append("no backups")
         elif now - backups[0].taken_at > BACKUP_LATE_AFTER:
             checks.append(f"latest backup is from {backups[0].taken_at:%Y-%m-%d}")
-        payload: dict[str, Any] = {
+        return {
             "status": "attention" if checks else "ok",
             "checks": checks,
             "checked_at": now.isoformat(timespec="seconds"),
@@ -514,8 +538,26 @@ class WebApp:
                 "latest_bytes": backups[0].size if backups else None,
             },
         }
+
+    def api_new(self, request: Request) -> Response:
+        """How many articles arrived after `since` (an ISO time): the "N new" nav count."""
+        try:
+            since = datetime.fromisoformat(request.get("since").replace("Z", "+00:00"))
+        except ValueError:
+            since = None
+        if since is None or since.tzinfo is None:
+            payload: dict[str, Any] = {"error": "since must be an ISO time with a zone"}
+            status = "400 Bad Request"
+        else:
+            try:
+                with self.connection() as conn:
+                    payload = {"since": since.isoformat(), "latest": count_new(conn, since=since)}
+                    status = "200 OK"
+            except HttpError as exc:
+                payload, status = {"error": exc.message}, exc.status
         return Response(
-            json.dumps(payload, indent=2).encode(),
+            json.dumps(payload).encode(),
+            status=status,
             content_type="application/json",
             headers=[("Cache-Control", "no-store")],
         )
@@ -615,13 +657,15 @@ class WebApp:
         clock = Clock(request.utc)
         nav = join(
             render(
-                '<a href="{href}"{current}>{label}</a>',
+                '<a href="{href}" data-nav="{key}"{current}>{label}</a>',
                 href=self.link(request, path),
+                key=path.strip("/") or "briefing",
                 current=Markup(' aria-current="page"') if request.path == path else Markup(""),
                 label=label,
             )
             for path, label in (
-                ("/", "Latest"),
+                ("/", "Briefing"),
+                ("/latest", "Latest"),
                 ("/stories", "Stories"),
                 ("/rewrites", "Rewrites"),
                 ("/search", "Search"),
@@ -630,14 +674,16 @@ class WebApp:
             )
         )
         other = Clock(False).zone if request.utc else "UTC"
+        switch = self.link(
+            request,
+            request.path or "/",
+            utc=not request.utc,
+            page=request.page if request.page > 1 else None,
+        )
         toggle = render(
-            '<a class="zone" href="{href}">Times: {zone} · show {other}</a>',
-            href=self.link(
-                request,
-                request.path or "/",
-                utc=not request.utc,
-                page=request.page if request.page > 1 else None,
-            ),
+            '<a class="zone" href="{href}" title="Times are in {zone}; switch to {other}">'
+            "{zone} → {other}</a>",
+            href=switch,
             zone=clock.zone,
             other=other,
         )
@@ -656,6 +702,7 @@ class WebApp:
 <title>headliner</title>
 <link rel="icon" href="{icon}">
 <link rel="stylesheet" href="/static/app.css">
+<script src="/static/app.js" defer></script>
 </head>
 <body>
 <header class="top">
@@ -669,7 +716,8 @@ class WebApp:
 <main>
 {warning}{body}
 </main>
-<footer>Read-only view of the headliner database. Times in {zone}; hover a time for UTC.</footer>
+<footer>Read-only view of the headliner database. Times in {zone}; hover a time for UTC,
+or <a href="{switch}">show times in {other}</a>.</footer>
 </body>
 </html>
 """,
@@ -680,6 +728,8 @@ class WebApp:
             warning=warning,
             body=body,
             zone=clock.zone,
+            switch=switch,
+            other=other,
         )
 
     def error_page(self, status: str, message: str, request: Request | None = None) -> Response:
@@ -700,34 +750,44 @@ class WebApp:
         extra: Markup = EMPTY,
         keep: Sequence[str] = (),
     ) -> Markup:
-        """The filter bar: tag checkboxes, source picker, time window."""
+        """The filter bar: grouped tag checkboxes, source picker, time window.
+
+        Tags and source sit in a collapsible panel (closed on phones; app.js
+        opens it on wider screens), with the active ones repeated as removable
+        chips below so a closed panel still says what is filtered.
+        """
         config = self.config
-        tag_boxes = join(
-            render(
-                '<label class="chip"><input type="checkbox" name="tag" value="{tag}"{checked}>'
-                "{tag}</label>",
-                tag=tag,
-                checked=Markup(" checked") if tag in filters.tags else Markup(""),
+        all_tags = config.all_tags if config else []
+
+        def boxes(tags: Iterable[str]) -> Markup:
+            return join(
+                render(
+                    '<label class="chip"><input type="checkbox" name="tag" value="{tag}"{checked}>'
+                    "{tag}</label>",
+                    tag=tag,
+                    checked=Markup(" checked") if tag in filters.tags else EMPTY,
+                )
+                for tag in tags
             )
-            for tag in (config.all_tags if config else [])
-        )
-        names = sorted((s.name for s in config.sources), key=str.casefold) if config else []
-        if filters.source and filters.source not in names:
-            names.insert(0, filters.source)
-        options = join(
+
+        countries = [tag for tag in all_tags if is_country(tag)]
+        others = [tag for tag in all_tags if not is_country(tag)]
+        groups = [
             render(
-                '<option value="{name}"{sel}>{name}</option>',
-                name=name,
-                sel=Markup(" selected") if name == filters.source else Markup(""),
+                '<fieldset class="tags"><legend>{label}</legend>{boxes}</fieldset>',
+                label=label,
+                boxes=boxes(tags),
             )
-            for name in names
-        )
+            for label, tags in (("Countries", countries), ("Regions & topics", others))
+            if tags
+        ]
+        tag_boxes = join(groups) or Markup('<span class="muted">No tags configured.</span>')
         source_select = render(
             '<label>Source <select name="source"><option value="">All sources</option>'
             "{options}</select></label>",
-            options=options,
+            options=self.source_options(filters.source),
         )
-        since_select = Markup("")
+        since_select = EMPTY
         if since is not None:
             chosen = request.get("since", since)
             if chosen not in SINCE_CHOICES:
@@ -739,7 +799,7 @@ class WebApp:
                         '<option value="{value}"{sel}>{label}</option>',
                         value=key,
                         label="any time" if key == "all" else f"last {key}",
-                        sel=Markup(" selected") if key == chosen else Markup(""),
+                        sel=Markup(" selected") if key == chosen else EMPTY,
                     )
                     for key in SINCE_CHOICES
                 ),
@@ -749,25 +809,88 @@ class WebApp:
             for key in ("utc", *keep)
             for value in request.get_all(key)
         )
+        active = len(filters.tags) + bool(filters.source)
         notices = join(render('<p class="notice">{n}</p>', n=note) for note in filters.notices)
         return render(
             """<form class="filters" method="get" action="{action}">
   {extra}
-  <fieldset class="tags"><legend>Tags</legend>{tags}</fieldset>
-  {source}{since}{hidden}
+  <details class="panel">
+    <summary>Tags &amp; sources{count}</summary>
+    {tags}
+    {source}
+  </details>
+  {since}{hidden}
   <button type="submit">Apply</button>
   <a class="reset" href="{reset}">Reset</a>
 </form>
-{notices}""",
+{chips}{notices}""",
             action=request.path,
             extra=extra,
-            tags=tag_boxes or Markup('<span class="muted">none configured</span>'),
+            count=render(' <span class="count">{n} active</span>', n=active) if active else EMPTY,
+            tags=tag_boxes,
             source=source_select,
             since=since_select,
             hidden=hidden,
             reset=request.path + ("?utc=1" if request.utc else ""),
+            chips=self.active_chips(request, filters),
             notices=notices,
         )
+
+    def source_options(self, chosen: str) -> Markup:
+        """`<option>`s for every source, grouped by country (a source's first country tag)."""
+        config = self.config
+        grouped: dict[str, list[str]] = {}
+        for source in config.sources if config else []:
+            country = next((tag for tag in source.tags if is_country(tag)), "Other")
+            grouped.setdefault(country, []).append(source.name)
+        known = {name for names in grouped.values() for name in names}
+        orphan = (
+            render('<option value="{n}" selected>{n}</option>', n=chosen)
+            if chosen and chosen not in known
+            else EMPTY
+        )
+        groups = join(
+            render(
+                '<optgroup label="{label}">{options}</optgroup>',
+                label=country,
+                options=join(
+                    render(
+                        '<option value="{name}"{sel}>{name}</option>',
+                        name=name,
+                        sel=Markup(" selected") if name == chosen else EMPTY,
+                    )
+                    for name in sorted(names, key=str.casefold)
+                ),
+            )
+            for country, names in sorted(
+                grouped.items(), key=lambda item: (item[0] == "Other", item[0])
+            )
+        )
+        return join([orphan, groups])
+
+    def active_chips(self, request: Request, filters: Filters) -> Markup:
+        """The active tag and source filters as chips; following one removes it."""
+        chips = [
+            render(
+                '<a class="chip on" href="{h}" title="Remove this filter">{t} &times;</a>',
+                h=self.link(
+                    request, request.path, tag=[t for t in filters.tags if t != tag] or None
+                ),
+                t=tag,
+            )
+            for tag in filters.tags
+        ]
+        if filters.source:
+            chips.append(
+                render(
+                    '<a class="chip on" href="{h}" title="Remove this filter">{s} &times;</a>',
+                    h=self.link(request, request.path, source=None),
+                    s=filters.source,
+                )
+            )
+        if not chips:
+            return EMPTY
+        return render('<p class="active">Filtered by {c}</p>', c=join(chips, " "))
 
     def since(self, request: Request, default: str) -> datetime | None:
         key = request.get("since", default)
@@ -802,7 +925,7 @@ class WebApp:
         if story is not None and len(story.sources) > 1:
             parts.append(
                 render(
-                    '<a class="badge story" href="{h}" title="Other outlets reporting this">'
+                    '<a class="badge outlets" href="{h}" title="Other outlets reporting this">'
                     "{n} outlets</a>",
                     h=self.link(request, "/story", url=headline.url),
                     n=len(story.sources),
@@ -849,13 +972,16 @@ class WebApp:
             summary = _shorten(headline.summary, SUMMARY_LENGTH) if headline.summary else ""
             out.append(
                 render(
-                    """<li class="item">
+                    """<li class="item" data-seen="{seen}">
   <div class="meta">{time} <a class="source" href="{src_href}">{source}</a> {badges}</div>
   {title}
   {earlier}{summary}
 </li>""",
+                    seen=_iso_or_none(headline.fetched_at),
                     time=clock.time(when, "%H:%M" if group_by_day else "%Y-%m-%d %H:%M"),
-                    src_href=self.link(request, "/", source=headline.source, tag=None, q=None),
+                    src_href=self.link(
+                        request, "/latest", source=headline.source, tag=None, q=None
+                    ),
                     source=headline.source,
                     badges=self.badges(
                         headline, counts.get(headline.url, 1), request, story_of.get(headline.url)
@@ -1089,7 +1215,7 @@ class WebApp:
   <td><span class="state {css}" title="{error}">{state}</span>{detail}</td>
   <td>{feed}</td>
 </tr>""",
-                    list=self.link(request, "/", source=source.name, tag=None),
+                    list=self.link(request, "/latest", source=source.name, tag=None),
                     name=source.name,
                     type=source.type,
                     tags=join(
@@ -1292,25 +1418,7 @@ class WebApp:
             chosen.sort(key=lambda story: (len(story.sources), story.last_seen), reverse=True)
         page = request.page
         shown = chosen[(page - 1) * STORIES_PAGE_SIZE : page * STORIES_PAGE_SIZE]
-        clock = Clock(request.utc)
-        cards = join(
-            render(
-                """<li class="story">
-  <div class="meta">{first} to {last} · <strong>{n} outlets</strong> {tags}</div>
-  <h3><a href="{href}">{title}</a></h3>
-  <details><summary>{count} headlines</summary><ol class="members">{members}</ol></details>
-</li>""",
-                first=clock.time(story.first_seen, "%a %H:%M"),
-                last=clock.time(story.last_seen, "%a %H:%M"),
-                n=len(story.sources),
-                tags=self.tag_counts(story),
-                href=self.link(request, "/story", url=(story.lead or story.headlines[0]).url),
-                title=story.title,
-                count=len(story.headlines),
-                members=self.story_members(request, conn, story),
-            )
-            for story in shown
-        )
+        cards = join(self.story_card(request, conn, story) for story in shown)
         options = render(
             '<label>Outlets <select name="min">{m}</select></label>'
             '<label>Order <select name="sort">{o}</select></label>',
@@ -1348,6 +1456,38 @@ Headlines are grouped by shared words, so the occasional grouping is wrong.</p>
             if shown
             else Markup('<p class="empty">No stories match.</p>'),
             pager=self.pager(request, page * STORIES_PAGE_SIZE < len(chosen)),
+        )
+
+    def story_card(
+        self, request: Request, conn: sqlite3.Connection, story: Story, *, compact: bool = False
+    ) -> Markup:
+        """One story: when, how many outlets (by tag), its title, and (unless compact) members."""
+        clock = Clock(request.utc)
+        members = (
+            EMPTY
+            if compact
+            else render(
+                '<details><summary>{count} headlines</summary><ol class="members">{m}</ol>'
+                "</details>",
+                count=len(story.headlines),
+                m=self.story_members(request, conn, story),
+            )
+        )
+        return render(
+            """<li class="story{compact}" data-seen="{seen}">
+  <div class="meta">{first} to {last} · <strong>{n} outlets</strong> {tags}</div>
+  <h3><a href="{href}">{title}</a></h3>
+  {members}
+</li>""",
+            compact=" compact" if compact else "",
+            seen=_iso_or_none(min(headline.fetched_at for headline in story.headlines)),
+            first=clock.time(story.first_seen, "%a %H:%M"),
+            last=clock.time(story.last_seen, "%a %H:%M"),
+            n=len(story.sources),
+            tags=self.tag_counts(story),
+            href=self.link(request, "/story", url=(story.lead or story.headlines[0]).url),
+            title=story.title,
+            members=members,
         )
 
     @staticmethod
@@ -1391,6 +1531,123 @@ Headlines are grouped by shared words, so the occasional grouping is wrong.</p>
             lone=lone,
             count=len(story.headlines),
             members=self.story_members(request, conn, story),
+        )
+
+    # -- Briefing
+
+    def page_briefing(self, request: Request, conn: sqlite3.Connection) -> Markup:
+        """The home page: is everything working, what are the big stories, what changed."""
+        now = utcnow()
+        clock = Clock(request.utc)
+        recent = [
+            story
+            for story in self.stories(conn, "24h")
+            if len(story.sources) >= 2 and now - story.last_seen <= BRIEFING_WINDOW
+        ]
+        recent.sort(key=lambda story: (len(story.sources), story.last_seen), reverse=True)
+        top = recent[:BRIEFING_TOP]
+        shown = {id(story) for story in top}
+
+        config = self.config
+        regions: list[Markup] = []
+        if config is not None:
+            tags_of = {source.name.casefold(): source.tags for source in config.sources}
+            for tag in (tag for tag in config.all_tags if is_country(tag)):
+                # The stories this country's outlets lead on: the larger their share
+                # of a story's outlets, the more local it is. Each story shows once.
+                local = {
+                    id(story): sum(
+                        tag in tags_of.get(name.casefold(), ()) for name in story.sources
+                    )
+                    for story in recent
+                }
+                mine = sorted(
+                    (s for s in recent if id(s) not in shown and local[id(s)]),
+                    key=lambda s: (local[id(s)] / len(s.sources), local[id(s)], len(s.sources)),
+                    reverse=True,
+                )[:BRIEFING_PER_COUNTRY]
+                if not mine:
+                    continue
+                shown.update(id(story) for story in mine)
+                regions.append(
+                    render(
+                        """<section class="region"><h3>{tag}</h3>
+<ol class="stories">{cards}</ol>
+<a class="more" href="{more}">All {tag} stories →</a></section>""",
+                        tag=tag,
+                        cards=join(
+                            self.story_card(request, conn, story, compact=True) for story in mine
+                        ),
+                        more=self.link(request, "/stories", tag=tag, source=None),
+                    )
+                )
+
+        changes = list_title_changes(
+            conn, since=now - timedelta(hours=24), live="exclude", minor=False, limit=6
+        )
+        fresh = count_new(conn, since=now - BRIEFING_WINDOW)
+        hours = int(BRIEFING_WINDOW.total_seconds() // 3600)
+        return render(
+            """<h1>Briefing</h1>
+{health}
+<p class="muted">{fresh} new articles in the last {hours} hours.
+<span class="since-visit" hidden></span></p>
+<h2>Top stories · last {hours} h</h2>
+{top}
+<p><a class="more" href="{all_stories}">All stories →</a></p>
+{regions}
+<h2>Notable rewrites · last 24 h</h2>
+{changes}
+<p><a class="more" href="{all_rewrites}">All rewrites →</a></p>""",
+            health=self.health_strip(request, conn, clock),
+            fresh=f"{fresh:,}",
+            hours=hours,
+            top=render(
+                '<ol class="stories">{c}</ol>',
+                c=join(self.story_card(request, conn, story, compact=True) for story in top),
+            )
+            if top
+            else Markup(
+                '<p class="empty">No story has been reported by two or more outlets yet.</p>'
+            ),
+            all_stories=self.link(request, "/stories", tag=None, source=None),
+            regions=render('<h2>By country</h2><div class="regions">{r}</div>', r=join(regions))
+            if regions
+            else EMPTY,
+            changes=self.change_items(request, changes),
+            all_rewrites=self.link(request, "/rewrites", tag=None, source=None),
+        )
+
+    def health_strip(self, request: Request, conn: sqlite3.Connection, clock: Clock) -> Markup:
+        """One line: all well, or what needs attention (from the /api/status checks)."""
+        report = self.status_report(conn)
+        sources = report["sources"] or {}
+        states: dict[str, int] = sources.get("states", {})
+        backup = report["backups"]["latest_at"]
+        parts = [
+            render(
+                "{ok} of {enabled} sources ok",
+                ok=states.get("ok", 0),
+                enabled=sources.get("enabled", 0),
+            )
+            if sources
+            else EMPTY,
+            render(
+                "last backup {when}",
+                when=clock.time(datetime.fromisoformat(backup), "%a %H:%M"),
+            )
+            if backup
+            else EMPTY,
+        ]
+        detail = join((part for part in parts if part), " · ")
+        if report["status"] == "ok":
+            return render('<p class="health good">✓ All normal · {d}</p>', d=detail)
+        return render(
+            '<p class="health warn">⚠ Needs attention: {checks} · {d} · '
+            '<a href="{href}">Sources</a></p>',
+            checks="; ".join(report["checks"]),
+            d=detail,
+            href=self.link(request, "/sources", tag=None, source=None),
         )
 
     # -- Trends
@@ -1539,7 +1796,7 @@ source's first-ever run is left out.</p>
             render(
                 '<tr><th scope="row"><a href="{h}">{source}</a></th>{cells}'
                 '<td class="num">{total}</td></tr>',
-                h=self.link(request, "/", source=source, tag=None),
+                h=self.link(request, "/latest", source=source, tag=None),
                 source=source,
                 cells=join(cell(counts.get(day, 0)) for day in days),
                 total=sum(counts.values()),
@@ -1571,6 +1828,11 @@ source's first-ever run is left out.</p>
             rows=rows,
             footer=footer,
         )
+
+
+def is_country(tag: str) -> bool:
+    """Country tags are two capital letters (AU, IE); the rest are regions or topics."""
+    return len(tag) == 2 and tag.isalpha() and tag.isupper()
 
 
 def source_state(enabled: bool, status: SourceStatus, now: datetime) -> tuple[str, str]:
@@ -1620,7 +1882,11 @@ class _ReadOnly:
         self.conn: sqlite3.Connection | None = None
 
     def __enter__(self) -> sqlite3.Connection:
-        if not self.path.exists():
+        try:
+            exists = self.path.exists()
+        except OSError as exc:
+            raise HttpError("503 Service Unavailable", f"Cannot open the database: {exc}") from exc
+        if not exists:
             raise HttpError(
                 "503 Service Unavailable",
                 f"No database at {self.path} yet; it appears after the first fetch.",
