@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 from pathlib import Path
 
 import httpx
@@ -26,10 +27,15 @@ ALLOW_ALL = "User-agent: *\nAllow: /\n"
 DISALLOW_ALL = "User-agent: *\nDisallow: /\n"
 
 
-def rss(title: str, links: list[str]) -> bytes:
+# Recent enough not to count as a stale feed, whenever the tests run.
+PUBLISHED = (datetime.now(UTC) - timedelta(days=1)).replace(microsecond=0)
+
+
+def rss(title: str, links: list[str], published: datetime = PUBLISHED) -> bytes:
+    stamp = format_datetime(published, usegmt=True)
     items = "".join(
         f"<item><title>Headline number {i} about the harbour</title><link>{link}</link>"
-        "<pubDate>Fri, 02 Oct 2026 09:00:00 GMT</pubDate></item>"
+        f"<pubDate>{stamp}</pubDate></item>"
         for i, link in enumerate(links)
     )
     return (
@@ -77,7 +83,7 @@ def test_advertised_feed_is_used_and_named_from_its_title(
     assert found.feed_url == f"{SITE}rss/latest.xml"
     assert found.name == "Example News"
     assert found.items == 3
-    assert found.newest == datetime(2026, 10, 2, 9, 0, tzinfo=UTC)
+    assert found.newest == PUBLISHED
 
 
 def test_falls_back_to_platform_feed_paths(mocked: respx.MockRouter, settings: Settings) -> None:
@@ -405,3 +411,16 @@ def test_feed_already_in_config_is_reported_as_configured() -> None:
     ]
     mark_duplicate_feeds(results, config)
     assert (results[0].status, results[0].existing) == ("configured", "RTE News")
+
+
+def test_stale_feed_is_rejected_with_its_date(mocked: respx.MockRouter, settings: Settings) -> None:
+    feed = "https://rss.example.com/frozen.xml"
+    mocked.get("https://rss.example.com/robots.txt").mock(
+        return_value=httpx.Response(200, text=ALLOW_ALL)
+    )
+    old = rss("Frozen", [f"{SITE}a"], published=datetime(2018, 1, 24, 9, tzinfo=UTC))
+    mocked.get(feed).mock(return_value=httpx.Response(200, content=old))
+    catch_all(mocked)
+    [failed] = run([feed], settings)
+    assert failed.status == "failed"
+    assert "feed is stale: newest item 2018-01-24" in failed.note

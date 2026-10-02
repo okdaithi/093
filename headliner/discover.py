@@ -14,7 +14,7 @@ import logging
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Final, Literal
 from urllib.parse import urljoin, urlsplit
 
@@ -23,7 +23,7 @@ import httpx
 
 from headliner.config import Config, Settings, Source
 from headliner.fetcher import FetchError, RateLimiter, RobotsCache, build_client, fetch_url
-from headliner.models import clean_text, normalise_url
+from headliner.models import clean_text, normalise_url, utcnow
 from headliner.parsers import ParseError, find_feed_links, parse_feed
 
 logger = logging.getLogger(__name__)
@@ -45,6 +45,9 @@ FALLBACK_PATHS: Final = (
 # Small pages that redirect elsewhere are common; anything this long that
 # isn't a feed is not worth trying further candidates from the same page.
 MAX_CANDIDATES: Final = 12
+# A feed whose newest item is older than this has stopped updating (publishers
+# often leave retired feeds online, frozen).
+STALE_AFTER: Final = timedelta(days=14)
 
 Status = Literal["ok", "configured", "failed"]
 
@@ -163,8 +166,10 @@ async def _try_feed(
         return None, str(exc)
     if not headlines:
         return None, "feed has no usable items"
-    final_url = str(response.url) if response.url else url
     dated = [h.published_at for h in headlines if h.published_at]
+    if dated and utcnow() - max(dated) > STALE_AFTER:
+        return None, f"feed is stale: newest item {max(dated):%Y-%m-%d}"
+    final_url = str(response.url) if response.url else url
     return (
         Discovery(
             site=site,
@@ -264,7 +269,7 @@ async def discover_site(
         logger.debug("%s: %s rejected: %s", site, candidate, why)
         if why == "robots.txt disallows":
             robots_blocked += 1
-        elif candidate in advertised:
+        elif candidate in advertised or why.startswith("feed is stale"):
             reasons.append(f"advertised feed {candidate}: {why}")
 
     if robots_blocked == len(tried) and page_note.endswith("robots.txt disallows"):
