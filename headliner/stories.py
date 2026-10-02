@@ -81,16 +81,21 @@ def _stem(word: str) -> str:
     return word
 
 
-def tokens(text: str) -> list[str]:
-    """Content words of `text`: lowercased, possessives and suffixes folded, stopwords out."""
+def words(text: str) -> list[tuple[str, str]]:
+    """Content words of `text` as (stem, word as written, lowercased), stopwords out."""
     out = []
     for raw in _WORD.findall(unicodedata.normalize("NFKC", text).casefold()):
-        word = re.sub(r"['\u2019]s$", "", raw).replace("'", "").replace("\u2019", "")
-        word = _stem(word)
+        plain = re.sub(r"['\u2019]s$", "", raw).replace("'", "").replace("\u2019", "")
+        word = _stem(plain)
         if word in STOPWORDS or (len(word) < 3 and not any(c.isdigit() for c in word)):
             continue
-        out.append(word)
+        out.append((word, plain))
     return out
+
+
+def tokens(text: str) -> list[str]:
+    """Content words of `text`: lowercased, possessives and suffixes folded, stopwords out."""
+    return [word for word, _ in words(text)]
 
 
 @dataclass(slots=True)

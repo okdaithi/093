@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import re
 import sqlite3
@@ -431,6 +432,43 @@ def test_trends_page(get: Call) -> None:
     assert '<option value="30d" selected>' in body
     assert ">Example Wire</a></th>" not in body
     assert get("/trends?since=junk")[0] == "200 OK"
+
+
+def test_trends_rising_topics_and_day_links(db_path: Path, config_path: Path) -> None:
+    now = utcnow()
+    with connect(db_path) as conn:
+        store_headlines(
+            conn,
+            [
+                headline(f"Volcano erupts near town {i}", f"https://example.org/v{i}", source=src)
+                for i, src in enumerate(["Example Wire", "Other Daily", "Quiet Times"])
+            ]
+            + [
+                headline(
+                    "Budget talks continue",
+                    f"https://example.org/b{i}",
+                    fetched_at=now - timedelta(days=3, hours=i),
+                )
+                for i in range(3)
+            ],
+        )
+    get = make_client(WebApp(db_path, config_path))
+    status, _, body = get("/trends")
+    assert status == "200 OK"
+    assert "Rising topics" in body and ">volcano</a>" in body and "new</span>" in body
+    assert ">budget</a>" not in body  # only seen days ago
+    assert '<svg class="spark"' in body and "Biggest stories" in body
+    match = re.search(r'href="(/latest\?[^"]*day=(\d{4}-\d{2}-\d{2})[^"]*)"', body)
+    assert match
+    _, _, latest = get(html.unescape(match.group(1)))
+    assert f"First fetched on {match.group(2)}" in latest
+    assert get("/latest?day=nonsense")[0] == "200 OK"
+
+
+def test_trends_low_sample_greyed(get: Call) -> None:
+    _, _, body = get("/trends")
+    assert 'class="lowsample"' in body and "(n&lt;10)" in body
+    assert "All outlets" in body
 
 
 def test_frozen_feed_shows_content_stale(db_path: Path, config_path: Path) -> None:

@@ -26,7 +26,7 @@ import threading
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from importlib import resources
 from pathlib import Path
 from typing import Any, Final
@@ -38,14 +38,17 @@ from headliner.config import Config, ConfigError, load_config
 from headliner.models import Headline, is_minor_change, utcnow
 from headliner.store import (
     SCHEMA_VERSION,
+    FirstSeen,
     LiveFilter,
     Revision,
+    RewriteStat,
     SourceStatus,
     TitleChange,
     Totals,
     article_history,
     connect_readonly,
     count_new,
+    counts_by_source,
     feed_turnover,
     first_seen,
     hidden_changes,
@@ -60,7 +63,7 @@ from headliner.store import (
     source_status,
     totals,
 )
-from headliner.stories import MAX_STORY_HEADLINES, Story, by_url, cluster
+from headliner.stories import MAX_STORY_HEADLINES, Story, by_url, cluster, words
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +106,14 @@ BRIEFING_TOP: Final = 8
 BRIEFING_PER_COUNTRY: Final = 3
 TREND_WINDOWS: Final = {"7d": 7, "14d": 14, "30d": 30}
 HEAT_LEVELS: Final = 5
+# Trends: heatmap rows shown before "show all", rewrite sample size worth ranking,
+# rising topics listed, and how many outlets a term needs in the last day.
+HEAT_TOP_ROWS: Final = 20
+MIN_REWRITE_SAMPLE: Final = 10
+RISING_TOP: Final = 15
+RISING_MIN_COUNT: Final = 3
+RISING_MIN_SOURCES: Final = 2
+BIG_STORIES: Final = 10
 
 SECURITY_HEADERS: Final = [
     (
@@ -897,6 +908,17 @@ or <a href="{switch}">show times in {other}</a>.</footer>
         window = SINCE_CHOICES.get(key, SINCE_CHOICES[default])
         return utcnow() - window if window else None
 
+    def day_range(self, request: Request) -> tuple[datetime, datetime] | None:
+        """`day=YYYY-MM-DD` as a [start, end) range in UTC, midnight to midnight shown time."""
+        try:
+            day = date.fromisoformat(request.get("day", ""))
+        except ValueError:
+            return None
+        zone = Clock(request.utc).shown(utcnow()).tzinfo
+        start = datetime.combine(day, time.min, tzinfo=zone)
+        end = datetime.combine(day + timedelta(days=1), time.min, tzinfo=zone)
+        return start.astimezone(UTC), end.astimezone(UTC)
+
     def pager(self, request: Request, has_more: bool) -> Markup:
         page = request.page
         links = []
@@ -1008,17 +1030,30 @@ or <a href="{switch}">show times in {other}</a>.</footer>
     def page_latest(self, request: Request, conn: sqlite3.Connection) -> Markup:
         filters = self.filters(request)
         page = request.page
+        day_range = self.day_range(request)
         rows = list_headlines(
             conn,
-            since=self.since(request, "all"),
+            since=None if day_range else self.since(request, "all"),
             source=filters.source or None,
             sources=filters.sources,
             limit=PAGE_SIZE + 1,
             offset=(page - 1) * PAGE_SIZE,
+            fetched_since=day_range[0] if day_range else None,
+            fetched_until=day_range[1] if day_range else None,
         )
         has_more = len(rows) > PAGE_SIZE
+        day_note = (
+            render(
+                '<p class="notice">First fetched on {d}. <a href="{all}">Show all days</a>.</p>',
+                d=request.get("day"),
+                all=self.link(request, "/latest", day=None),
+            )
+            if day_range
+            else EMPTY
+        )
         return render(
-            "<h1>Latest headlines</h1>{form}{items}{pager}",
+            "<h1>Latest headlines</h1>{form}{note}{items}{pager}",
+            note=day_note,
             form=self.filter_form(request, filters, since="all"),
             items=self.headline_items(request, conn, rows[:PAGE_SIZE], group_by_day=True),
             pager=self.pager(request, has_more),
@@ -1659,47 +1694,92 @@ Headlines are grouped by shared words, so the occasional grouping is wrong.</p>
             window = "7d"
         clock = Clock(request.utc)
         days = TREND_WINDOWS[window]
-        today = clock.shown(utcnow()).date()
+        now = utcnow()
+        today = clock.shown(now).date()
         day_list = [today - timedelta(days=offset) for offset in range(days - 1, -1, -1)]
         start_local = datetime.combine(day_list[0], datetime.min.time())
-        start_local = start_local.replace(tzinfo=clock.shown(utcnow()).tzinfo)
+        start_local = start_local.replace(tzinfo=clock.shown(now).tzinfo)
         since = start_local.astimezone(UTC)
+        previous_since = since - timedelta(days=days)
         wanted = {name.casefold() for name in filters.named} if filters.named is not None else None
 
         def keep(source: str) -> bool:
             return wanted is None or source.casefold() in wanted
 
         # Articles per source per local day, and live blogs per day.
+        rows = [row for row in first_seen(conn, since=since) if keep(row.source)]
         per_day: dict[str, Counter[Any]] = {}
         live_per_day: Counter[Any] = Counter()
-        for row in first_seen(conn, since=since):
-            if not keep(row.source):
-                continue
+        for row in rows:
             day = clock.shown(row.fetched_at).date()
             per_day.setdefault(row.source, Counter())[day] += 1
             live_per_day[day] += int(row.is_live)
-        heat = self.heatmap(request, per_day, live_per_day, day_list)
+        previous = {
+            source: count
+            for source, count in counts_by_source(conn, since=previous_since, until=since).items()
+            if keep(source)
+        }
+        heat = self.heatmap(request, per_day, live_per_day, day_list, previous)
+        current_total = len(rows)
+        previous_total = sum(previous.values())
+        summary = render(
+            "<p>{n} articles in the last {days} days{delta}.</p>",
+            n=f"{current_total:,}",
+            days=days,
+            delta=render(
+                " ({d} on the previous {days} days)",
+                d=f"{(current_total - previous_total) / previous_total:+.0%}",
+                days=days,
+            )
+            if previous_total
+            else EMPTY,
+        )
+
+        rising = self.rising_topics(request, clock, rows, day_list, now)
+        big = self.big_stories(request, conn, since)
 
         stats = sorted(
             (stat for stat in rewrite_stats(conn, since=since) if keep(stat.source)),
-            key=lambda stat: (stat.share, stat.rewritten),
+            key=lambda stat: (stat.articles >= MIN_REWRITE_SAMPLE, stat.share, stat.rewritten),
             reverse=True,
         )
         rewrite_rows = join(
             render(
-                """<tr><td><a href="{h}">{source}</a></td><td class="num">{articles}</td>
-<td class="num">{rewritten}</td><td><span class="barwrap">{bar}<span>{pct}</span></span></td>
+                """<tr class="{css}"><td><a href="{h}">{source}</a></td>
+<td class="num">{articles}</td><td class="num">{rewritten}</td>
+<td><span class="barwrap">{bar}<span>{pct}</span></span></td>
 <td class="num">{delay}</td></tr>""",
+                css="lowsample" if stat.articles < MIN_REWRITE_SAMPLE else "",
                 h=self.link(request, "/rewrites", source=stat.source, tag=None),
                 source=stat.source,
                 articles=stat.articles,
                 rewritten=stat.rewritten,
                 bar=bar(stat.share),
-                pct=f"{stat.share:.0%}",
+                pct=f"{stat.share:.0%}"
+                + (f" (n<{MIN_REWRITE_SAMPLE})" if stat.articles < MIN_REWRITE_SAMPLE else ""),
                 delay=_duration(stat.median_delay),
             )
             for stat in stats
         )
+        rewrite_total = EMPTY
+        if stats:
+            overall = RewriteStat(
+                "All",
+                sum(stat.articles for stat in stats),
+                sum(stat.rewritten for stat in stats),
+                tuple(delay for stat in stats for delay in stat.delays),
+            )
+            rewrite_total = render(
+                """<tfoot><tr class="sum"><th scope="row">All outlets</th>
+<td class="num">{articles}</td><td class="num">{rewritten}</td>
+<td><span class="barwrap">{bar}<span>{pct}</span></span></td>
+<td class="num">{delay}</td></tr></tfoot>""",
+                articles=overall.articles,
+                rewritten=overall.rewritten,
+                bar=bar(overall.share),
+                pct=f"{overall.share:.0%}",
+                delay=_duration(overall.median_delay),
+            )
 
         turnover = sorted(
             (row for row in feed_turnover(conn, since=since) if keep(row.source)),
@@ -1728,19 +1808,29 @@ Headlines are grouped by shared words, so the occasional grouping is wrong.</p>
         return render(
             """<h1>Trends</h1>
 {form}
+{summary}
+<h2>Rising topics · last 24 h</h2>
+<p class="muted">Words in headlines from the last 24 hours, compared with their daily average
+over the rest of the period. Click one to search for it.</p>
+{rising}
+<h2>Biggest stories</h2>
+<p class="muted">Stories reported by the most outlets{story_note}.</p>
+{big}
 <h2>Articles per day</h2>
-<p class="muted">New articles by the day they were first fetched ({zone}). Darker is more.</p>
+<p class="muted">New articles by the day they were first fetched ({zone}). Darker is more;
+click a cell for that day's articles. ▲/▼ compares each total with the previous {days}
+days.</p>
 {heat}
 <h2>Rewrites by outlet</h2>
 <p class="muted">Of the articles first seen in this period (live blogs excluded), how many
 were reworded later. Punctuation-only changes don't count. The delay is from when the article
 was first fetched to when the new wording was, so it can't be shorter than the time between
-fetch runs.</p>
+fetch runs. Outlets with fewer than {min} articles are greyed and listed last.</p>
 <div class="scroll"><table>
 <thead><tr><th>Source</th><th class="num">Articles</th><th class="num">Rewritten</th>
 <th>Share</th><th class="num">Median delay</th></tr></thead>
-<tbody>{rewrite_rows}</tbody></table></div>
-<h2>Feed turnover and reliability</h2>
+<tbody>{rewrite_rows}</tbody>{rewrite_total}</table></div>
+<details class="section"><summary><h2>Feed turnover and reliability</h2></summary>
 <p class="muted">How much of each feed is new at each run. A feed that is entirely new run
 after run (<span class="warn">highlighted</span> when it happens in half the runs or more) is
 probably dropping stories between runs, so fetching more often would catch more. Each
@@ -1749,7 +1839,7 @@ source's first-ever run is left out.</p>
 <thead><tr><th>Source</th><th class="num">OK</th><th class="num">Failed</th>
 <th class="num">Skipped</th><th class="num">Items/run</th><th>New per run</th>
 <th class="num">Runs all new</th></tr></thead>
-<tbody>{turnover_rows}</tbody></table></div>""",
+<tbody>{turnover_rows}</tbody></table></div></details>""",
             form=self.filter_form(
                 request,
                 filters,
@@ -1766,11 +1856,102 @@ source's first-ever run is left out.</p>
                     ),
                 ),
             ),
+            summary=summary,
+            rising=rising,
+            big=big,
+            story_note=", among the last 7 days" if days > 7 else "",
             zone=clock.zone,
+            days=days,
             heat=heat,
+            min=MIN_REWRITE_SAMPLE,
             rewrite_rows=rewrite_rows or Markup('<tr><td colspan="5">No articles yet.</td></tr>'),
+            rewrite_total=rewrite_total,
             turnover_rows=turnover_rows
             or Markup('<tr><td colspan="7">No runs logged yet.</td></tr>'),
+        )
+
+    def rising_topics(
+        self,
+        request: Request,
+        clock: Clock,
+        rows: Sequence[FirstSeen],
+        days: list[Any],
+        now: datetime,
+    ) -> Markup:
+        """Terms much more common in the last 24 hours than over the rest of the period."""
+        recent_since = now - timedelta(hours=24)
+        config = self.config
+        ignored: set[str] = set()
+        if config is not None:
+            for source in config.sources:
+                ignored.update(stem for stem, _ in words(source.name))
+                ignored.update(tag.casefold() for tag in source.tags)
+        recent: Counter[str] = Counter()
+        earlier: Counter[str] = Counter()
+        outlets: dict[str, set[str]] = {}
+        per_day: dict[str, Counter[Any]] = {}
+        spelling: dict[str, Counter[str]] = {}
+        for row in rows:
+            if row.is_live:
+                continue
+            day = clock.shown(row.fetched_at).date()
+            fresh = row.fetched_at >= recent_since
+            for stem, plain in dict(words(row.title)).items():
+                if stem in ignored or stem.isdigit():
+                    continue
+                per_day.setdefault(stem, Counter())[day] += 1
+                if fresh:
+                    recent[stem] += 1
+                    outlets.setdefault(stem, set()).add(row.source)
+                    spelling.setdefault(stem, Counter())[plain] += 1
+                else:
+                    earlier[stem] += 1
+        span = (
+            max(1.0, (recent_since - rows[0].fetched_at).total_seconds() / 86400) if rows else 1.0
+        )
+        scored = []
+        for stem, count in recent.items():
+            if count < RISING_MIN_COUNT or len(outlets[stem]) < RISING_MIN_SOURCES:
+                continue
+            baseline = earlier[stem] / span
+            scored.append(((count + 1) / (baseline + 1), count, stem, baseline))
+        scored.sort(reverse=True)
+        if not scored:
+            return Markup('<p class="empty">Nothing stands out in the last 24 hours yet.</p>')
+        items = []
+        for ratio, count, stem, baseline in scored[:RISING_TOP]:
+            word = spelling[stem].most_common(1)[0][0]
+            items.append(
+                render(
+                    '<li><a href="{h}">{word}</a> {spark} <span class="muted">{n} in 24 h · '
+                    "{ratio}</span></li>",
+                    h=self.link(request, "/search", q=word, since=None, page=None),
+                    word=word,
+                    spark=sparkline([per_day[stem].get(day, 0) for day in days]),
+                    n=count,
+                    ratio="new" if baseline == 0 else f"\N{MULTIPLICATION SIGN}{ratio:.1f}",
+                )
+            )
+        return render('<ol class="rising">{i}</ol>', i=join(items))
+
+    def big_stories(self, request: Request, conn: sqlite3.Connection, since: datetime) -> Markup:
+        """The stories with the most outlets, among the last 7 days at most."""
+        stories = sorted(
+            (
+                story
+                for story in self.stories(conn, "7d")
+                if len(story.sources) >= 2 and story.last_seen >= since
+            ),
+            key=lambda story: (len(story.sources), story.last_seen),
+            reverse=True,
+        )[:BIG_STORIES]
+        if not stories:
+            return Markup(
+                '<p class="empty">No story has been reported by two or more outlets yet.</p>'
+            )
+        return render(
+            '<ol class="stories">{c}</ol>',
+            c=join(self.story_card(request, conn, story, compact=True) for story in stories),
         )
 
     def heatmap(
@@ -1779,37 +1960,70 @@ source's first-ever run is left out.</p>
         per_day: dict[str, Counter[Any]],
         live_per_day: Counter[Any],
         days: list[Any],
+        previous: dict[str, int] | None = None,
     ) -> Markup:
         if not per_day:
             return Markup('<p class="empty">No articles in this period.</p>')
+        previous = previous or {}
         peak = max(count for counts in per_day.values() for count in counts.values())
         totals_by_day: Counter[Any] = Counter()
         for counts in per_day.values():
             totals_by_day.update(counts)
 
-        def cell(count: int) -> Markup:
+        def cell(source: str, day: Any, count: int) -> Markup:
             level = 0 if count == 0 else max(1, math.ceil(HEAT_LEVELS * count / peak))
-            return render('<td class="heat h{l}" title="{n}">{n}</td>', l=level, n=count or "")
+            if not count:
+                return render('<td class="heat h{l}"></td>', l=level)
+            return render(
+                '<td class="heat h{l}"><a href="{h}" title="{n} on {d}">{n}</a></td>',
+                l=level,
+                h=self.link(
+                    request, "/latest", source=source, tag=None, since=None, day=day.isoformat()
+                ),
+                n=count,
+                d=day.isoformat(),
+            )
+
+        def change(source: str, total: int) -> Markup:
+            before = previous.get(source, 0)
+            if not before:
+                return EMPTY
+            ratio = (total - before) / before
+            if abs(ratio) < 0.1:
+                return EMPTY
+            return render(
+                ' <span class="{c}" title="{b} in the previous period">{a}</span>',
+                c="up" if ratio > 0 else "down",
+                b=before,
+                a="▲" if ratio > 0 else "▼",
+            )
 
         ordered = sorted(per_day.items(), key=lambda item: -sum(item[1].values()))
-        rows = join(
-            render(
-                '<tr><th scope="row"><a href="{h}">{source}</a></th>{cells}'
-                '<td class="num">{total}</td></tr>',
-                h=self.link(request, "/latest", source=source, tag=None),
-                source=source,
-                cells=join(cell(counts.get(day, 0)) for day in days),
-                total=sum(counts.values()),
+
+        def table_rows(chunk: Sequence[tuple[str, Counter[Any]]]) -> Markup:
+            return join(
+                render(
+                    '<tr><th scope="row"><a href="{h}">{source}</a></th>{cells}'
+                    '<td class="num">{total}{change}</td></tr>',
+                    h=self.link(request, "/latest", source=source, tag=None),
+                    source=source,
+                    cells=join(cell(source, day, counts.get(day, 0)) for day in days),
+                    total=sum(counts.values()),
+                    change=change(source, sum(counts.values())),
+                )
+                for source, counts in chunk
             )
-            for source, counts in ordered
-        )
-        head = join(
-            render(
-                '<th class="day" title="{full}">{d}</th>',
-                full=day.isoformat(),
-                d=day.strftime("%a %-d"),
-            )
-            for day in days
+
+        head = render(
+            '<thead><tr><th>Source</th>{d}<th class="num">Total</th></tr></thead>',
+            d=join(
+                render(
+                    '<th class="day" title="{full}">{d}</th>',
+                    full=day.isoformat(),
+                    d=day.strftime("%a %-d"),
+                )
+                for day in days
+            ),
         )
         footer = render(
             '<tr class="sum"><th scope="row">All sources</th>{t}<td class="num">{all}</td></tr>'
@@ -1820,14 +2034,41 @@ source's first-ever run is left out.</p>
             l=join(render('<td class="num">{n}</td>', n=live_per_day.get(day, 0)) for day in days),
             lt=sum(live_per_day.values()),
         )
-        return render(
-            '<div class="scroll"><table class="heatmap"><thead><tr><th>Source</th>{head}'
-            '<th class="num">Total</th></tr></thead><tbody>{rows}</tbody><tfoot>{footer}</tfoot>'
-            "</table></div>",
+        main = render(
+            '<div class="scroll"><table class="heatmap">{head}<tbody>{rows}</tbody>'
+            "<tfoot>{footer}</tfoot></table></div>",
             head=head,
-            rows=rows,
+            rows=table_rows(ordered[:HEAT_TOP_ROWS]),
             footer=footer,
         )
+        rest = ordered[HEAT_TOP_ROWS:]
+        if not rest:
+            return main
+        return render(
+            '{main}<details class="more-rows"><summary>Show the other {n} sources</summary>'
+            '<div class="scroll"><table class="heatmap">{head}<tbody>{rows}</tbody></table></div>'
+            "</details>",
+            main=main,
+            n=len(rest),
+            head=head,
+            rows=table_rows(rest),
+        )
+
+
+def sparkline(values: Sequence[int]) -> Markup:
+    """A tiny line chart of daily counts, as inline SVG (attributes only, CSP-safe)."""
+    if not values:
+        return EMPTY
+    peak = max(values) or 1
+    step = 100 / max(1, len(values) - 1)
+    points = " ".join(
+        f"{index * step:.1f},{18 - 16 * value / peak:.1f}" for index, value in enumerate(values)
+    )
+    return render(
+        '<svg class="spark" viewBox="0 0 100 20" preserveAspectRatio="none" aria-hidden="true">'
+        '<polyline points="{p}"/></svg>',
+        p=points,
+    )
 
 
 def is_country(tag: str) -> bool:

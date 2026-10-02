@@ -846,8 +846,14 @@ def list_headlines(
     sources: Sequence[str] | None = None,
     limit: int = 50,
     offset: int = 0,
+    fetched_since: datetime | None = None,
+    fetched_until: datetime | None = None,
 ) -> list[Headline]:
-    """Most recent headlines first, optionally filtered by age and source(s)."""
+    """Most recent headlines first, optionally filtered by age and source(s).
+
+    `fetched_since`/`fetched_until` bound when articles were first stored
+    (until is exclusive), as the Trends per-day counts are.
+    """
     clauses: list[str] = []
     params: list[Any] = []
     in_clause, in_params = _in_sources("source", sources)
@@ -857,6 +863,12 @@ def list_headlines(
     if since is not None:
         clauses.append("COALESCE(published_at, fetched_at) >= ?")
         params.append(_iso(since))
+    if fetched_since is not None:
+        clauses.append("fetched_at >= ?")
+        params.append(_iso(fetched_since))
+    if fetched_until is not None:
+        clauses.append("fetched_at < ?")
+        params.append(_iso(fetched_until))
     if source:
         clauses.append("source = ? COLLATE NOCASE")
         params.append(source)
@@ -1353,22 +1365,26 @@ class FirstSeen:
     source: str
     fetched_at: datetime
     is_live: bool
+    title: str = ""
 
 
-def first_seen(conn: sqlite3.Connection, *, since: datetime) -> list[FirstSeen]:
-    """Every article first stored since `since`, oldest first."""
-    with closing(
-        conn.execute(
-            "SELECT source, fetched_at, is_live FROM headlines WHERE fetched_at >= ?"
-            " ORDER BY fetched_at",
-            (_iso(since),),
-        )
-    ) as cursor:
+def first_seen(
+    conn: sqlite3.Connection, *, since: datetime, until: datetime | None = None
+) -> list[FirstSeen]:
+    """Every article first stored since `since` (and before `until`), oldest first."""
+    sql = "SELECT source, fetched_at, is_live, title FROM headlines WHERE fetched_at >= ?"
+    params = [_iso(since)]
+    if until is not None:
+        sql += " AND fetched_at < ?"
+        params.append(_iso(until))
+    with closing(conn.execute(sql + " ORDER BY fetched_at", params)) as cursor:
         rows = []
         for row in cursor.fetchall():
             when = _parse_iso(row["fetched_at"])
             if when is not None:
-                rows.append(FirstSeen(row["source"], when, bool(row["is_live"])))
+                rows.append(
+                    FirstSeen(row["source"], when, bool(row["is_live"]), row["title"] or "")
+                )
         return rows
 
 
@@ -1376,6 +1392,18 @@ def count_new(conn: sqlite3.Connection, *, since: datetime) -> int:
     """How many articles were first stored after `since`."""
     row = conn.execute("SELECT COUNT(*) FROM headlines WHERE fetched_at > ?", (_iso(since),))
     return int(row.fetchone()[0])
+
+
+def counts_by_source(
+    conn: sqlite3.Connection, *, since: datetime, until: datetime
+) -> dict[str, int]:
+    """Articles first stored in [since, until), per source."""
+    rows = conn.execute(
+        "SELECT source, COUNT(*) FROM headlines WHERE fetched_at >= ? AND fetched_at < ?"
+        " GROUP BY source",
+        (_iso(since), _iso(until)),
+    )
+    return {source: int(count) for source, count in rows.fetchall()}
 
 
 @dataclass(frozen=True, slots=True)
