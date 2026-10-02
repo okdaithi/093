@@ -202,7 +202,15 @@ async def fetch_url(
             last_error = f"HTTP {response.status_code}"
             if response.status_code not in RETRY_STATUSES:
                 raise FetchError(f"{url}: {last_error}")
-            delay = _backoff_delay(attempt, _retry_after_seconds(response))
+            retry_after = _retry_after_seconds(response)
+            if retry_after is not None and retry_after > BACKOFF_CAP_SECONDS:
+                # Retrying sooner than the server asked is impolite; leave this
+                # source for the next scheduled run instead.
+                raise FetchError(
+                    f"{url}: {last_error} with Retry-After {retry_after:.0f}s "
+                    f"(over the {BACKOFF_CAP_SECONDS:.0f}s cap); not retrying this run"
+                )
+            delay = _backoff_delay(attempt, retry_after)
             logger.debug(
                 "attempt %d/%d for %s got %s; retrying in %.2fs",
                 attempt,
