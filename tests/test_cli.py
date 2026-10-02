@@ -900,3 +900,50 @@ def test_changes_hides_minor_rewrites_unless_asked(
 
     assert main([*base, "--include-minor"]) == EXIT_OK
     assert "[minor] White elephant" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# stories
+# --------------------------------------------------------------------------
+
+
+def seed_story(db_path: Path) -> None:
+    conn = connect(db_path)
+    now = datetime.now(UTC)
+    rows = [
+        ("Example Wire", "Former Liberal politician Bruce Baird dies aged 84", "a"),
+        ("Other Daily", "Bruce Baird, former Liberal MP and NSW minister, dies aged 84", "b"),
+        ("Example Wire", "Invasive Asian hornet nest located in Cork", "c"),
+    ]
+    store_headlines(
+        conn,
+        [
+            Headline.create(
+                source=source,
+                title=title,
+                url=f"https://example.org/{slug}",
+                published_at=now - timedelta(hours=2),
+                fetched_at=now - timedelta(hours=2),
+            )
+            for source, title, slug in rows
+        ],
+    )
+    conn.close()
+
+
+def test_stories_lists_multi_outlet_stories(
+    db_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed_story(db_path)
+    base = ["stories", "--db", str(db_path), "--quiet"]
+    assert main(base) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "OUTLETS" in out and "Bruce Baird" in out and "hornet" not in out
+
+    assert main([*base, "--format", "json"]) == EXIT_OK
+    [story] = json.loads(capsys.readouterr().out)
+    assert sorted(story["sources"]) == ["Example Wire", "Other Daily"]
+    assert len(story["headlines"]) == 2
+
+    assert main([*base, "--min-sources", "3"]) == EXIT_OK
+    assert "No stories found." in capsys.readouterr().out

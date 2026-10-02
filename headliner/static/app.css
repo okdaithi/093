@@ -115,6 +115,19 @@ mark { background: var(--mark); color: inherit; border-radius: 2px; }
 .badge { font-size: 0.7rem; font-weight: 700; border-radius: 4px; padding: 0 0.35rem; letter-spacing: 0.03em; }
 .badge.live { background: var(--bad); color: #fff; }
 .badge.minor { background: var(--chip); color: var(--muted); font-weight: 600; }
+.badge.story { background: var(--chip); color: var(--link); }
+.stories { list-style: none; margin: 0; padding: 0; }
+.story { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 0.7rem 0.9rem; margin-bottom: 0.8rem; }
+.story .meta { font-size: 0.8rem; color: var(--muted); display: flex; flex-wrap: wrap; gap: 0.2rem 0.5rem; align-items: center; }
+.story h3 { font-size: 1.05rem; margin: 0.3rem 0; }
+.story h3 a { color: var(--text); }
+.story summary { cursor: pointer; font-size: 0.85rem; color: var(--link); }
+.members { margin: 0.4rem 0 0; padding-left: 1.2rem; font-size: 0.92rem; }
+.members li { margin: 0.3rem 0; }
+.members .meta { font-size: 0.78rem; color: var(--muted); margin-right: 0.3rem; }
+.members .source { font-weight: 600; }
+.members a { color: var(--text); }
+.members.wide li { padding: 0.35rem 0; border-bottom: 1px solid var(--line); }
 .badge.rewritten { background: var(--chip); color: var(--accent); }
 
 .notice { background: var(--panel); border-left: 3px solid var(--warn); padding: 0.4rem 0.7rem; font-size: 0.9rem; }
