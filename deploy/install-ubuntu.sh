@@ -43,6 +43,18 @@ if [[ ! -e /etc/headliner/sources.yaml ]]; then
         "${repo_dir}/deploy/sources.yaml" /etc/headliner/sources.yaml
 else
     echo "Keeping existing /etc/headliner/sources.yaml"
+    # Ship the current defaults alongside so changes (e.g. retired feeds) can
+    # be merged by hand; the live file is never overwritten.
+    install -o root -g headliner -m 0640 \
+        "${repo_dir}/deploy/sources.yaml" /etc/headliner/sources.yaml.dist
+    if ! cmp -s /etc/headliner/sources.yaml /etc/headliner/sources.yaml.dist; then
+        echo "NOTE: /etc/headliner/sources.yaml differs from the shipped defaults." >&2
+        echo "      Review with: diff -u /etc/headliner/sources.yaml /etc/headliner/sources.yaml.dist" >&2
+    fi
+fi
+
+if grep -q 'you@example\.com' /etc/headliner/sources.yaml; then
+    echo "WARNING: /etc/headliner/sources.yaml still uses the placeholder contact address." >&2
 fi
 
 install -o root -g root -m 0644 \

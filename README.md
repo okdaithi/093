@@ -68,7 +68,14 @@ sudo systemctl start headliner.service
 Inspect timer state with `systemctl list-timers headliner.timer` and logs with
 `journalctl -u headliner.service`. To deploy an update, rerun
 `sudo bash deploy/install-ubuntu.sh` from the updated checkout; it preserves the
-server's existing source configuration and database.
+server's existing source configuration and database. The current defaults are
+written next to it as `/etc/headliner/sources.yaml.dist`, and the installer
+prints a note when the two differ so you can merge changes such as retired
+feeds:
+
+```bash
+sudo diff -u /etc/headliner/sources.yaml /etc/headliner/sources.yaml.dist
+```
 
 ## Quickstart
 
