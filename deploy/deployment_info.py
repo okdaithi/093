@@ -8,12 +8,15 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 GITHUB_API = "https://api.github.com"
 COMMIT_PATTERN = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
+MERGE_PATTERN = re.compile(r"^Merge pull request #(\d+)\b")
 
 
 @dataclass(frozen=True)
@@ -30,7 +33,8 @@ class PullRequest:
 def _git_output(repo_dir: Path, *args: str) -> str | None:
     try:
         result = subprocess.run(
-            ["git", "-C", str(repo_dir), *args],
+            # The installer runs as root on a checkout owned by someone else.
+            ["git", "-c", f"safe.directory={repo_dir}", "-C", str(repo_dir), *args],
             check=False,
             capture_output=True,
             text=True,
@@ -117,6 +121,54 @@ def _fetch_pull_request(repository: str, commit: str) -> PullRequest | None:
     return _select_pull_request(payload, commit)
 
 
+def _latest_merge(repo_dir: Path) -> dict[str, Any] | None:
+    """The newest merge commit reachable from HEAD, read from local Git only."""
+    out = _git_output(repo_dir, "log", "--merges", "-1", "--format=%H%x1f%cI%x1f%s%x1f%b")
+    if not out:
+        return None
+    commit, date, subject, body = [*out.split("\x1f"), "", "", ""][:4]
+    match = MERGE_PATTERN.match(subject)
+    title = next((line.strip() for line in body.splitlines() if line.strip()), "")
+    return {
+        "commit": commit,
+        "date": date,
+        "subject": subject,
+        "pr": int(match.group(1)) if match else None,
+        "title": title or None,
+    }
+
+
+def _lookup(repository: str | None, commit: str) -> PullRequest | None:
+    if repository is None:
+        return None
+    try:
+        return _fetch_pull_request(repository, commit)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def build_record(repo_dir: Path, *, now: datetime | None = None) -> dict[str, Any]:
+    """What the web viewer shows about the installed code (saved as _build.json)."""
+    commit = _git_output(repo_dir, "rev-parse", "HEAD")
+    if commit is None or not COMMIT_PATTERN.fullmatch(commit):
+        commit = None
+    dirty = _git_output(repo_dir, "status", "--porcelain")
+    repository = _github_repository(_git_output(repo_dir, "config", "--get", "remote.origin.url"))
+    pull_request = _lookup(repository, commit) if commit else None
+    return {
+        "commit": commit,
+        "committed_at": _git_output(repo_dir, "show", "-s", "--format=%cI", "HEAD")
+        if commit
+        else None,
+        "branch": _git_output(repo_dir, "rev-parse", "--abbrev-ref", "HEAD"),
+        "dirty": bool(dirty) if dirty is not None else None,
+        "repository": repository,
+        "built_at": (now or datetime.now(UTC)).isoformat(timespec="seconds"),
+        "merge": _latest_merge(repo_dir),
+        "pr": asdict(pull_request) if pull_request else None,
+    }
+
+
 def show_deployment_info(repo_dir: Path) -> None:
     print("Deployment code:")
     commit = _git_output(repo_dir, "rev-parse", "HEAD")
@@ -163,5 +215,14 @@ def show_deployment_info(repo_dir: Path) -> None:
     print(f"  URL: {pull_request.url}")
 
 
+def main(argv: list[str]) -> None:
+    """`deployment_info.py REPO` prints; `deployment_info.py REPO --json PATH` saves."""
+    repo_dir = Path(argv[0])
+    if len(argv) == 3 and argv[1] == "--json":
+        Path(argv[2]).write_text(json.dumps(build_record(repo_dir), indent=2) + "\n")
+        return
+    show_deployment_info(repo_dir)
+
+
 if __name__ == "__main__":
-    show_deployment_info(Path(sys.argv[1]))
+    main(sys.argv[1:])

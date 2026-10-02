@@ -77,6 +77,12 @@ fi
 build_dir="$(mktemp -d)"
 trap 'rm -rf -- "${build_dir}"' EXIT
 cp -r "${repo_dir}/pyproject.toml" "${repo_dir}/README.md" "${repo_dir}/headliner" "${build_dir}/"
+# Record which code this is, for the web viewer's footer and /healthz.
+rm -f -- "${build_dir}/headliner/_build.json"
+if ! python3 "${repo_dir}/deploy/deployment_info.py" "${repo_dir}" \
+    --json "${build_dir}/headliner/_build.json"; then
+    echo "WARNING: Could not record build details; the viewer will show an unknown build." >&2
+fi
 "${venv_python}" -m pip install --no-deps --no-build-isolation "${build_dir}"
 
 install -d -o root -g headliner -m 0750 /etc/headliner

@@ -22,6 +22,7 @@ import math
 import re
 import socketserver
 import sqlite3
+import sys
 import threading
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -33,6 +34,7 @@ from typing import Any, Final
 from urllib.parse import parse_qs, urlencode, urlsplit
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
+from headliner import build as build_info
 from headliner import local_timezone, tz_abbrev
 from headliner.backup import default_dir, list_backups
 from headliner.config import Config, ConfigError, load_config
@@ -370,6 +372,7 @@ class WebApp:
         self._story_cache: dict[tuple[object, ...], list[Story]] = {}
         self._story_lock = threading.Lock()
         self._publishers: tuple[Config | None, dict[str, str]] = (None, {})
+        self.build = build_info.load()
         self._totals: tuple[tuple[object, ...], Totals] | None = None
 
     # -- WSGI plumbing
@@ -439,6 +442,7 @@ class WebApp:
                     "schema": schema_version(conn),
                     "articles": info.articles,
                     "last_fetch": info.last_fetch.isoformat() if info.last_fetch else None,
+                    "build": self.build.raw if self.build else None,
                 }
                 status = "200 OK"
         except HttpError as exc:
@@ -529,6 +533,7 @@ class WebApp:
             "checks": checks,
             "checked_at": now.isoformat(timespec="seconds"),
             "schema": version,
+            "build": self.build.raw if self.build else None,
             "database": {
                 "bytes": self.db_path.stat().st_size,
                 "articles": info.articles,
@@ -738,7 +743,8 @@ class WebApp:
 {warning}{body}
 </main>
 <footer>Read-only view of the headliner database. Times in {zone}; hover a time for UTC,
-or <a href="{switch}">show times in {other}</a>.</footer>
+or <a href="{switch}">show times in {other}</a>.
+<span class="build">{build}</span></footer>
 </body>
 </html>
 """,
@@ -751,6 +757,97 @@ or <a href="{switch}">show times in {other}</a>.</footer>
             zone=clock.zone,
             switch=switch,
             other=other,
+            build=self.build_line(request, clock),
+        )
+
+    def build_line(self, request: Request, clock: Clock) -> Markup:
+        """The footer's "which code is this" line."""
+        build = self.build
+        if build is None:
+            return render(
+                '<a href="{href}">Development build</a> (not installed by the deploy script).',
+                href=self.link(request, "/sources") + "#build",
+            )
+        pr = render(" · {link}", link=self.pr_link(build)) if build.pr_number else Markup("")
+        return render(
+            '<a href="{href}">Build <code>{short}</code></a>{dirty}{pr}{built}',
+            href=self.link(request, "/sources") + "#build",
+            short=build.short,
+            dirty=Markup(' <span class="warn">+ local changes</span>')
+            if build.dirty
+            else Markup(""),
+            pr=pr,
+            built=render(
+                " · installed {when} ({ago})",
+                when=clock.time(build.built_at, "%a %-d %b %H:%M"),
+                ago=clock.ago(build.built_at),
+            )
+            if build.built_at
+            else Markup(""),
+        )
+
+    @staticmethod
+    def pr_link(build: build_info.Build) -> Markup:
+        title = f" {build.pr_title}" if build.pr_title else ""
+        if not build.pr_url:
+            return render("PR #{n}{t}", n=build.pr_number, t=title)
+        return render(
+            '<a href="{href}" rel="noreferrer">PR #{n}</a>{t}',
+            href=build.pr_url,
+            n=build.pr_number,
+            t=title,
+        )
+
+    def build_details(self, conn: sqlite3.Connection, clock: Clock) -> Markup:
+        """The Sources page's "About this build" block."""
+        build = self.build
+        rows: list[tuple[str, Markup | str]] = []
+        if build is None:
+            rows.append(("Build", "Development build: no build record (headliner/_build.json)."))
+        else:
+            rows.append(
+                (
+                    "Commit",
+                    render(
+                        "<code>{c}</code>{d}",
+                        c=build.commit or "unknown",
+                        d=" (with local changes)" if build.dirty else "",
+                    ),
+                )
+            )
+            if build.branch:
+                rows.append(("Branch", build.branch))
+            if build.committed_at:
+                rows.append(("Committed", clock.time(build.committed_at)))
+            if build.pr_number is not None:
+                rows.append(("Pull request", self.pr_link(build)))
+            if build.merge_commit:
+                rows.append(
+                    (
+                        "Latest merge",
+                        render(
+                            "<code>{c}</code> {when}",
+                            c=build.merge_commit[:7],
+                            when=clock.time(build.merge_at) if build.merge_at else "",
+                        ),
+                    )
+                )
+            if build.built_at:
+                rows.append(
+                    (
+                        "Installed",
+                        render(
+                            "{when} ({ago})",
+                            when=clock.time(build.built_at),
+                            ago=clock.ago(build.built_at),
+                        ),
+                    )
+                )
+        rows.append(("Python", sys.version.split()[0]))
+        rows.append(("Database schema", str(schema_version(conn))))
+        return render(
+            '<h2 id="build">About this build</h2>\n<dl class="build-info">{rows}</dl>',
+            rows=join(render("<dt>{k}</dt><dd>{v}</dd>", k=k, v=v) for k, v in rows),
         )
 
     def error_page(self, status: str, message: str, request: Request | None = None) -> Response:
@@ -1335,7 +1432,9 @@ or <a href="{switch}">show times in {other}</a>.</footer>
 <thead><tr><th>Started ({zone})</th><th class="num">Took</th><th class="num">OK</th>
 <th class="num">Skipped</th><th class="num">Failed</th><th class="num">Found</th>
 <th class="num">New</th><th class="num">Retitled</th><th>Failed sources</th></tr></thead>
-<tbody>{run_rows}</tbody></table></div>""",
+<tbody>{run_rows}</tbody></table></div>
+{build}""",
+            build=self.build_details(conn, clock),
             healthy=healthy,
             enabled=enabled,
             tag_links=tag_links,
@@ -1703,7 +1802,15 @@ alone.</p>
         per_day: Counter[Any] = Counter(clock.shown(row.fetched_at).date() for row in rows)
         heat = (
             count_strip(
-                [(str(day.day), f"{day.strftime('%a')} {day.day} {day.strftime('%b')}", per_day[day]) for day in day_list]
+                [
+                    (
+                        str(day.day),
+                        f"{day.strftime('%a')} {day.day} {day.strftime('%b')}",
+                        per_day[day],
+                    )
+                    for day in day_list
+                ],
+                "articles a day",
             )
             if rows
             else Markup('<p class="empty">No articles in this period.</p>')
@@ -1844,7 +1951,8 @@ schedule as much as the outlet's own rhythm.</p>
             return Markup('<p class="empty">No articles in this period.</p>')
         per_hour = Counter(clock.shown(row.fetched_at).hour for row in rows)
         return count_strip(
-            [(f"{hour:02d}", f"{hour:02d}:00", per_hour[hour]) for hour in range(24)]
+            [(f"{hour:02d}", f"{hour:02d}:00", per_hour[hour]) for hour in range(24)],
+            "articles in each hour",
         )
 
     # -- Briefing
@@ -2320,7 +2428,8 @@ source's first-ever run is left out.</p>
         )
         main = render(
             '<div class="scroll"><table class="heatmap">{head}<tbody>{rows}</tbody>'
-            "<tfoot>{footer}</tfoot></table></div>",
+            "<tfoot>{footer}</tfoot></table></div>{legend}",
+            legend=heat_legend(peak, "articles a day"),
             head=head,
             rows=table_rows(ordered[:HEAT_TOP_ROWS]),
             footer=footer,
@@ -2339,12 +2448,32 @@ source's first-ever run is left out.</p>
         )
 
 
-def count_strip(cells: Sequence[tuple[str, str, int]]) -> Markup:
+def heat_legend(peak: int, unit: str) -> Markup:
+    """The key to a heatmap's shades: what range of counts each one stands for."""
+    if peak <= 0:
+        return EMPTY
+    swatches = []
+    for level in range(1, HEAT_LEVELS + 1):
+        low = math.floor(peak * (level - 1) / HEAT_LEVELS) + 1
+        high = math.floor(peak * level / HEAT_LEVELS)
+        if high < low:
+            continue
+        span = str(low) if low == high else f"{low}\N{EN DASH}{high}"
+        swatches.append(render('<span class="heat h{l}" title="{s}">{s}</span>', l=level, s=span))
+    return render(
+        '<p class="legend" aria-label="Shading key">{u}: {s}</p>',
+        u=unit[:1].upper() + unit[1:],
+        s=join(swatches),
+    )
+
+
+def count_strip(cells: Sequence[tuple[str, str, int]], unit: str = "articles") -> Markup:
     """One row of shaded count cells under short labels: (label, hover name, count)."""
     peak = max((count for _, _, count in cells), default=0) or 1
     return render(
         '<div class="scroll"><table class="heatmap hours"><thead><tr>{h}</tr></thead>'
-        "<tbody><tr>{c}</tr></tbody></table></div>",
+        "<tbody><tr>{c}</tr></tbody></table></div>{legend}",
+        legend=heat_legend(peak, unit),
         h=join(render('<th class="day">{l}</th>', l=label) for label, _, _ in cells),
         c=join(
             render(
