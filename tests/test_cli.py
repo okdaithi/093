@@ -431,7 +431,7 @@ def test_migrate_dry_run_reports_and_changes_nothing(
     make_legacy_db(path)
     assert main(["migrate", "--dry-run", "--db", str(path), "--quiet"]) == EXIT_OK
     out = capsys.readouterr().out
-    assert "schema version 0 -> 2" in out
+    assert "schema version 0 -> 3" in out
     assert "would merge 1 row(s) across 1 URL(s)" in out
     assert "would flag 0 live blog(s)" in out
     assert "nothing changed" in out
@@ -721,3 +721,68 @@ def test_unchanged_live_blog_hides_nothing(
     out = capsys.readouterr().out
     assert "No headline changes found." in out
     assert "hidden" not in out
+
+
+# --------------------------------------------------------------------------
+# search --history
+# --------------------------------------------------------------------------
+
+
+def seed_retitled(db_path: Path) -> None:
+    conn = connect(db_path)
+    for hours, title in enumerate(
+        ["Quarantine centre to become a prison", "White elephant may become WA's newest prison"]
+    ):
+        store_headlines(
+            conn,
+            [
+                Headline.create(
+                    source="ABC News AU",
+                    title=title,
+                    url="https://example.org/quarantine-centre",
+                    fetched_at=datetime.now(UTC) - timedelta(hours=5 - hours),
+                )
+            ],
+        )
+    conn.close()
+
+
+def test_search_is_current_only_by_default(
+    db_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed_retitled(db_path)
+    assert main(["search", "quarantine", "--db", str(db_path), "--quiet"]) == EXIT_OK
+    assert "No headlines found." in capsys.readouterr().out
+
+
+def test_search_history_shows_the_matched_earlier_title(
+    db_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed_retitled(db_path)
+    base = ["search", "quarantine", "--history", "--db", str(db_path), "--quiet"]
+
+    assert main(base) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "MATCHED EARLIER TITLE" in out
+    assert "White elephant may become WA's newest prison" in out
+    assert "Quarantine centre to become a prison" in out
+
+    assert main([*base, "--format", "json"]) == EXIT_OK
+    [item] = json.loads(capsys.readouterr().out)
+    assert item["title"] == "White elephant may become WA's newest prison"
+    assert item["matched_title"] == "Quarantine centre to become a prison"
+
+    assert main([*base, "--format", "csv"]) == EXIT_OK
+    [row] = list(csv.DictReader(io.StringIO(capsys.readouterr().out)))
+    assert row["matched_title"] == "Quarantine centre to become a prison"
+
+
+def test_search_history_on_current_words_adds_no_column(
+    db_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed_retitled(db_path)
+    args = ["search", "elephant", "--history", "--db", str(db_path), "--quiet"]
+    assert main(args) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "White elephant" in out
+    assert "MATCHED EARLIER TITLE" not in out

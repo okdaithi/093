@@ -11,7 +11,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Final, Literal
 
-from headliner.models import Headline, looks_live, to_utc, utcnow
+from headliner.models import (
+    Headline,
+    compute_hash,
+    looks_live,
+    normalise_url,
+    to_utc,
+    utcnow,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -19,8 +26,9 @@ DEFAULT_DB_PATH: Final = Path("headlines.db")
 
 # Stored in `PRAGMA user_version`. 0 is the original layout (dedup on URL and
 # title); 1 keys `headlines` on URL and keeps titles in `headline_revisions`;
-# 2 adds `headlines.is_live` for live blogs.
-SCHEMA_VERSION: Final = 2
+# 2 adds `headlines.is_live` for live blogs; 3 re-normalises stored URLs (BBC
+# `at_*` tracking parameters) and indexes `headline_revisions` for search.
+SCHEMA_VERSION: Final = 3
 
 _SCHEMA: Final = """
 CREATE TABLE IF NOT EXISTS headlines (
@@ -133,6 +141,37 @@ CREATE TRIGGER IF NOT EXISTS headlines_fts_update AFTER UPDATE ON headlines BEGI
 END;
 """
 
+# Every title and summary an article has carried, for `search --history`.
+_REVISIONS_FTS_SCHEMA: Final = """
+CREATE VIRTUAL TABLE IF NOT EXISTS headline_revisions_fts USING fts5(
+    title,
+    summary,
+    content='headline_revisions',
+    content_rowid='id',
+    tokenize='unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS headline_revisions_fts_insert AFTER INSERT ON headline_revisions
+BEGIN
+    INSERT INTO headline_revisions_fts(rowid, title, summary)
+    VALUES (new.id, new.title, new.summary);
+END;
+
+CREATE TRIGGER IF NOT EXISTS headline_revisions_fts_delete AFTER DELETE ON headline_revisions
+BEGIN
+    INSERT INTO headline_revisions_fts(headline_revisions_fts, rowid, title, summary)
+    VALUES ('delete', old.id, old.title, old.summary);
+END;
+
+CREATE TRIGGER IF NOT EXISTS headline_revisions_fts_update AFTER UPDATE ON headline_revisions
+BEGIN
+    INSERT INTO headline_revisions_fts(headline_revisions_fts, rowid, title, summary)
+    VALUES ('delete', old.id, old.title, old.summary);
+    INSERT INTO headline_revisions_fts(rowid, title, summary)
+    VALUES (new.id, new.title, new.summary);
+END;
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class SourceStatus:
@@ -168,6 +207,15 @@ class TitleChange:
 
 
 @dataclass(frozen=True, slots=True)
+class SearchHit:
+    """One article found by `search_history`."""
+
+    headline: Headline
+    # The earlier title whose version matched, or None when the current one did.
+    matched_title: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class UpgradePlan:
     """What `migrate` would do to an existing database, for `--dry-run`."""
 
@@ -177,6 +225,8 @@ class UpgradePlan:
     merged_urls: int
     rows_merged: int
     live_articles: int = 0
+    urls_normalised: int = 0
+    rows_folded: int = 0
 
     @property
     def needed(self) -> bool:
@@ -233,9 +283,41 @@ def upgrade_plan(conn: sqlite3.Connection) -> UpgradePlan:
         ).fetchone()[0]
     rows_merged = int(total) - int(distinct) if version < 1 else 0
     live_articles = len(_live_urls(conn)) if version < 2 else 0
+    urls_normalised = rows_folded = 0
+    if version < 3:
+        targets, groups = _normalisation_plan(conn)
+        urls_normalised = sum(1 for _, (old, new) in targets.items() if old != new)
+        rows_folded = sum(len({targets[i][0] for i in ids}) - 1 for ids in groups.values())
     return UpgradePlan(
-        version, SCHEMA_VERSION, int(total), int(merged_urls), rows_merged, live_articles
+        version,
+        SCHEMA_VERSION,
+        int(total),
+        int(merged_urls),
+        rows_merged,
+        live_articles,
+        urls_normalised,
+        rows_folded,
     )
+
+
+def _normalisation_plan(
+    conn: sqlite3.Connection,
+) -> tuple[dict[int, tuple[str, str]], dict[str, list[int]]]:
+    """Each headline's (stored, re-normalised) URL, and URLs that now collide.
+
+    Collisions map the new URL to its row ids, oldest first. On a version-0
+    database (several rows per URL) these are counted after the v1 merge.
+    """
+    targets: dict[int, tuple[str, str]] = {}
+    by_new: dict[str, set[str]] = {}  # distinct stored URLs per new URL
+    ids_by_new: dict[str, list[int]] = {}
+    for row in conn.execute("SELECT id, url FROM headlines ORDER BY id").fetchall():
+        new_url = normalise_url(row[1])
+        targets[row[0]] = (row[1], new_url)
+        by_new.setdefault(new_url, set()).add(row[1])
+        ids_by_new.setdefault(new_url, []).append(row[0])
+    groups = {url: ids_by_new[url] for url, olds in by_new.items() if len(olds) > 1}
+    return targets, groups
 
 
 def _live_urls(conn: sqlite3.Connection) -> set[str]:
@@ -313,6 +395,131 @@ def _upgrade_to_v2(conn: sqlite3.Connection) -> None:
         logger.info("upgrading database: flagged %d live blog(s)", len(live))
 
 
+def _upgrade_to_v3(conn: sqlite3.Connection) -> None:
+    """Re-normalise stored URLs, folding rows that now share one, and index history.
+
+    URL normalisation now strips more tracking parameters (`at_*`), so a
+    stored URL can change and two rows can turn out to be one article. Each
+    such group keeps its oldest row, takes over the others' title history and
+    keeps the most recently seen title. Hashes depend on the URL, so they are
+    recomputed for every row and revision.
+    """
+    targets, groups = _normalisation_plan(conn)
+    changed = sum(1 for old, new in targets.values() if old != new)
+    if changed:
+        backup = _backup(conn, "pre-v3")
+        logger.warning(
+            "upgrading database: re-normalising %d URL(s), folding %d row(s) (backup: %s)",
+            changed,
+            sum(len(ids) - 1 for ids in groups.values()),
+            backup,
+        )
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # `migrate` has just created the history index empty. Fill it before
+        # touching any revision: its update/delete triggers assume every row
+        # is already indexed, and removing an unindexed row corrupts FTS5.
+        if _table_exists(conn, "headline_revisions_fts"):
+            conn.execute(
+                "INSERT INTO headline_revisions_fts(headline_revisions_fts) VALUES ('rebuild')"
+            )
+        keepers = set()
+        for ids in groups.values():
+            _fold_rows(conn, keeper=ids[0], others=ids[1:])
+            keepers.add(ids[0])
+        for headline_id, (old_url, new_url) in targets.items():
+            # Keepers always need rehashing: they hold moved revisions and may
+            # have taken another row's title.
+            if (old_url == new_url and headline_id not in keepers) or not _row_exists(
+                conn, headline_id
+            ):
+                continue
+            title = conn.execute(
+                "SELECT title FROM headlines WHERE id = ?", (headline_id,)
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE headlines SET url = ?, content_hash = ? WHERE id = ?",
+                (new_url, compute_hash(new_url, title), headline_id),
+            )
+            _rehash_revisions(conn, headline_id, new_url)
+        conn.execute("PRAGMA user_version = 3")
+    except BaseException:
+        conn.rollback()
+        raise
+    conn.commit()
+
+
+def _row_exists(conn: sqlite3.Connection, headline_id: int) -> bool:
+    return (
+        conn.execute("SELECT 1 FROM headlines WHERE id = ?", (headline_id,)).fetchone() is not None
+    )
+
+
+def _rehash_revisions(conn: sqlite3.Connection, headline_id: int, url: str) -> None:
+    """Recompute revision hashes for a new URL, dropping revisions that now repeat."""
+    seen: set[str] = set()
+    for rev_id, title, old_hash in conn.execute(
+        "SELECT id, title, content_hash FROM headline_revisions WHERE headline_id = ?"
+        " ORDER BY seen_at, id",
+        (headline_id,),
+    ).fetchall():
+        new_hash = compute_hash(url, title)
+        if new_hash in seen:
+            conn.execute("DELETE FROM headline_revisions WHERE id = ?", (rev_id,))
+            continue
+        seen.add(new_hash)
+        if new_hash != old_hash:
+            conn.execute(
+                "UPDATE headline_revisions SET content_hash = ? WHERE id = ?", (new_hash, rev_id)
+            )
+
+
+def _fold_rows(conn: sqlite3.Connection, *, keeper: int, others: list[int]) -> None:
+    """Merge `others` into `keeper`: one article seen under several stored URLs."""
+    marks = ",".join("?" * len(others))
+    # Hashes are about to be recomputed, so park the moved revisions on unique
+    # placeholder hashes; `_rehash_revisions` then drops true repeats.
+    conn.execute(
+        f"""
+        UPDATE headline_revisions
+        SET headline_id = ?, content_hash = 'fold:' || id
+        WHERE headline_id IN ({marks})
+        """,
+        (keeper, *others),
+    )
+    group = (keeper, *others)
+    all_marks = ",".join("?" * len(group))
+    first_seen, published, live = conn.execute(
+        f"""
+        SELECT MIN(fetched_at), MIN(published_at), MAX(is_live)
+        FROM headlines WHERE id IN ({all_marks})
+        """,
+        group,
+    ).fetchone()
+    conn.execute(f"DELETE FROM headlines WHERE id IN ({marks})", others)
+    latest = conn.execute(
+        "SELECT title, summary FROM headline_revisions WHERE headline_id = ?"
+        " ORDER BY seen_at DESC, id DESC LIMIT 1",
+        (keeper,),
+    ).fetchone()
+    conn.execute(
+        """
+        UPDATE headlines
+        SET fetched_at = ?, published_at = COALESCE(published_at, ?), is_live = ?,
+            title = COALESCE(?, title), summary = COALESCE(?, summary)
+        WHERE id = ?
+        """,
+        (
+            first_seen,
+            published,
+            live,
+            latest[0] if latest else None,
+            latest[1] if latest else None,
+            keeper,
+        ),
+    )
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     """Create the schema if absent and apply pending upgrades. Safe on every start."""
     conn.execute("PRAGMA journal_mode=WAL")
@@ -320,6 +527,7 @@ def migrate(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
     try:
         conn.executescript(_FTS_SCHEMA)
+        conn.executescript(_REVISIONS_FTS_SCHEMA)
     except sqlite3.OperationalError as exc:
         logger.debug("FTS5 unavailable (%s); search will use LIKE", exc)
     conn.commit()
@@ -327,6 +535,8 @@ def migrate(conn: sqlite3.Connection) -> None:
         _upgrade_to_v1(conn)
     if int(conn.execute("PRAGMA user_version").fetchone()[0]) < 2:
         _upgrade_to_v2(conn)
+    if int(conn.execute("PRAGMA user_version").fetchone()[0]) < 3:
+        _upgrade_to_v3(conn)
 
 
 def connect(
@@ -668,6 +878,96 @@ def search_headlines(
         )
     ) as cursor:
         return [_row_to_headline(row) for row in cursor.fetchall()]
+
+
+def search_history(
+    conn: sqlite3.Connection,
+    query: str,
+    *,
+    limit: int = 50,
+) -> list[SearchHit]:
+    """Search every title and summary an article has carried; one hit per article.
+
+    Articles rank by their best-matching version. A hit carries the matched
+    earlier title when that version was not the current one.
+    """
+    term = query.strip()
+    if not term:
+        return []
+
+    columns = ", ".join(f"h.{c}" for c in _SELECT_COLUMNS.split(", "))
+    # The version reported per article: the current one whenever it matches,
+    # otherwise the best-ranked earlier one. Articles rank by their best score.
+    best_per_article = """
+        ROW_NUMBER() OVER (
+            PARTITION BY r.headline_id
+            ORDER BY r.content_hash = h.content_hash DESC, m.score, r.seen_at DESC, r.id DESC
+        ) AS rn,
+        MIN(m.score) OVER (PARTITION BY r.headline_id) AS best
+    """
+    if _table_exists(conn, "headline_revisions_fts"):
+        match = _fts_query(term)
+        if match:
+            try:
+                with closing(
+                    conn.execute(
+                        f"""
+                        WITH m AS (
+                            SELECT rowid AS rid, bm25(headline_revisions_fts) AS score
+                            FROM headline_revisions_fts
+                            WHERE headline_revisions_fts MATCH ?
+                        ),
+                        ranked AS (
+                            SELECT r.headline_id, r.title AS matched, {best_per_article}
+                            FROM m
+                            JOIN headline_revisions r ON r.id = m.rid
+                            JOIN headlines h ON h.id = r.headline_id
+                        )
+                        SELECT {columns}, ranked.matched
+                        FROM ranked JOIN headlines h ON h.id = ranked.headline_id
+                        WHERE ranked.rn = 1
+                        ORDER BY ranked.best, COALESCE(h.published_at, h.fetched_at) DESC
+                        LIMIT ?
+                        """,
+                        (match, max(1, limit)),
+                    )
+                ) as cursor:
+                    return [_row_to_hit(row) for row in cursor.fetchall()]
+            except sqlite3.OperationalError as exc:
+                logger.debug("FTS history query failed (%s); falling back to LIKE", exc)
+
+    pattern = f"%{_escape_like(term)}%"
+    with closing(
+        conn.execute(
+            f"""
+            WITH m AS (
+                SELECT id AS rid, 0 AS score FROM headline_revisions
+                WHERE title LIKE ? ESCAPE '\\' OR COALESCE(summary, '') LIKE ? ESCAPE '\\'
+            ),
+            ranked AS (
+                SELECT r.headline_id, r.title AS matched, {best_per_article}
+                FROM m
+                JOIN headline_revisions r ON r.id = m.rid
+                JOIN headlines h ON h.id = r.headline_id
+            )
+            SELECT {columns}, ranked.matched
+            FROM ranked JOIN headlines h ON h.id = ranked.headline_id
+            WHERE ranked.rn = 1
+            ORDER BY COALESCE(h.published_at, h.fetched_at) DESC, h.id DESC
+            LIMIT ?
+            """,
+            (pattern, pattern, max(1, limit)),
+        )
+    ) as cursor:
+        return [_row_to_hit(row) for row in cursor.fetchall()]
+
+
+def _row_to_hit(row: sqlite3.Row) -> SearchHit:
+    headline = _row_to_headline(row)
+    matched = row["matched"]
+    return SearchHit(
+        headline=headline, matched_title=None if matched == headline.title else matched
+    )
 
 
 def source_status(conn: sqlite3.Connection, names: Iterable[str]) -> list[SourceStatus]:

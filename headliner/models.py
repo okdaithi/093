@@ -48,6 +48,14 @@ _TRACKING_PARAMS = frozenset(
         "utm_term",
     }
 )
+# Whole families of tracking parameters. `at_` is AT Internet / Piano Analytics,
+# which the BBC appends to every feed link (`at_campaign=rss&at_medium=RSS`).
+_TRACKING_PREFIXES = ("at_", "utm_")
+
+
+def _is_tracking_param(key: str) -> bool:
+    lowered = key.lower()
+    return lowered in _TRACKING_PARAMS or lowered.startswith(_TRACKING_PREFIXES)
 
 
 def clean_text(value: str | None) -> str:
@@ -86,7 +94,7 @@ def normalise_url(url: str, *, drop_query: bool = False) -> str:
         kept = [
             (key, value)
             for key, value in parse_qsl(parts.query, keep_blank_values=True)
-            if key.lower() not in _TRACKING_PARAMS
+            if not _is_tracking_param(key)
         ]
         query = urlencode(sorted(kept))
 

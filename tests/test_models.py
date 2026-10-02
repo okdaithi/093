@@ -182,3 +182,23 @@ def test_headline_create_sets_is_live() -> None:
     plain = Headline.create(source="X", title="An ordinary headline here", url="https://e.org/b")
     assert live.is_live and live.as_dict()["is_live"] is True
     assert not plain.is_live
+
+
+def test_normalise_url_strips_bbc_at_internet_params() -> None:
+    raw = "https://www.bbc.co.uk/news/articles/c5kg0gwwpyx8o?at_campaign=rss&at_medium=RSS"
+    assert normalise_url(raw) == "https://www.bbc.co.uk/news/articles/c5kg0gwwpyx8o"
+    assert normalise_url("https://e.org/a?id=3&utm_anything=x&AT_Link_ID=9") == (
+        "https://e.org/a?id=3"
+    )
+
+
+def test_normalise_url_keeps_lookalike_params() -> None:
+    assert normalise_url("https://e.org/a?attribute=1&at=2") == "https://e.org/a?at=2&attribute=1"
+
+
+def test_bbc_campaign_change_no_longer_changes_the_hash() -> None:
+    base = "https://www.bbc.co.uk/news/articles/c5kg0gwwpyx8o"
+    title = "A headline long enough to keep"
+    assert compute_hash(f"{base}?at_campaign=rss&at_medium=RSS", title) == compute_hash(
+        f"{base}?at_campaign=newsletter", title
+    )

@@ -33,6 +33,7 @@ from headliner.store import (
     open_db,
     record_fetch,
     search_headlines,
+    search_history,
     source_status,
     store_headlines,
     upgrade_plan,
@@ -137,31 +138,43 @@ def render_table(rows: list[list[str]], headers: list[str], stream: TextIO) -> N
 
 
 def output_headlines(
-    headlines: list[Headline], fmt: str, stream: TextIO, *, utc: bool = False
+    headlines: list[Headline],
+    fmt: str,
+    stream: TextIO,
+    *,
+    utc: bool = False,
+    matched: Sequence[str | None] | None = None,
 ) -> None:
     """Write headlines to `stream` as a table, JSON or CSV.
 
     JSON and CSV always carry UTC ISO-8601 timestamps; only the table follows `utc`.
+    `matched` (from `search --history`) adds each hit's matched earlier title.
     """
     if fmt == "json":
-        json.dump([headline.as_dict() for headline in headlines], stream, indent=2)
+        items = [headline.as_dict() for headline in headlines]
+        if matched is not None:
+            for item, title in zip(items, matched, strict=True):
+                item["matched_title"] = title
+        json.dump(items, stream, indent=2)
         stream.write("\n")
         return
 
     if fmt == "csv":
         writer = csv.writer(stream, lineterminator="\n")
-        writer.writerow(["source", "published_at", "title", "url", "summary", "is_live"])
-        for headline in headlines:
-            writer.writerow(
-                [
-                    headline.source,
-                    headline.published_at.isoformat() if headline.published_at else "",
-                    headline.title,
-                    headline.url,
-                    headline.summary or "",
-                    "1" if headline.is_live else "0",
-                ]
-            )
+        header = ["source", "published_at", "title", "url", "summary", "is_live"]
+        writer.writerow([*header, "matched_title"] if matched is not None else header)
+        for index, headline in enumerate(headlines):
+            row = [
+                headline.source,
+                headline.published_at.isoformat() if headline.published_at else "",
+                headline.title,
+                headline.url,
+                headline.summary or "",
+                "1" if headline.is_live else "0",
+            ]
+            if matched is not None:
+                row.append(matched[index] or "")
+            writer.writerow(row)
         return
 
     if not headlines:
@@ -177,7 +190,13 @@ def output_headlines(
         ]
         for headline, when in zip(headlines, published, strict=True)
     ]
-    render_table(rows, ["SOURCE", f"PUBLISHED ({zone})", "TITLE", "URL"], stream)
+    headers = ["SOURCE", f"PUBLISHED ({zone})", "TITLE", "URL"]
+    # Only when some hit matched an earlier title: say which one, before the URL.
+    if matched is not None and any(matched):
+        for row, title in zip(rows, matched, strict=True):
+            row.insert(3, _truncate(title, 50) if title else "-")
+        headers.insert(3, "MATCHED EARLIER TITLE")
+    render_table(rows, headers, stream)
 
 
 def _summarise(results: list[SourceResult], *, dry_run: bool) -> None:
@@ -257,10 +276,20 @@ def cmd_list(args: argparse.Namespace, config: Config) -> int:
 
 
 def cmd_search(args: argparse.Namespace) -> int:
-    """Search stored headlines."""
+    """Search stored headlines: current versions, or every version with --history."""
     with open_db(args.db) as conn:
-        headlines = search_headlines(conn, args.query, limit=args.limit)
-    output_headlines(headlines, args.format, sys.stdout, utc=args.utc)
+        if not args.history:
+            headlines = search_headlines(conn, args.query, limit=args.limit)
+            output_headlines(headlines, args.format, sys.stdout, utc=args.utc)
+            return EXIT_OK
+        hits = search_history(conn, args.query, limit=args.limit)
+    output_headlines(
+        [hit.headline for hit in hits],
+        args.format,
+        sys.stdout,
+        utc=args.utc,
+        matched=[hit.matched_title for hit in hits],
+    )
     return EXIT_OK
 
 
@@ -369,6 +398,12 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     if plan.from_version < 2:
         verb = "would flag" if args.dry_run else "flagging"
         steps.append(f"{verb} {plan.live_articles} live blog(s)")
+    if plan.from_version < 3:
+        verb = "would re-normalise" if args.dry_run else "re-normalising"
+        steps.append(
+            f"{verb} {plan.urls_normalised} URL(s), folding {plan.rows_folded} row(s); "
+            "indexing title history for search"
+        )
     print(
         f"{args.db}: schema version {plan.from_version} -> {plan.to_version}; "
         f"{plan.headlines} headline row(s); {'; '.join(steps)}."
@@ -507,6 +542,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     search = subparsers.add_parser("search", parents=[common], help="search stored headlines")
     search.add_argument("query", help="search terms")
+    search.add_argument(
+        "--history",
+        action="store_true",
+        help="also search earlier titles and summaries (default: current versions only)",
+    )
     search.add_argument(
         "--limit", type=int, default=50, metavar="N", help="maximum rows (default: %(default)s)"
     )
