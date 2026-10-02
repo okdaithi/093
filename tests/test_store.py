@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
@@ -13,6 +14,7 @@ from headliner.models import Headline, utcnow
 from headliner.store import (
     SCHEMA_VERSION,
     connect,
+    count_title_changes,
     has_fts,
     insert_headlines,
     list_headlines,
@@ -464,5 +466,107 @@ def test_upgrade_without_duplicates_takes_no_backup(tmp_path: Path) -> None:
     make_v0_db(path, V0_ROWS[:2])
     upgraded = connect(path)
     assert revision_titles(upgraded) == [V0_ROWS[0].title, V0_ROWS[1].title]
+    upgraded.close()
+    assert not list(tmp_path.glob("*.bak"))
+
+
+# --------------------------------------------------------------------------
+# live blogs
+# --------------------------------------------------------------------------
+
+LIVE_URL = "https://example.org/world/live/2026/oct/02/storm"
+
+
+def test_live_retitles_are_counted_separately(conn: sqlite3.Connection) -> None:
+    store_headlines(conn, [seen("Storm live: winds reach 120km/h on the coast", T0, url=LIVE_URL)])
+    store_headlines(conn, [seen("Ordinary first headline here", T0)])
+    result = store_headlines(
+        conn,
+        [
+            seen("Storm live: power out for 40,000 homes", T0 + timedelta(hours=1), url=LIVE_URL),
+            seen("Ordinary second headline here", T0 + timedelta(hours=1)),
+        ],
+    )
+    assert (result.retitled, result.retitled_live) == (2, 1)
+    flags = dict(conn.execute("SELECT url, is_live FROM headlines").fetchall())
+    assert flags == {LIVE_URL: 1, STORY_URL: 0}
+
+
+def test_live_flag_sticks_when_the_title_stops_saying_live(conn: sqlite3.Connection) -> None:
+    url = "https://example.org/story-123"
+    store_headlines(conn, [seen("Election live: counting under way", T0, url=url)])
+    store_headlines(conn, [seen("Labor wins second term", T0 + timedelta(hours=3), url=url)])
+    [current] = list_headlines(conn)
+    assert current.title == "Labor wins second term"
+    assert current.is_live
+
+
+def test_source_pattern_flags_a_known_article_without_a_new_title(
+    conn: sqlite3.Connection,
+) -> None:
+    url = "https://example.org/as-it-happened/budget"
+    store_headlines(conn, [seen("Budget night: every announcement", T0, url=url)])
+    assert not list_headlines(conn)[0].is_live
+    flagged = Headline.create(
+        source="Example Wire",
+        title="Budget night: every announcement",
+        url=url,
+        fetched_at=T0 + timedelta(hours=1),
+        live_url_pattern=re.compile("/as-it-happened/"),
+    )
+    result = store_headlines(conn, [flagged])
+    assert (result.new, result.retitled) == (0, 0)
+    assert list_headlines(conn)[0].is_live
+
+
+def seed_live_and_plain(conn: sqlite3.Connection) -> None:
+    store_headlines(conn, [seen("Storm live: winds reach 120km/h", T0, url=LIVE_URL)])
+    store_headlines(conn, [seen("Storm live: power cut", T0 + timedelta(hours=1), url=LIVE_URL)])
+    store_headlines(
+        conn, [seen("Storm live: clean-up begins", T0 + timedelta(hours=2), url=LIVE_URL)]
+    )
+    store_headlines(conn, [seen("Original headline wording", T0)])
+    store_headlines(conn, [seen("Rewritten headline wording", T0 + timedelta(hours=1))])
+
+
+def test_changes_can_exclude_include_or_isolate_live_blogs(conn: sqlite3.Connection) -> None:
+    seed_live_and_plain(conn)
+
+    excluded = list_title_changes(conn, live="exclude")
+    assert [c.new_title for c in excluded] == ["Rewritten headline wording"]
+    assert len(list_title_changes(conn, live="include")) == 3
+
+    timeline = list_title_changes(conn, live="only", oldest_first=True)
+    assert [(c.old_title, c.new_title) for c in timeline] == [
+        (None, "Storm live: winds reach 120km/h"),
+        ("Storm live: winds reach 120km/h", "Storm live: power cut"),
+        ("Storm live: power cut", "Storm live: clean-up begins"),
+    ]
+    assert all(c.is_live for c in timeline)
+    assert count_title_changes(conn, live="only") == 3
+    assert count_title_changes(conn, live="exclude") == 1
+
+
+def test_upgrade_from_v1_flags_live_blogs(tmp_path: Path) -> None:
+    path = tmp_path / "v1.db"
+    v1 = connect(path)
+    # A URL that only an earlier title marks as live, and one marked by its path.
+    store_headlines(v1, [seen("Budget live: treasurer rises to speak", T0)])
+    store_headlines(v1, [seen("Budget delivers tax cuts", T0 + timedelta(hours=2))])
+    store_headlines(v1, [seen("Storm batters the coast tonight", T0, url=LIVE_URL)])
+    store_headlines(v1, [seen("Unrelated ordinary story", T0, url="https://example.org/o")])
+    v1.execute("ALTER TABLE headlines DROP COLUMN is_live")
+    v1.execute("PRAGMA user_version = 1")
+    v1.commit()
+    v1.close()
+
+    with closing(connect(path, migrate_schema=False)) as before:
+        plan = upgrade_plan(before)
+    assert (plan.from_version, plan.live_articles, plan.rows_merged) == (1, 2, 0)
+
+    upgraded = connect(path)
+    assert upgraded.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    flags = dict(upgraded.execute("SELECT url, is_live FROM headlines").fetchall())
+    assert flags == {STORY_URL: 1, LIVE_URL: 1, "https://example.org/o": 0}
     upgraded.close()
     assert not list(tmp_path.glob("*.bak"))

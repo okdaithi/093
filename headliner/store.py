@@ -9,17 +9,18 @@ from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Literal
 
-from headliner.models import Headline, to_utc, utcnow
+from headliner.models import Headline, looks_live, to_utc, utcnow
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH: Final = Path("headlines.db")
 
 # Stored in `PRAGMA user_version`. 0 is the original layout (dedup on URL and
-# title); 1 keys `headlines` on URL and keeps titles in `headline_revisions`.
-SCHEMA_VERSION: Final = 1
+# title); 1 keys `headlines` on URL and keeps titles in `headline_revisions`;
+# 2 adds `headlines.is_live` for live blogs.
+SCHEMA_VERSION: Final = 2
 
 _SCHEMA: Final = """
 CREATE TABLE IF NOT EXISTS headlines (
@@ -30,7 +31,9 @@ CREATE TABLE IF NOT EXISTS headlines (
     published_at  TEXT,
     fetched_at    TEXT    NOT NULL,
     summary       TEXT,
-    content_hash  TEXT    NOT NULL UNIQUE
+    content_hash  TEXT    NOT NULL UNIQUE,
+    -- 1 once any version of the article looked like a live blog; never reset.
+    is_live       INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_headlines_source       ON headlines(source);
@@ -148,6 +151,7 @@ class InsertResult:
 
     new: int
     retitled: int
+    retitled_live: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,8 +161,10 @@ class TitleChange:
     source: str
     url: str
     changed_at: datetime | None
-    old_title: str
+    # None for an article's first headline, which only `live="only"` returns.
+    old_title: str | None
     new_title: str
+    is_live: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +176,7 @@ class UpgradePlan:
     headlines: int
     merged_urls: int
     rows_merged: int
+    live_articles: int = 0
 
     @property
     def needed(self) -> bool:
@@ -225,7 +232,24 @@ def upgrade_plan(conn: sqlite3.Connection) -> UpgradePlan:
             "SELECT COUNT(*) FROM (SELECT url FROM headlines GROUP BY url HAVING COUNT(*) > 1)"
         ).fetchone()[0]
     rows_merged = int(total) - int(distinct) if version < 1 else 0
-    return UpgradePlan(version, SCHEMA_VERSION, int(total), int(merged_urls), rows_merged)
+    live_articles = len(_live_urls(conn)) if version < 2 else 0
+    return UpgradePlan(
+        version, SCHEMA_VERSION, int(total), int(merged_urls), rows_merged, live_articles
+    )
+
+
+def _live_urls(conn: sqlite3.Connection) -> set[str]:
+    """URLs whose current or any earlier title looks like a live blog (built-in rules)."""
+    titles: dict[str, list[str]] = {}
+    for row in conn.execute("SELECT url, title FROM headlines").fetchall():
+        titles.setdefault(row[0], []).append(row[1])
+    if _table_exists(conn, "headline_revisions"):
+        for row in conn.execute(
+            "SELECT h.url, r.title FROM headline_revisions r JOIN headlines h"
+            " ON h.id = r.headline_id"
+        ).fetchall():
+            titles.setdefault(row[0], []).append(row[1])
+    return {url for url, seen in titles.items() if any(looks_live(url, t) for t in seen)}
 
 
 def _backup(conn: sqlite3.Connection, suffix: str) -> Path | None:
@@ -267,6 +291,28 @@ def _upgrade_to_v1(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _upgrade_to_v2(conn: sqlite3.Connection) -> None:
+    """Add `headlines.is_live` and flag existing live blogs from their URLs and titles.
+
+    Only the built-in rules apply here; a source's own `live_url_pattern`
+    flags its articles the next time they are fetched.
+    """
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(headlines)").fetchall()}
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if "is_live" not in columns:
+            conn.execute("ALTER TABLE headlines ADD COLUMN is_live INTEGER NOT NULL DEFAULT 0")
+        live = _live_urls(conn)
+        conn.executemany("UPDATE headlines SET is_live = 1 WHERE url = ?", [(u,) for u in live])
+        conn.execute("PRAGMA user_version = 2")
+    except BaseException:
+        conn.rollback()
+        raise
+    conn.commit()
+    if live:
+        logger.info("upgrading database: flagged %d live blog(s)", len(live))
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     """Create the schema if absent and apply pending upgrades. Safe on every start."""
     conn.execute("PRAGMA journal_mode=WAL")
@@ -279,6 +325,8 @@ def migrate(conn: sqlite3.Connection) -> None:
     conn.commit()
     if int(conn.execute("PRAGMA user_version").fetchone()[0]) < 1:
         _upgrade_to_v1(conn)
+    if int(conn.execute("PRAGMA user_version").fetchone()[0]) < 2:
+        _upgrade_to_v2(conn)
 
 
 def connect(
@@ -332,20 +380,23 @@ def store_headlines(conn: sqlite3.Connection, headlines: Iterable[Headline]) -> 
     A URL not seen before is a new row. A known URL under a different title
     becomes the row's current title and, the first time that title is seen
     for the article, a new revision. Titles that only differ in case or
-    whitespace are the same title (see `compute_hash`).
+    whitespace are the same title (see `compute_hash`). An article stays a
+    live blog once any version of it looked like one.
     """
-    new = retitled = 0
+    new = retitled = retitled_live = 0
     with conn:
         for headline in headlines:
             existing = conn.execute(
-                "SELECT id, content_hash FROM headlines WHERE url = ?", (headline.url,)
+                "SELECT id, content_hash, is_live FROM headlines WHERE url = ?",
+                (headline.url,),
             ).fetchone()
             if existing is None:
                 cursor = conn.execute(
                     """
                     INSERT INTO headlines
-                        (source, title, url, published_at, fetched_at, summary, content_hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                        (source, title, url, published_at, fetched_at, summary, content_hash,
+                         is_live)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         headline.source,
@@ -355,6 +406,7 @@ def store_headlines(conn: sqlite3.Connection, headlines: Iterable[Headline]) -> 
                         _iso(headline.fetched_at),
                         headline.summary,
                         headline.content_hash,
+                        int(headline.is_live),
                     ),
                 )
                 headline_id = cursor.lastrowid
@@ -363,18 +415,31 @@ def store_headlines(conn: sqlite3.Connection, headlines: Iterable[Headline]) -> 
                 new += 1
                 continue
 
+            is_live = bool(existing["is_live"]) or headline.is_live
             if existing["content_hash"] == headline.content_hash:
+                if is_live and not existing["is_live"]:
+                    conn.execute("UPDATE headlines SET is_live = 1 WHERE id = ?", (existing["id"],))
                 continue
             # A title flipping back to an earlier one updates the current
             # title but adds no revision, so feeds that alternate between
             # two wordings do not grow the history every run.
             if _add_revision(conn, existing["id"], headline):
                 retitled += 1
+                retitled_live += int(is_live)
             conn.execute(
-                "UPDATE headlines SET title = ?, summary = ?, content_hash = ? WHERE id = ?",
-                (headline.title, headline.summary, headline.content_hash, existing["id"]),
+                """
+                UPDATE headlines SET title = ?, summary = ?, content_hash = ?, is_live = ?
+                WHERE id = ?
+                """,
+                (
+                    headline.title,
+                    headline.summary,
+                    headline.content_hash,
+                    int(is_live),
+                    existing["id"],
+                ),
             )
-    return InsertResult(new=new, retitled=retitled)
+    return InsertResult(new=new, retitled=retitled, retitled_live=retitled_live)
 
 
 def insert_headlines(conn: sqlite3.Connection, headlines: Iterable[Headline]) -> int:
@@ -425,10 +490,13 @@ def _row_to_headline(row: sqlite3.Row) -> Headline:
         fetched_at=_parse_iso(row["fetched_at"]) or utcnow(),
         summary=row["summary"],
         content_hash=row["content_hash"],
+        is_live=bool(row["is_live"]),
     )
 
 
-_SELECT_COLUMNS: Final = "source, title, url, published_at, fetched_at, summary, content_hash"
+_SELECT_COLUMNS: Final = (
+    "source, title, url, published_at, fetched_at, summary, content_hash, is_live"
+)
 # COALESCE so items without a publication date still sort by when we saw them.
 _ORDER_BY: Final = "ORDER BY COALESCE(published_at, fetched_at) DESC, id DESC"
 
@@ -461,40 +529,63 @@ def list_headlines(
         return [_row_to_headline(row) for row in cursor.fetchall()]
 
 
-def list_title_changes(
-    conn: sqlite3.Connection,
-    *,
-    since: datetime | None = None,
-    source: str | None = None,
-    limit: int = 50,
-) -> list[TitleChange]:
-    """Headline rewrites, most recent first: each revision after an article's first."""
-    clauses = ["r.old_title IS NOT NULL"]
+LiveFilter = Literal["exclude", "include", "only"]
+
+
+def _changes_query(
+    *, since: datetime | None, source: str | None, live: LiveFilter
+) -> tuple[str, list[Any]]:
+    """FROM/WHERE for `list_title_changes` and `count_title_changes`."""
+    # A live blog's first headline is part of its timeline, so `only` keeps it.
+    clauses = [] if live == "only" else ["r.old_title IS NOT NULL"]
     params: list[Any] = []
+    if live == "exclude":
+        clauses.append("h.is_live = 0")
+    elif live == "only":
+        clauses.append("h.is_live = 1")
     if since is not None:
         clauses.append("r.seen_at >= ?")
         params.append(_iso(since))
     if source:
         clauses.append("h.source = ? COLLATE NOCASE")
         params.append(source)
-    params.append(max(1, limit))
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    sql = f"""
+        FROM (
+            SELECT id, headline_id, title, seen_at,
+                   LAG(title) OVER (PARTITION BY headline_id ORDER BY seen_at, id) AS old_title
+            FROM headline_revisions
+        ) r
+        JOIN headlines h ON h.id = r.headline_id
+        {where}
+    """
+    return sql, params
+
+
+def list_title_changes(
+    conn: sqlite3.Connection,
+    *,
+    since: datetime | None = None,
+    source: str | None = None,
+    limit: int = 50,
+    live: LiveFilter = "include",
+    oldest_first: bool = False,
+) -> list[TitleChange]:
+    """Headline rewrites, most recent first: each revision after an article's first.
+
+    `live` keeps, drops or isolates live blogs. With `"only"` the result is
+    each live blog's timeline, its first headline included (`old_title` None).
+    """
+    sql, params = _changes_query(since=since, source=source, live=live)
+    order = "ASC" if oldest_first else "DESC"
     with closing(
         conn.execute(
             f"""
-            SELECT h.source, h.url, r.seen_at, r.old_title, r.title
-            FROM (
-                SELECT id, headline_id, title, seen_at,
-                       LAG(title) OVER (
-                           PARTITION BY headline_id ORDER BY seen_at, id
-                       ) AS old_title
-                FROM headline_revisions
-            ) r
-            JOIN headlines h ON h.id = r.headline_id
-            WHERE {" AND ".join(clauses)}
-            ORDER BY r.seen_at DESC, r.id DESC
+            SELECT h.source, h.url, h.is_live, r.seen_at, r.old_title, r.title {sql}
+            ORDER BY r.seen_at {order}, r.id {order}
             LIMIT ?
             """,
-            params,
+            [*params, max(1, limit)],
         )
     ) as cursor:
         return [
@@ -504,9 +595,22 @@ def list_title_changes(
                 changed_at=_parse_iso(row["seen_at"]),
                 old_title=row["old_title"],
                 new_title=row["title"],
+                is_live=bool(row["is_live"]),
             )
             for row in cursor.fetchall()
         ]
+
+
+def count_title_changes(
+    conn: sqlite3.Connection,
+    *,
+    since: datetime | None = None,
+    source: str | None = None,
+    live: LiveFilter = "include",
+) -> int:
+    """How many rows `list_title_changes` would return without a limit."""
+    sql, params = _changes_query(since=since, source=source, live=live)
+    return int(conn.execute(f"SELECT COUNT(*) {sql}", params).fetchone()[0])
 
 
 def _escape_like(term: str) -> str:

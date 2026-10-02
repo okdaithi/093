@@ -23,7 +23,7 @@ from headliner.cli import (
     time_column,
 )
 from headliner.models import Headline
-from headliner.store import connect, insert_headlines
+from headliner.store import connect, insert_headlines, store_headlines
 
 FIXTURES = Path(__file__).parent / "fixtures"
 FEED_URL = "https://feed.example.org/rss.xml"
@@ -246,7 +246,7 @@ def test_list_csv_output(
         ["list", "--sources", str(config_path), "--db", str(db_path), "--format", "csv", "--quiet"]
     )
     rows = list(csv.reader(io.StringIO(capsys.readouterr().out)))
-    assert rows[0] == ["source", "published_at", "title", "url", "summary"]
+    assert rows[0] == ["source", "published_at", "title", "url", "summary", "is_live"]
     assert len(rows) == 3
 
 
@@ -431,8 +431,9 @@ def test_migrate_dry_run_reports_and_changes_nothing(
     make_legacy_db(path)
     assert main(["migrate", "--dry-run", "--db", str(path), "--quiet"]) == EXIT_OK
     out = capsys.readouterr().out
-    assert "schema version 0 -> 1" in out
+    assert "schema version 0 -> 2" in out
     assert "would merge 1 row(s) across 1 URL(s)" in out
+    assert "would flag 0 live blog(s)" in out
     assert "nothing changed" in out
 
     conn = sqlite3.connect(path)
@@ -595,3 +596,128 @@ def test_changes_and_sources_tables_label_the_zone(
     sources = ["sources", "--sources", str(config_path), "--db", str(db_path), "--quiet"]
     assert main(sources) == EXIT_OK
     assert "LAST SUCCESS (AWST)" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# live blogs in the CLI
+# --------------------------------------------------------------------------
+
+
+def seed_live(db_path: Path) -> None:
+    conn = connect(db_path)
+    live_url = "https://example.org/world/live/2026/oct/02/storm"
+    base = datetime.now(UTC) - timedelta(hours=3)
+    for hours, title in enumerate(
+        ["Storm live: winds reach 120km/h", "Storm live: power cut to 40,000 homes"]
+    ):
+        store_headlines(
+            conn,
+            [
+                Headline.create(
+                    source="Example Wire",
+                    title=title,
+                    url=live_url,
+                    fetched_at=base + timedelta(hours=hours),
+                )
+            ],
+        )
+    for hours, title in enumerate(["Ferry service suspended by storm", "Ferry back after storm"]):
+        store_headlines(
+            conn,
+            [
+                Headline.create(
+                    source="Example Wire",
+                    title=title,
+                    url="https://example.org/ferry",
+                    fetched_at=base + timedelta(hours=hours),
+                )
+            ],
+        )
+    conn.close()
+
+
+def test_changes_hides_live_blogs_by_default(
+    db_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed_live(db_path)
+    assert main(["changes", "--db", str(db_path), "--quiet"]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "Ferry back after storm" in out
+    assert "Storm live" not in out
+    # One live rewrite; the blog's first headline is not counted as a change.
+    assert "1 live-blog headline(s) hidden; use --include-live or --live-only" in out
+
+    assert main(["changes", "--db", str(db_path), "--quiet", "--include-live"]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "Storm live: power cut" in out
+    assert "hidden" not in out
+
+
+def test_live_only_is_a_timeline_with_the_first_headline(
+    db_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed_live(db_path)
+    args = ["changes", "--db", str(db_path), "--quiet", "--live-only", "--oldest-first"]
+    assert main([*args, "--format", "json"]) == EXIT_OK
+    timeline = json.loads(capsys.readouterr().out)
+    assert [(c["old_title"], c["new_title"], c["is_live"]) for c in timeline] == [
+        (None, "Storm live: winds reach 120km/h", True),
+        ("Storm live: winds reach 120km/h", "Storm live: power cut to 40,000 homes", True),
+    ]
+    assert main(args) == EXIT_OK
+    assert "(first seen)" in capsys.readouterr().out
+
+
+def test_include_and_only_live_are_mutually_exclusive(db_path: Path) -> None:
+    with pytest.raises(SystemExit):
+        main(["changes", "--db", str(db_path), "--include-live", "--live-only"])
+
+
+def test_list_tags_live_blogs(
+    config_path: Path, db_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed_live(db_path)
+    base = ["list", "--sources", str(config_path), "--db", str(db_path), "--quiet"]
+    assert main(base) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "[LIVE] Storm live: power cut" in out
+    assert "[LIVE] Ferry" not in out
+    assert main([*base, "--format", "json"]) == EXIT_OK
+    flags = {item["title"]: item["is_live"] for item in json.loads(capsys.readouterr().out)}
+    assert flags == {"Storm live: power cut to 40,000 homes": True, "Ferry back after storm": False}
+
+
+@respx.mock
+def test_fetch_summary_reports_live_retitles(
+    config_path: Path, db_path: Path, feed_body: bytes, capsys: pytest.CaptureFixture[str]
+) -> None:
+    live_feed = feed_body.replace(
+        b"Parliament passes long-delayed housing bill", b"Parliament live: housing bill debate"
+    )
+    args = ["fetch", "--sources", str(config_path), "--db", str(db_path)]
+    mock_feed(live_feed)
+    assert main(args) == EXIT_OK
+    mock_feed(live_feed.replace(b"housing bill debate", b"housing bill passes third reading"))
+    assert main(args) == EXIT_OK
+    assert "1 retitled (1 live)" in capsys.readouterr().err
+
+
+def test_unchanged_live_blog_hides_nothing(
+    db_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    conn = connect(db_path)
+    store_headlines(
+        conn,
+        [
+            Headline.create(
+                source="Example Wire",
+                title="Storm live: winds reach 120km/h",
+                url="https://example.org/world/live/2026/oct/02/storm",
+            )
+        ],
+    )
+    conn.close()
+    assert main(["changes", "--db", str(db_path), "--quiet"]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "No headline changes found." in out
+    assert "hidden" not in out

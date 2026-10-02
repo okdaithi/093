@@ -139,3 +139,23 @@ def test_shipped_sources_yaml_is_valid() -> None:
     assert any(source.type == "html" for source in config.sources)
     assert sum(1 for source in config.sources if source.type == "rss") >= 8
     assert "contact" in config.settings.user_agent
+
+
+def test_live_url_pattern_is_accepted_and_compiled() -> None:
+    config = parse_config(
+        "sources:\n"
+        "  - {name: A, url: 'https://a.example/f', type: rss,"
+        " live_url_pattern: '/as-it-happened/'}\n"
+    )
+    [source] = config.sources
+    assert source.live_url_pattern == "/as-it-happened/"
+    assert source.live_regex is not None
+    assert source.live_regex.search("https://a.example/AS-IT-HAPPENED/x")
+
+
+def test_invalid_live_url_pattern_is_a_config_error() -> None:
+    with pytest.raises(ConfigError, match=r"live_url_pattern.*not a valid regular expression"):
+        parse_config(
+            "sources:\n  - {name: A, url: 'https://a.example/f', type: rss,"
+            " live_url_pattern: '(unclosed'}\n"
+        )

@@ -13,6 +13,8 @@ download article bodies and is not a way around a paywall.
   a `Retry-After` longer than 30s skips the source until the next run
 - Idempotent storage: one row per article URL; re-running never duplicates a headline
 - Headline rewrites are kept: every distinct title an article carries is recorded
+- Live blogs are recognised, kept out of the rewrite list by default, and
+  available as a running timeline
 - One failing source never aborts the run
 
 ## Requirements
@@ -157,7 +159,42 @@ reads the database.
 
 **`changes`** takes the same `--since`, `--source`, `--limit` and `--format` flags
 as `list`, and needs no config file. Each row is one rewrite: the previous title,
-the new one, and when the new one was first seen.
+the new one, and when the new one was first seen. Live blogs are hidden by default
+(see [Live blogs](#live-blogs)); the table ends with a note saying how many were
+hidden.
+
+| Flag | Effect |
+| --- | --- |
+| `--include-live` | Show live blogs alongside other rewrites |
+| `--live-only` | Only live blogs, as a timeline that includes each blog's first headline (`(first seen)`) |
+| `--oldest-first` | Chronological order. Reads best with `--live-only`. |
+
+### Live blogs
+
+Live blogs re-headline every time they're updated, so they would crowd ordinary
+rewrites out of `changes`. An article counts as a live blog when:
+
+- its URL path has a `live` or `liveblog` segment (Guardian `/live/`, BBC
+  `/news/live/`, Al Jazeera `/liveblog/`), or
+- its title has a `… live:` style marker (`Live: …`, `Australia news live: …`,
+  `… live updates: …`), or
+- its URL matches the source's own `live_url_pattern` (see below).
+
+Ordinary uses of the word don't count: "live in harmony" and "play live tonight"
+are not live blogs. Once any version of an article looks live, it stays flagged,
+because live blogs often drop the marker from their final headline.
+
+Nothing is discarded. Every live-blog headline is kept in the title history.
+`list` marks live blogs with `[LIVE]` in tables and `is_live` in JSON and CSV.
+`fetch` reports live rewrites separately, e.g. `5 retitled (3 live)`.
+
+Each live-blog headline sums up the latest development, so the history doubles as
+a running timeline:
+
+```bash
+headliner changes --live-only --oldest-first --since 24h
+headliner changes --live-only --source "The Guardian AU" --format json
+```
 
 **`migrate`** upgrades an older database to the current schema. Every command
 does this on open, so running it by hand is only needed to preview an upgrade
@@ -205,6 +242,7 @@ Every entry needs `name`, `url` and `type`.
 | `link_selector` | html | yes | CSS selector for the link, relative to the article element |
 | `date_selector` | html | no | CSS selector for the timestamp. Reads `datetime`, then `content`, then the text. |
 | `summary_selector` | html | no | CSS selector for a short standfirst or teaser |
+| `live_url_pattern` | both | no | Regular expression (case-insensitive) searched in each article URL; a match marks it as a live blog, on top of the built-in rules |
 
 Anything else is rejected with an error naming the file and the key, so a typo
 fails at startup rather than silently doing nothing.
@@ -303,7 +341,8 @@ normalisation lowercases the scheme and host, drops the fragment, strips trackin
 parameters (`utm_*`, `fbclid`, `gclid` and friends) and sorts the rest, so the
 same article arriving through two different links stores once. `title`,
 `summary` and `content_hash` always hold the most recently seen version;
-`fetched_at` is when the article was first seen.
+`fetched_at` is when the article was first seen. `is_live` is `1` once any
+version of the article has looked like a live blog.
 
 `content_hash` is a sha256 over the normalised URL and the case-folded,
 whitespace-collapsed title. Two titles with the same hash count as the same
@@ -346,7 +385,14 @@ it stored a rewritten headline as a second row. The upgrade:
 3. keeps that earliest row, gives it the latest title, and deletes the others,
 4. adds the unique index on `url`.
 
-It runs in one transaction. To see what it will do first:
+It runs in one transaction.
+
+Version 2 adds `headlines.is_live` and flags existing live blogs, checking each
+article's URL and every title in its history against the built-in rules. It only
+adds a column, so no backup is taken. A source's own `live_url_pattern` takes
+effect for its articles the next time they are fetched.
+
+To see what an upgrade will do first:
 
 ```bash
 headliner migrate --dry-run --db /path/to/headlines.db

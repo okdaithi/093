@@ -165,6 +165,7 @@ def parse_feed(
                 url=url,
                 published_at=published,
                 fetched_at=stamp,
+                live_url_pattern=source.live_regex,
                 summary=_entry_summary(entry),
             )
         except InvalidHeadlineError as exc:
@@ -310,6 +311,7 @@ def parse_html(
                 url=url,
                 published_at=_extract_date(article, source.date_selector),
                 fetched_at=stamp,
+                live_url_pattern=source.live_regex,
                 summary=_node_text(article.select_one(source.summary_selector))
                 if source.summary_selector
                 else None,

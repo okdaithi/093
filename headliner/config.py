@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import functools
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 from urllib.parse import urlsplit
 
 import yaml
+
+
+@functools.lru_cache(maxsize=64)
+def _compile_cached(pattern: str) -> re.Pattern[str]:
+    return re.compile(pattern, re.IGNORECASE)
+
 
 DEFAULT_CONFIG_PATH: Final = Path("sources.yaml")
 
@@ -18,7 +26,16 @@ DEFAULT_USER_AGENT: Final = (
 _SOURCE_TYPES: Final = frozenset({"rss", "html"})
 _HTML_REQUIRED: Final = ("article_selector", "title_selector", "link_selector")
 _KNOWN_SOURCE_KEYS: Final = frozenset(
-    {"name", "url", "type", "enabled", "date_selector", "summary_selector", *_HTML_REQUIRED}
+    {
+        "name",
+        "url",
+        "type",
+        "enabled",
+        "date_selector",
+        "summary_selector",
+        "live_url_pattern",
+        *_HTML_REQUIRED,
+    }
 )
 _KNOWN_SETTINGS_KEYS: Final = frozenset(
     {
@@ -63,6 +80,12 @@ class Source:
     link_selector: str | None = None
     date_selector: str | None = None
     summary_selector: str | None = None
+    live_url_pattern: str | None = None
+
+    @property
+    def live_regex(self) -> re.Pattern[str] | None:
+        """`live_url_pattern` compiled (validated at load, so this cannot fail)."""
+        return _compile_cached(self.live_url_pattern) if self.live_url_pattern else None
 
     @property
     def domain(self) -> str:
@@ -205,6 +228,15 @@ def _parse_source(raw: Any, index: int, file_label: str) -> Source:
     if not isinstance(enabled, bool):
         raise ConfigError(f"{where}: 'enabled' must be true or false, got {enabled!r}")
 
+    live_url_pattern = _optional_str(mapping, "live_url_pattern", where)
+    if live_url_pattern is not None:
+        try:
+            re.compile(live_url_pattern)
+        except re.error as exc:
+            raise ConfigError(
+                f"{where}: 'live_url_pattern' is not a valid regular expression: {exc}"
+            ) from exc
+
     selectors: dict[str, str | None] = {}
     if source_type == "html":
         for key in _HTML_REQUIRED:
@@ -230,6 +262,7 @@ def _parse_source(raw: Any, index: int, file_label: str) -> Source:
         summary_selector=_optional_str(mapping, "summary_selector", where)
         if source_type == "html"
         else None,
+        live_url_pattern=live_url_pattern,
     )
 
 

@@ -23,8 +23,10 @@ from headliner.fetcher import SourceResult, fetch_all
 from headliner.models import Headline, utcnow
 from headliner.store import (
     DEFAULT_DB_PATH,
+    LiveFilter,
     SourceStatus,
     TitleChange,
+    count_title_changes,
     list_headlines,
     list_title_changes,
     migrate,
@@ -109,6 +111,10 @@ def time_column(values: Sequence[datetime | None], *, utc: bool) -> tuple[list[s
     return cells, label
 
 
+LIVE_TAG: Final = "[LIVE] "
+FIRST_SEEN: Final = "(first seen)"
+
+
 def _truncate(text: str, width: int) -> str:
     return text if len(text) <= width else text[: width - 1].rstrip() + "…"
 
@@ -144,7 +150,7 @@ def output_headlines(
 
     if fmt == "csv":
         writer = csv.writer(stream, lineterminator="\n")
-        writer.writerow(["source", "published_at", "title", "url", "summary"])
+        writer.writerow(["source", "published_at", "title", "url", "summary", "is_live"])
         for headline in headlines:
             writer.writerow(
                 [
@@ -153,6 +159,7 @@ def output_headlines(
                     headline.title,
                     headline.url,
                     headline.summary or "",
+                    "1" if headline.is_live else "0",
                 ]
             )
         return
@@ -165,7 +172,7 @@ def output_headlines(
         [
             _truncate(headline.source, 22),
             when,
-            _truncate(headline.title, 78),
+            _truncate(f"{LIVE_TAG}{headline.title}" if headline.is_live else headline.title, 78),
             headline.url,
         ]
         for headline, when in zip(headlines, published, strict=True)
@@ -180,15 +187,18 @@ def _summarise(results: list[SourceResult], *, dry_run: bool) -> None:
     found = sum(result.items_found for result in results)
     new = sum(result.items_new for result in results)
     changed = sum(result.items_changed for result in results)
+    changed_live = sum(result.items_changed_live for result in results)
+    live_note = f" ({changed_live} live)" if changed_live else ""
     suffix = " (dry run, nothing written)" if dry_run else ""
     logger.info(
-        "done: %d ok, %d skipped, %d failed; %d item(s) found, %d new, %d retitled%s",
+        "done: %d ok, %d skipped, %d failed; %d item(s) found, %d new, %d retitled%s%s",
         ok,
         skipped,
         failed,
         found,
         new,
         changed,
+        live_note,
         suffix,
     )
 
@@ -218,6 +228,7 @@ def cmd_fetch(args: argparse.Namespace, config: Config) -> int:
                     stored = store_headlines(conn, result.headlines)
                     result.items_new = stored.new
                     result.items_changed = stored.retitled
+                    result.items_changed_live = stored.retitled_live
                 record_fetch(
                     conn,
                     source=result.source,
@@ -268,6 +279,7 @@ def output_changes(
                 "changed_at": change.changed_at.isoformat() if change.changed_at else None,
                 "old_title": change.old_title,
                 "new_title": change.new_title,
+                "is_live": change.is_live,
             }
             for change in changes
         ]
@@ -277,15 +289,16 @@ def output_changes(
 
     if fmt == "csv":
         writer = csv.writer(stream, lineterminator="\n")
-        writer.writerow(["source", "changed_at", "old_title", "new_title", "url"])
+        writer.writerow(["source", "changed_at", "old_title", "new_title", "url", "is_live"])
         for change in changes:
             writer.writerow(
                 [
                     change.source,
                     change.changed_at.isoformat() if change.changed_at else "",
-                    change.old_title,
+                    change.old_title or "",
                     change.new_title,
                     change.url,
+                    "1" if change.is_live else "0",
                 ]
             )
         return
@@ -298,7 +311,7 @@ def output_changes(
         [
             when,
             _truncate(change.source, 22),
-            _truncate(change.old_title, 60),
+            _truncate(change.old_title or FIRST_SEEN, 60),
             _truncate(change.new_title, 60),
         ]
         for change, when in zip(changes, changed, strict=True)
@@ -307,11 +320,32 @@ def output_changes(
 
 
 def cmd_changes(args: argparse.Namespace) -> int:
-    """Print headline rewrites."""
+    """Print headline rewrites; live blogs are hidden unless asked for."""
     since = utcnow() - args.since if args.since else None
+    live: LiveFilter = "only" if args.live_only else "include" if args.include_live else "exclude"
     with open_db(args.db) as conn:
-        changes = list_title_changes(conn, since=since, source=args.source, limit=args.limit)
+        changes = list_title_changes(
+            conn,
+            since=since,
+            source=args.source,
+            limit=args.limit,
+            live=live,
+            oldest_first=args.oldest_first,
+        )
+        # Live rewrites only; a live blog's first headline is not a change.
+        hidden = (
+            count_title_changes(conn, since=since, source=args.source, live="include")
+            - count_title_changes(conn, since=since, source=args.source, live="exclude")
+            if live == "exclude"
+            else 0
+        )
     output_changes(changes, args.format, sys.stdout, utc=args.utc)
+    if hidden:
+        note = f"{hidden} live-blog headline(s) hidden; use --include-live or --live-only"
+        if args.format == "table":
+            print(f"\n({note})", file=sys.stdout)
+        else:
+            logger.info("%s", note)
     return EXIT_OK
 
 
@@ -326,11 +360,18 @@ def cmd_migrate(args: argparse.Namespace) -> int:
         print(f"{args.db}: schema version {plan.from_version} is current; nothing to do.")
         return EXIT_OK
 
-    verb = "would merge" if args.dry_run else "merging"
+    steps = []
+    if plan.from_version < 1:
+        verb = "would merge" if args.dry_run else "merging"
+        steps.append(
+            f"{verb} {plan.rows_merged} row(s) across {plan.merged_urls} URL(s) into title history"
+        )
+    if plan.from_version < 2:
+        verb = "would flag" if args.dry_run else "flagging"
+        steps.append(f"{verb} {plan.live_articles} live blog(s)")
     print(
         f"{args.db}: schema version {plan.from_version} -> {plan.to_version}; "
-        f"{plan.headlines} headline row(s); {verb} {plan.rows_merged} row(s) "
-        f"across {plan.merged_urls} URL(s) into title history."
+        f"{plan.headlines} headline row(s); {'; '.join(steps)}."
     )
     if args.dry_run:
         print("Dry run: nothing changed.")
@@ -494,6 +535,22 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("table", "json", "csv"),
         default="table",
         help="output format (default: %(default)s)",
+    )
+    live_group = changes.add_mutually_exclusive_group()
+    live_group.add_argument(
+        "--include-live",
+        action="store_true",
+        help="also show live blogs, which are hidden by default",
+    )
+    live_group.add_argument(
+        "--live-only",
+        action="store_true",
+        help="only live blogs, as a timeline including each blog's first headline",
+    )
+    changes.add_argument(
+        "--oldest-first",
+        action="store_true",
+        help="chronological order (useful with --live-only)",
     )
 
     migrate_cmd = subparsers.add_parser(
