@@ -223,6 +223,39 @@ def test_retries_on_429(settings: Settings, feed_body: bytes) -> None:
     assert route.call_count == 2
 
 
+@respx.mock
+@pytest.mark.parametrize("status", [429, 503])
+def test_long_retry_after_gives_up_without_retrying(settings: Settings, status: int) -> None:
+    route = respx.get(FEED_URL).mock(
+        return_value=httpx.Response(status, headers={"Retry-After": "300"})
+    )
+
+    async def check() -> None:
+        async with build_client(settings) as client:
+            await fetch_url(client, FEED_URL, timeout=5.0, sleep=False)
+
+    with pytest.raises(FetchError, match=r"Retry-After 300s .*not retrying this run"):
+        run(check())
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_retry_after_at_the_cap_is_still_honoured(settings: Settings, feed_body: bytes) -> None:
+    route = respx.get(FEED_URL).mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "30"}),
+            httpx.Response(200, content=feed_body),
+        ]
+    )
+
+    async def check() -> httpx.Response:
+        async with build_client(settings) as client:
+            return await fetch_url(client, FEED_URL, timeout=5.0, sleep=False)
+
+    assert run(check()).status_code == 200
+    assert route.call_count == 2
+
+
 def test_retry_after_seconds_reads_both_forms() -> None:
     delay = _retry_after_seconds(httpx.Response(429, headers={"Retry-After": "12"}))
     assert delay == 12.0

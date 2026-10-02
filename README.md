@@ -9,7 +9,8 @@ download article bodies and is not a way around a paywall.
 
 - Async fetching with a per-domain rate limit and bounded concurrency
 - `robots.txt` is checked and cached per domain; disallowed paths are skipped
-- Retries on 429/5xx/timeouts with exponential backoff, jitter and `Retry-After`
+- Retries on 429/5xx/timeouts with exponential backoff, jitter and `Retry-After`;
+  a `Retry-After` longer than 30s skips the source until the next run
 - Idempotent storage: re-running never duplicates a headline
 - One failing source never aborts the run
 
