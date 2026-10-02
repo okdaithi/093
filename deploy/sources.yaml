@@ -8,8 +8,9 @@ settings:
   concurrency: 3
 
 # Tags: a country code for where the outlet is based (AU, IE, UK, US, DE, FR,
-# QA), plus beats such as "business". Filter with --tag on fetch, list, search,
-# changes and sources. To add sites, see "Adding sources" in the README:
+# QA, CN, HK, IN, JP, KR, SG, VN), then group and beat tags in lower case
+# (galway, asia, markets, business, energy, crypto, commentary). Filter with
+# --tag on fetch, list, search, changes and sources. To add sites, see "Adding sources" in the README:
 #   headliner discover --tag AU https://example.com.au/ >> new-sources.yaml
 sources:
   # --- Australia -----------------------------------------------------------
@@ -177,3 +178,212 @@ sources:
     article_selector: ".topic-container li"
     title_selector: "a"
     link_selector: "a"
+
+  # --- Ireland: Galway (batches/2026-10-03-global.txt) -------------------------
+  # RTE Galway has no feed of its own; its stories come through RTE News.
+  # Galway Bay FM and the Connacht Tribune/Advertiser (advertiser.ie): no feed found.
+  - name: GalwayBeo
+    url: https://www.galwaybeo.ie/?service=rss
+    type: rss
+    tags: [IE, galway]
+
+  - name: Galway Daily
+    url: https://www.galwaydaily.com/feed/
+    type: rss
+    tags: [IE, galway]
+
+
+  # --- United States -----------------------------------------------------------
+  # Not fetchable: Axios (robots.txt disallows its feed), USA Today and The Spectator
+  # (US) (no working feed), CNN (RSS frozen since 2023-04; edition feed since 2024-04).
+  - name: MS NOW
+    url: https://www.ms.now/feed
+    type: rss
+    tags: [US]
+
+  - name: Fox News
+    url: https://moxie.foxnews.com/google-publisher/latest.xml
+    type: rss
+    tags: [US]
+
+  - name: New York Times
+    url: https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml
+    type: rss
+    tags: [US]
+
+  - name: WSJ World
+    url: https://feeds.content.dowjones.io/public/rss/RSSWorldNews
+    type: rss
+    tags: [US]
+
+  - name: New York Post
+    url: https://nypost.com/feed/
+    type: rss
+    tags: [US]
+
+  - name: Politico
+    url: https://rss.politico.com/politics-news.xml
+    type: rss
+    tags: [US]
+
+  - name: The Hill
+    url: https://thehill.com/feed/?feed=partnerfeed-news-feed&format=rss
+    type: rss
+    tags: [US]
+
+  - name: Breitbart
+    url: https://feeds.feedburner.com/breitbart
+    type: rss
+    tags: [US]
+
+
+  # --- United Kingdom ----------------------------------------------------------
+  # Not fetchable: The Sun and The Times (robots.txt disallows everything), The
+  # Spectator and LBC (no feed found).
+  - name: The Telegraph
+    url: https://www.telegraph.co.uk/rss.xml
+    type: rss
+    tags: [UK]
+
+  - name: The Independent
+    url: https://www.independent.co.uk/rss
+    type: rss
+    tags: [UK]
+
+  - name: GB News
+    url: https://www.gbnews.com/feeds/feed.rss
+    type: rss
+    tags: [UK]
+
+  - name: The Standard
+    url: https://www.standard.co.uk/rss
+    type: rss
+    tags: [UK]
+
+  - name: The i Paper
+    url: https://inews.co.uk/feed
+    type: rss
+    tags: [UK]
+
+  - name: Daily Express
+    url: https://www.express.co.uk/?service=rss
+    type: rss
+    tags: [UK]
+
+  - name: The Mirror
+    url: https://www.mirror.co.uk/?service=rss
+    type: rss
+    tags: [UK]
+
+  - name: Daily Mail
+    url: https://www.dailymail.com/news/index.rss
+    type: rss
+    tags: [UK]
+
+
+  # --- China and Greater China -------------------------------------------------
+  # Not fetchable: China Daily, Taiwan News and Caixin Global (no working feed),
+  # Xinhua (RSS frozen since 2018) and Global Times (RSS frozen since 2026-08-23).
+  # cn-intel (CICIR, CIIS, Qiushi, gov.cn, stats.gov.cn, Guancha, ce.cn, CCPS, China
+  # Military): none publishes RSS; HTML scraping is planned as a separate step.
+  - name: South China Morning Post
+    url: https://www.scmp.com/rss/feed/
+    type: rss
+    tags: [HK]
+
+  - name: CGTN
+    url: https://www.cgtn.com/subscribe/rss/section/world.xml
+    type: rss
+    tags: [CN]
+
+
+  # --- Asia --------------------------------------------------------------------
+  # Not fetchable: The Standard (HK) and The Jakarta Post (no feed found).
+  - name: Times of India
+    url: https://timesofindia.indiatimes.com/rssfeedstopstories.cms
+    type: rss
+    tags: [IN, asia]
+
+  - name: Economic Times
+    url: https://economictimes.indiatimes.com/rssfeedstopstories.cms
+    type: rss
+    tags: [IN, asia, business]
+
+  - name: The Straits Times
+    url: https://www.straitstimes.com/news/world/rss.xml
+    type: rss
+    tags: [SG, asia]
+
+  - name: CNA
+    url: https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml
+    type: rss
+    tags: [SG, asia]
+
+  - name: Japan Today
+    url: https://japantoday.com/feed/atom
+    type: rss
+    tags: [JP, asia]
+
+  - name: The Japan Times
+    url: https://www.japantimes.co.jp/feed/
+    type: rss
+    tags: [JP, asia]
+
+  - name: Nikkei Asia
+    url: https://asia.nikkei.com/rss/feed/nar
+    type: rss
+    tags: [JP, asia, business]
+
+  - name: The Korea Herald
+    url: https://www.koreaherald.com/rss/newsAll
+    type: rss
+    tags: [KR, asia]
+
+  - name: Yonhap
+    url: https://en.yna.co.kr/RSS/news.xml
+    type: rss
+    tags: [KR, asia]
+
+  - name: VnExpress International
+    url: https://e.vnexpress.net/rss/news.rss
+    type: rss
+    tags: [VN, asia]
+
+
+  # --- Markets -----------------------------------------------------------------
+  # Not fetchable: Bloomberg (bot protection), Reuters (robots.txt disallows), Kitco
+  # (no feed found). Left out as too thin: The Daily Shot (1 item), Investing.com (5).
+  - name: WSJ Markets
+    url: https://feeds.content.dowjones.io/public/rss/RSSMarketsMain
+    type: rss
+    tags: [markets]
+
+  - name: Hedgeweek
+    url: https://hedgeweek.com/feed/
+    type: rss
+    tags: [markets]
+
+  - name: Pensions & Investments
+    url: https://www.pionline.com/arc/outboundfeeds/rss/?outputType=xml
+    type: rss
+    tags: [markets]
+
+  - name: Project Syndicate
+    url: https://www.project-syndicate.org/rss
+    type: rss
+    tags: [markets, commentary]
+
+  - name: Oilprice.com
+    url: https://oilprice.com/rss.xml
+    type: rss
+    tags: [markets, energy]
+
+  - name: CoinDesk
+    url: https://www.coindesk.com/arc/outboundfeeds/rss?outputType=xml
+    type: rss
+    tags: [markets, crypto]
+
+  - name: ZeroHedge
+    url: https://cms.zerohedge.com/fullrss2.xml
+    type: rss
+    tags: [markets]
