@@ -33,6 +33,7 @@ from typing import Any, Final
 from urllib.parse import parse_qs, urlencode, urlsplit
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
+from headliner import local_timezone, tz_abbrev
 from headliner.backup import default_dir, list_backups
 from headliner.config import Config, ConfigError, load_config
 from headliner.models import Headline, is_minor_change, utcnow
@@ -276,11 +277,11 @@ class Clock:
     utc: bool
 
     def shown(self, value: datetime) -> datetime:
-        return value.astimezone(UTC) if self.utc else value.astimezone()
+        return value.astimezone(UTC) if self.utc else value.astimezone(local_timezone())
 
     @property
     def zone(self) -> str:
-        return "UTC" if self.utc else (datetime.now().astimezone().tzname() or "local")
+        return "UTC" if self.utc else tz_abbrev(local_timezone())
 
     def time(self, value: datetime | None, fmt: str = "%Y-%m-%d %H:%M") -> Markup:
         """A `<time>` element; its title and datetime attribute carry UTC."""
@@ -289,8 +290,9 @@ class Clock:
         shown = self.shown(value)
         label = shown.strftime(fmt)
         # Across a daylight-saving change the zone differs per value; say which.
-        if not self.utc and shown.tzname() != self.zone:
-            label += f" {shown.tzname()}"
+        zone = tz_abbrev(shown)
+        if not self.utc and zone != self.zone:
+            label += f" {zone}"
         utc_iso = value.astimezone(UTC).isoformat(timespec="seconds")
         return render(
             '<time datetime="{iso}" title="{title}">{label}</time>',
@@ -300,7 +302,8 @@ class Clock:
         )
 
     def day(self, value: datetime) -> str:
-        return self.shown(value).strftime("%A %-d %B %Y")
+        shown = self.shown(value)
+        return f"{shown.strftime('%A')} {shown.day} {shown.strftime('%B %Y')}"
 
     def ago(self, value: datetime | None) -> str:
         if value is None:
@@ -1700,7 +1703,7 @@ alone.</p>
         per_day: Counter[Any] = Counter(clock.shown(row.fetched_at).date() for row in rows)
         heat = (
             count_strip(
-                [(day.strftime("%-d"), day.strftime("%a %-d %b"), per_day[day]) for day in day_list]
+                [(str(day.day), f"{day.strftime('%a')} {day.day} {day.strftime('%b')}", per_day[day]) for day in day_list]
             )
             if rows
             else Markup('<p class="empty">No articles in this period.</p>')
@@ -2301,7 +2304,7 @@ source's first-ever run is left out.</p>
                 render(
                     '<th class="day" title="{full}">{d}</th>',
                     full=day.isoformat(),
-                    d=day.strftime("%a %-d"),
+                    d=f"{day.strftime('%a')} {day.day}",
                 )
                 for day in days
             ),

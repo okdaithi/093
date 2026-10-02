@@ -79,6 +79,7 @@ def take_backup(db_path: Path, directory: Path, *, now: datetime | None = None) 
             raise BackupError(f"integrity check failed on the copy: {result}")
         partial.chmod(0o600)
         partial.replace(target)
+        target.chmod(0o600)
     except (sqlite3.Error, OSError) as exc:
         raise BackupError(f"backup of {db_path} failed: {exc}") from exc
     finally:
