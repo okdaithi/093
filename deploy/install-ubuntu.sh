@@ -39,7 +39,7 @@ fi
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd -- "${script_dir}/.." && pwd)"
 
-for required_file in requirements.txt pyproject.toml deploy/headliner.service deploy/headliner.timer deploy/headliner-web.service deploy/headliner-backup.service deploy/headliner-backup.timer deploy/sources.yaml; do
+for required_file in requirements.txt pyproject.toml deploy/headliner.service deploy/headliner.timer deploy/headliner-web.service deploy/headliner-backup.service deploy/headliner-backup.timer deploy/sources.yaml deploy/deployment_info.py; do
     if [[ ! -f "${repo_dir}/${required_file}" ]]; then
         echo "Missing ${required_file}; run this script from a complete repository checkout." >&2
         exit 1
@@ -152,6 +152,12 @@ if systemctl is-active --quiet headliner-web.service; then
     systemctl restart headliner-web.service
     echo "Restarted headliner-web.service (web viewer) on the new code."
 fi
+
+echo
+if ! python3 "${repo_dir}/deploy/deployment_info.py" "${repo_dir}"; then
+    echo "WARNING: Could not display deployment code metadata; installation completed." >&2
+fi
+echo
 
 cat <<'INSTRUCTIONS'
 Headliner is installed. Before enabling scheduled fetches:
