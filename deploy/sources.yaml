@@ -16,9 +16,10 @@ sources:
     url: https://www.theguardian.com/au/rss
     type: rss
 
-  # Reuters has wound down public RSS; this agency feed may go away.
-  - name: Reuters World
-    url: https://www.reutersagency.com/feed/?best-topics=world&post_type=best
+  # Reuters has wound down public RSS and the old agency feed now returns 404.
+  # Replaced with the Deutsche Welle world feed to keep 1st-party coverage.
+  - name: Deutsche Welle
+    url: https://rss.dw.com/rdf/rss-en-world
     type: rss
 
   - name: BBC News
@@ -33,9 +34,10 @@ sources:
     url: https://www.irishtimes.com/arc/outboundfeeds/feed-irish-news/
     type: rss
 
-  # AP retired its public RSS feeds; this is a community mirror.
-  - name: AP News
-    url: https://rsshub.app/apnews/topics/apf-topnews
+  # AP retired its public RSS feeds and the rsshub.app mirror now returns 403.
+  # Replaced with the France 24 world feed (1st-party, no mirror dependency).
+  - name: France 24
+    url: https://www.france24.com/en/rss
     type: rss
 
   - name: Al Jazeera

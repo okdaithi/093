@@ -49,7 +49,7 @@ systemctl daemon-reload
 cat <<'INSTRUCTIONS'
 Headliner is installed. Before enabling scheduled fetches:
   1. Edit /etc/headliner/sources.yaml and replace the placeholder contact address.
-  2. Enable the six-hour timer: systemctl enable --now headliner.timer
+  2. Enable the timer (runs four times daily): systemctl enable --now headliner.timer
   3. Optionally run once now: systemctl start headliner.service
 
 Inspect runs with: journalctl -u headliner.service

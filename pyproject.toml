@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Polite CLI news-headline aggregator over RSS/Atom feeds and HTML listing pages."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "headliner contributors" }]
 keywords = ["news", "rss", "atom", "scraper", "cli"]
 classifiers = [
