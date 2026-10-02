@@ -209,3 +209,19 @@ time { font-variant-numeric: tabular-nums; }
   h1 { font-size: 1.3rem; }
   .filters { padding: 0.5rem 0.6rem; gap: 0.4rem 0.8rem; }
 }
+
+/* Trends: rising topics, sparklines, small samples, period changes */
+ol.rising { columns: 2 16rem; column-gap: 2rem; padding-left: 1.5rem; margin: 0.5rem 0 1rem; }
+ol.rising li { break-inside: avoid; margin: 0.15rem 0; }
+ol.rising a { font-weight: 600; }
+svg.spark { width: 4rem; height: 1rem; vertical-align: middle; }
+svg.spark polyline { fill: none; stroke: var(--accent); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+tr.lowsample td { color: var(--muted); }
+tr.lowsample svg.bar { opacity: 0.5; }
+.heatmap td.heat a { color: inherit; text-decoration: none; display: block; }
+.heatmap td.heat a:hover { text-decoration: underline; }
+.up { color: var(--good); font-size: 0.7rem; }
+.down { color: var(--bad); font-size: 0.7rem; }
+details.more-rows > summary { cursor: pointer; color: var(--link); margin: 0.4rem 0; }
+details.section > summary { cursor: pointer; }
+details.section > summary h2 { display: inline; }
