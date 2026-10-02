@@ -16,9 +16,13 @@ for required_file in requirements.txt pyproject.toml deploy/headliner.service de
     fi
 done
 
-export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y python3 python3-venv
+# Redeploys skip apt: refreshing every package index is slow and changes
+# nothing once python3-venv is installed.
+if ! dpkg-query -W -f='${Status}' python3-venv 2>/dev/null | grep -q 'ok installed'; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y python3 python3-venv
+fi
 
 if ! getent passwd headliner >/dev/null; then
     useradd --system --home-dir /var/lib/headliner --create-home \
@@ -26,16 +30,24 @@ if ! getent passwd headliner >/dev/null; then
 fi
 
 install -d -o root -g root -m 0755 /opt/headliner
-python3 -m venv /opt/headliner/venv
-/opt/headliner/venv/bin/python -m pip install --upgrade pip
-/opt/headliner/venv/bin/python -m pip install -r "${repo_dir}/requirements.txt"
+venv_python=/opt/headliner/venv/bin/python
+# Only a missing or broken venv (e.g. after a Python upgrade) is rebuilt, so a
+# redeploy does not go back to PyPI for pip itself.
+if ! "${venv_python}" -c 'import pip' >/dev/null 2>&1; then
+    python3 -m venv --clear /opt/headliner/venv
+    "${venv_python}" -m pip install --upgrade pip
+fi
+# setuptools matches [build-system] in pyproject.toml. Installing it here lets
+# the package build below skip build isolation, which would otherwise fetch
+# setuptools from PyPI on every deploy.
+"${venv_python}" -m pip install -r "${repo_dir}/requirements.txt" 'setuptools>=68'
 # Build from a scratch copy: an in-tree build as root would leave root-owned
 # build/ and *.egg-info directories in the checkout, and a stale build/lib
 # could carry deleted modules into later installs.
 build_dir="$(mktemp -d)"
 trap 'rm -rf -- "${build_dir}"' EXIT
 cp -r "${repo_dir}/pyproject.toml" "${repo_dir}/README.md" "${repo_dir}/headliner" "${build_dir}/"
-/opt/headliner/venv/bin/python -m pip install --no-deps "${build_dir}"
+"${venv_python}" -m pip install --no-deps --no-build-isolation "${build_dir}"
 
 install -d -o root -g headliner -m 0750 /etc/headliner
 if [[ ! -e /etc/headliner/sources.yaml ]]; then
