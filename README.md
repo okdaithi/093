@@ -103,6 +103,7 @@ merged, so check the diff if you have them.
 | Page | Shows |
 | --- | --- |
 | **Latest** | Headlines newest first, grouped by day, with links to the articles. A `LIVE` badge marks live blogs, and "N titles" marks rewritten articles. |
+| **Stories** | Headlines from different outlets grouped into stories (see [Stories](#stories)): most widely covered first or newest first, with outlets per tag ("AU 3 · IE 1") and each outlet's headline. Latest and Search mark grouped headlines "N outlets", linking to the story. |
 | **Rewrites** | Each title change as a word-level diff (removed words struck through, added words highlighted), with the old title underneath. Live blogs and minor (punctuation-only) changes are hidden by default, as in `changes`; the page says how many of each were hidden and lets you show them. |
 | **Search** | Full-text search over current titles and summaries, with matches highlighted. Tick *Include earlier titles* to search every version (like `search --history`). |
 | **Sources** | Each source's tags, item count, last success and last run status: `ok`, `failed` (with the error), `skipped`, `stale` (no success in 13 hours) or `never fetched`. Below it, the last 12 runs with their ok/skipped/failed counts and new and retitled items. |
@@ -190,6 +191,7 @@ headliner list --since 6h --format json 2>/dev/null | jq '.[].title'
 | `headliner changes` | List headlines that were rewritten after publication, newest first |
 | `headliner migrate` | Upgrade the database schema (runs automatically; `--dry-run` previews) |
 | `headliner discover URL...` | Find each site's RSS/Atom feed and print source entries to paste (see [Adding sources](#adding-sources)) |
+| `headliner stories` | Stories reported by several outlets, most widely covered first (see [Stories](#stories)) |
 | `headliner web` | Serve a read-only web viewer (see [Web viewer](#web-viewer)) |
 
 Shared flags: `--sources PATH` (default `sources.yaml`), `--db PATH` (default
@@ -295,6 +297,33 @@ with `--dry-run`. See [Schema upgrades](#schema-upgrades).
 | `0` | Everything succeeded. A source skipped by `robots.txt` counts as success. |
 | `1` | At least one source failed. The rest still ran and were stored. |
 | `2` | Configuration error, bad arguments, or a fatal problem. |
+
+### Stories
+
+`headliner stories` groups headlines from different outlets that report the same
+event: the Christa Pike execution story, say, as told by RTE, the BBC, The Age,
+NPR and eight others.
+
+```bash
+headliner stories                    # last 24 hours, stories from 2+ outlets
+headliner stories --since 3d --min-sources 4 --tag IE
+headliner stories --format json      # every member headline, UTC timestamps
+```
+
+Each headline becomes a TF-IDF vector of its title words, plus the start of its
+summary at lower weight. Rare shared words, such as names and places, count most.
+Headlines are taken oldest first. Each joins the story it is closest to: close
+to the story as a whole (cosine >= 0.3), or close to one member (cosine >= 0.4).
+Otherwise it starts a new story. A story stops growing after 36 hours without a
+new member. Nothing is stored; grouping is recomputed on demand (about 0.3s for
+1,000 headlines, and the web viewer caches it until the next fetch).
+
+On a day of real data (1,066 headlines from 29 sources), this found 115 stories
+reported by two or more outlets. Spot checks found the large ones correct, with
+the occasional wrong member, for example a council campaign that shared "mental
+health" with an unrelated story. Treat the groups as a reading aid, not a
+verdict. Nine's mastheads (The Age, Sydney Morning Herald, WAtoday) often run
+the same headline, so they can inflate a story's outlet count.
 
 ## Configuration
 
@@ -585,6 +614,7 @@ headliner/
   parsers.py    rss/atom via feedparser, html via selectolax or beautifulsoup4
   store.py      sqlite schema, inserts, queries
   discover.py   feed discovery for `headliner discover`
+  stories.py    grouping headlines into stories across outlets
   web.py        read-only web viewer for `headliner web` (standard library WSGI)
   static/       the viewer's stylesheet
 tests/

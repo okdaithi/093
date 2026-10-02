@@ -370,3 +370,46 @@ def test_rewrites_hide_minor_changes(db_path: Path, config_path: Path) -> None:
     assert "minor change(s) hidden" not in body
     _, _, body = get("/article?url=https%3A%2F%2Fexample.org%2Fbridge")
     assert "changed to (punctuation only)" in body
+
+
+def seed_story(db_path: Path) -> None:
+    with connect(db_path) as conn:
+        store_headlines(
+            conn,
+            [
+                headline(
+                    "Harbour bridge reopening date set for Monday",
+                    "https://other.example/bridge",
+                    source="Other Daily",
+                ),
+            ],
+        )
+        conn.commit()
+
+
+def test_stories_page_groups_outlets(db_path: Path, config_path: Path) -> None:
+    seed_story(db_path)
+    get = make_client(WebApp(db_path, config_path))
+    status, _, body = get("/stories")
+    assert status == "200 OK"
+    assert "1 stories reported by 2 or more outlets in the last 24h" in body
+    assert "<strong>2 outlets</strong>" in body
+    assert '<span class="chip">AU 1</span>' in body and '<span class="chip">IE 1</span>' in body
+    assert "Budget surplus" not in body
+    _, _, body = get("/stories?tag=IE&min=3")
+    assert "No stories match." in body
+    _, _, body = get("/stories?since=bogus&min=x&sort=newest")
+    assert '<option value="newest" selected>' in body
+
+
+def test_story_page_and_latest_badge(db_path: Path, config_path: Path) -> None:
+    seed_story(db_path)
+    get = make_client(WebApp(db_path, config_path))
+    _, _, body = get("/")
+    assert body.count('class="badge story"') == 2
+    status, _, body = get("/story?url=https%3A%2F%2Fexample.org%2Fbridge")
+    assert status == "200 OK"
+    assert "2 headline(s), oldest first" in body and "Other Daily" in body
+    status, _, body = get("/story?url=https%3A%2F%2Fexample.org%2Fxss")
+    assert status == "200 OK" and "Only one outlet has reported this so far." in body
+    assert get("/story?url=https%3A%2F%2Fnope.example%2F")[0] == "404 Not Found"

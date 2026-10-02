@@ -20,6 +20,8 @@ import logging
 import re
 import socketserver
 import sqlite3
+import threading
+from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -49,6 +51,7 @@ from headliner.store import (
     source_status,
     totals,
 )
+from headliner.stories import MAX_STORY_HEADLINES, Story, by_url, cluster
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +73,14 @@ SINCE_CHOICES: Final = {
 LIVE_CHOICES: Final[tuple[LiveFilter, ...]] = ("exclude", "include", "only")
 # Query parameters kept when following a link to a different page.
 CARRIED_PARAMS: Final = frozenset({"tag", "source", "since", "utc"})
+STORY_WINDOWS: Final = {
+    "24h": timedelta(hours=24),
+    "3d": timedelta(days=3),
+    "7d": timedelta(days=7),
+}
+# The window behind "N outlets" badges and /story links.
+STORY_LINK_WINDOW: Final = "3d"
+STORIES_PAGE_SIZE: Final = 30
 
 SECURITY_HEADERS: Final = [
     (
@@ -304,7 +315,11 @@ class WebApp:
             "/search": self.page_search,
             "/sources": self.page_sources,
             "/article": self.page_article,
+            "/stories": self.page_stories,
+            "/story": self.page_story,
         }
+        self._story_cache: dict[tuple[object, ...], list[Story]] = {}
+        self._story_lock = threading.Lock()
 
     # -- WSGI plumbing
 
@@ -467,6 +482,7 @@ class WebApp:
             )
             for path, label in (
                 ("/", "Latest"),
+                ("/stories", "Stories"),
                 ("/rewrites", "Rewrites"),
                 ("/search", "Search"),
                 ("/sources", "Sources"),
@@ -636,10 +652,21 @@ class WebApp:
             return Markup("")
         return render('<nav class="pager">{l}<span>page {p}</span></nav>', l=join(links), p=page)
 
-    def badges(self, headline: Headline, titles: int, request: Request) -> Markup:
+    def badges(
+        self, headline: Headline, titles: int, request: Request, story: Story | None = None
+    ) -> Markup:
         parts = []
         if headline.is_live:
             parts.append(Markup('<span class="badge live">LIVE</span>'))
+        if story is not None and len(story.sources) > 1:
+            parts.append(
+                render(
+                    '<a class="badge story" href="{h}" title="Other outlets reporting this">'
+                    "{n} outlets</a>",
+                    h=self.link(request, "/story", url=headline.url),
+                    n=len(story.sources),
+                )
+            )
         if titles > 1:
             parts.append(
                 render(
@@ -664,6 +691,7 @@ class WebApp:
             return Markup('<p class="empty">No headlines match.</p>')
         clock = Clock(request.utc)
         counts = revision_counts(conn, [headline.url for headline in headlines])
+        story_of = by_url(self.stories(conn, STORY_LINK_WINDOW))
         out: list[Markup] = []
         day = None
         for index, headline in enumerate(headlines):
@@ -688,7 +716,9 @@ class WebApp:
                     time=clock.time(when, "%H:%M" if group_by_day else "%Y-%m-%d %H:%M"),
                     src_href=self.link(request, "/", source=headline.source, tag=None, q=None),
                     source=headline.source,
-                    badges=self.badges(headline, counts.get(headline.url, 1), request),
+                    badges=self.badges(
+                        headline, counts.get(headline.url, 1), request, story_of.get(headline.url)
+                    ),
                     title=external_link(headline.url, title, "title"),
                     earlier=render(
                         '<p class="earlier">Matched earlier title: {t}</p>',
@@ -1050,6 +1080,183 @@ class WebApp:
             open=external_link(headline.url, "open article ↗"),
             n=len(revisions),
             items=join(items),
+        )
+
+    # -- Stories
+
+    def stories(self, conn: sqlite3.Connection, window: str) -> list[Story]:
+        """Stories among the last `window` of headlines, cached until the data changes.
+
+        A fetch run changes the newest `fetched_at`; the 15-minute bucket moves
+        the window along between runs.
+        """
+        newest, count = conn.execute("SELECT MAX(fetched_at), COUNT(*) FROM headlines").fetchone()
+        key = (window, newest, count, int(utcnow().timestamp() // 900))
+        with self._story_lock:
+            cached = self._story_cache.get(key)
+        if cached is not None:
+            return cached
+        headlines = list_headlines(
+            conn, since=utcnow() - STORY_WINDOWS[window], limit=MAX_STORY_HEADLINES
+        )
+        result = cluster(headlines)
+        with self._story_lock:
+            if len(self._story_cache) >= 8:
+                self._story_cache.clear()
+            self._story_cache[key] = result
+        return result
+
+    def tag_counts(self, story: Story) -> Markup:
+        """'AU 3 · IE 1': outlets per tag, from the config."""
+        config = self.config
+        if config is None:
+            return EMPTY
+        tags_of = {source.name.casefold(): source.tags for source in config.sources}
+        counts: Counter[str] = Counter()
+        for name in story.sources:
+            counts.update(tags_of.get(name.casefold(), ()))
+        return join(
+            render('<span class="chip">{t} {n}</span>', t=tag, n=n)
+            for tag, n in sorted(counts.items(), key=lambda item: (-item[1], item[0].casefold()))
+        )
+
+    def story_members(self, request: Request, conn: sqlite3.Connection, story: Story) -> Markup:
+        clock = Clock(request.utc)
+        counts = revision_counts(conn, [headline.url for headline in story.headlines])
+        return join(
+            render(
+                '<li><span class="meta">{time} <span class="source">{source}</span> {badges}'
+                "</span> {title}</li>",
+                time=clock.time(headline.published_at or headline.fetched_at, "%a %H:%M"),
+                source=headline.source,
+                badges=self.badges(headline, counts.get(headline.url, 1), request),
+                title=external_link(headline.url, headline.title),
+            )
+            for headline in story.headlines
+        )
+
+    def page_stories(self, request: Request, conn: sqlite3.Connection) -> Markup:
+        filters = self.filters(request)
+        window = request.get("since", "24h")
+        if window not in STORY_WINDOWS:
+            window = "24h"
+        try:
+            minimum = max(2, min(10, int(request.get("min", "2"))))
+        except ValueError:
+            minimum = 2
+        newest = request.get("sort") == "newest"
+        wanted = {name.casefold() for name in (filters.named or [])}
+        chosen = [
+            story
+            for story in self.stories(conn, window)
+            if len(story.sources) >= minimum
+            and (filters.named is None or any(n.casefold() in wanted for n in story.sources))
+        ]
+        if newest:
+            chosen.sort(key=lambda story: story.last_seen, reverse=True)
+        else:
+            chosen.sort(key=lambda story: (len(story.sources), story.last_seen), reverse=True)
+        page = request.page
+        shown = chosen[(page - 1) * STORIES_PAGE_SIZE : page * STORIES_PAGE_SIZE]
+        clock = Clock(request.utc)
+        cards = join(
+            render(
+                """<li class="story">
+  <div class="meta">{first} to {last} · <strong>{n} outlets</strong> {tags}</div>
+  <h3><a href="{href}">{title}</a></h3>
+  <details><summary>{count} headlines</summary><ol class="members">{members}</ol></details>
+</li>""",
+                first=clock.time(story.first_seen, "%a %H:%M"),
+                last=clock.time(story.last_seen, "%a %H:%M"),
+                n=len(story.sources),
+                tags=self.tag_counts(story),
+                href=self.link(request, "/story", url=(story.lead or story.headlines[0]).url),
+                title=story.title,
+                count=len(story.headlines),
+                members=self.story_members(request, conn, story),
+            )
+            for story in shown
+        )
+        options = render(
+            '<label>Outlets <select name="min">{m}</select></label>'
+            '<label>Order <select name="sort">{o}</select></label>',
+            m=join(
+                render(
+                    '<option value="{v}"{s}>{v}+</option>',
+                    v=value,
+                    s=Markup(" selected") if value == minimum else EMPTY,
+                )
+                for value in (2, 3, 5)
+            ),
+            o=join(
+                render(
+                    '<option value="{v}"{s}>{label}</option>',
+                    v=value,
+                    label=label,
+                    s=Markup(" selected") if (value == "newest") == newest else EMPTY,
+                )
+                for value, label in (("covered", "most outlets"), ("newest", "newest"))
+            ),
+        )
+        return render(
+            """<h1>Stories</h1>
+{form}
+<p class="muted">{total} stories reported by {minimum} or more outlets in the last {window}.
+Headlines are grouped by shared words, so the occasional grouping is wrong.</p>
+{cards}{pager}""",
+            form=self.filter_form(
+                request, filters, since=None, extra=join([options, self.window_select(window)])
+            ),
+            total=len(chosen),
+            minimum=minimum,
+            window=window,
+            cards=render('<ol class="stories">{c}</ol>', c=cards)
+            if shown
+            else Markup('<p class="empty">No stories match.</p>'),
+            pager=self.pager(request, page * STORIES_PAGE_SIZE < len(chosen)),
+        )
+
+    @staticmethod
+    def window_select(window: str) -> Markup:
+        return render(
+            '<label>Within <select name="since">{o}</select></label>',
+            o=join(
+                render(
+                    '<option value="{v}"{s}>last {v}</option>',
+                    v=key,
+                    s=Markup(" selected") if key == window else EMPTY,
+                )
+                for key in STORY_WINDOWS
+            ),
+        )
+
+    def page_story(self, request: Request, conn: sqlite3.Connection) -> Markup:
+        url = request.get("url")
+        window = request.get("since", STORY_LINK_WINDOW)
+        if window not in STORY_WINDOWS:
+            window = STORY_LINK_WINDOW
+        story = by_url(self.stories(conn, window)).get(url) if url else None
+        if story is None:
+            raise HttpError(
+                "404 Not Found", f"No headline with that URL in the last {window} of stories."
+            )
+        lone = (
+            Markup('<p class="muted">Only one outlet has reported this so far.</p>')
+            if len(story.sources) < 2
+            else EMPTY
+        )
+        return render(
+            """<h1>{title}</h1>
+<p class="meta"><strong>{n} outlet(s)</strong> {tags}</p>
+{lone}
+<h2>{count} headline(s), oldest first</h2>
+<ol class="members wide">{members}</ol>""",
+            title=story.title,
+            n=len(story.sources),
+            tags=self.tag_counts(story),
+            lone=lone,
+            count=len(story.headlines),
+            members=self.story_members(request, conn, story),
         )
 
 

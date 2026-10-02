@@ -47,6 +47,7 @@ from headliner.store import (
     store_headlines,
     upgrade_plan,
 )
+from headliner.stories import MAX_STORY_HEADLINES, cluster
 
 logger = logging.getLogger("headliner")
 
@@ -550,6 +551,53 @@ def cmd_discover(args: argparse.Namespace) -> int:
     return EXIT_OK if not failed else EXIT_PARTIAL_FAILURE
 
 
+def cmd_stories(args: argparse.Namespace) -> int:
+    """Print stories reported by several outlets, most widely covered first."""
+    since = utcnow() - (args.since or timedelta(hours=24))
+    tagged = _tag_sources(args)
+    with open_db(args.db) as conn:
+        headlines = list_headlines(conn, since=since, limit=MAX_STORY_HEADLINES)
+    wanted = {name.casefold() for name in tagged} if tagged is not None else None
+    stories = [
+        story
+        for story in cluster(headlines)
+        if len(story.sources) >= args.min_sources
+        and (wanted is None or any(name.casefold() in wanted for name in story.sources))
+    ]
+    stories.sort(key=lambda story: (len(story.sources), story.last_seen), reverse=True)
+    stories = stories[: args.limit]
+
+    if args.format == "json":
+        payload = [
+            {
+                "title": story.title,
+                "first_seen": story.first_seen.isoformat(),
+                "last_seen": story.last_seen.isoformat(),
+                "sources": story.sources,
+                "headlines": [headline.as_dict() for headline in story.headlines],
+            }
+            for story in stories
+        ]
+        json.dump(payload, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return EXIT_OK
+    if not stories:
+        print("No stories found.", file=sys.stdout)
+        return EXIT_OK
+    first, zone = time_column([story.first_seen for story in stories], utc=args.utc)
+    rows = [
+        [
+            when,
+            str(len(story.sources)),
+            _truncate(", ".join(story.sources), 40),
+            _truncate(story.title, 80),
+        ]
+        for story, when in zip(stories, first, strict=True)
+    ]
+    render_table(rows, [f"FIRST SEEN ({zone})", "OUTLETS", "SOURCES", "TITLE"], sys.stdout)
+    return EXIT_OK
+
+
 def cmd_web(args: argparse.Namespace) -> int:
     """Serve the read-only web viewer until interrupted."""
     from headliner.web import serve  # the CLI's other commands never need it
@@ -750,6 +798,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="tag to put on every discovered source (repeatable), e.g. --tag AU",
     )
 
+    stories_cmd = subparsers.add_parser(
+        "stories",
+        parents=[common],
+        help="group headlines from different outlets that report the same story",
+    )
+    stories_cmd.add_argument(
+        "--since",
+        type=parse_duration,
+        metavar="DURATION",
+        help="headlines newer than this age (default: 24h)",
+    )
+    stories_cmd.add_argument(
+        "--min-sources",
+        type=int,
+        default=2,
+        metavar="N",
+        help="only stories from at least N outlets (default: %(default)s)",
+    )
+    stories_cmd.add_argument(
+        "--tag",
+        action="append",
+        metavar="TAG",
+        help="only stories reported by a source with this tag (repeatable; reads the config file)",
+    )
+    stories_cmd.add_argument(
+        "--limit", type=int, default=30, metavar="N", help="maximum stories (default: %(default)s)"
+    )
+    stories_cmd.add_argument(
+        "--format",
+        choices=("table", "json"),
+        default="table",
+        help="output format (default: %(default)s)",
+    )
+
     web = subparsers.add_parser(
         "web", parents=[common], help="serve a read-only web viewer of the database"
     )
@@ -788,6 +870,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_discover(args)
         if args.command == "web":
             return cmd_web(args)
+        if args.command == "stories":
+            return cmd_stories(args)
         config = load_config(args.sources)
         if args.command == "fetch":
             return cmd_fetch(args, config)
