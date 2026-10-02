@@ -92,16 +92,21 @@ class RateLimiter:
         self._locks: dict[str, asyncio.Lock] = {}
         self._last_request: dict[str, float] = {}
 
-    async def acquire(self, domain: str) -> None:
-        """Sleep, if needed, until this domain may be hit again."""
-        if self._delay <= 0:
+    async def acquire(self, domain: str, *, min_gap: float | None = None) -> None:
+        """Sleep, if needed, until this domain may be hit again.
+
+        `min_gap` (e.g. a robots.txt `Crawl-delay`) widens the gap for this
+        request when it is longer than the configured delay.
+        """
+        gap = max(self._delay, min_gap or 0.0)
+        if gap <= 0:
             return
         lock = self._locks.setdefault(domain, asyncio.Lock())
         async with lock:
             loop = asyncio.get_running_loop()
             last = self._last_request.get(domain)
             if last is not None:
-                wait = self._delay - (loop.time() - last)
+                wait = gap - (loop.time() - last)
                 if wait > 0:
                     logger.debug("rate limit: sleeping %.2fs before hitting %s", wait, domain)
                     await asyncio.sleep(wait)
@@ -264,12 +269,17 @@ async def fetch_source(
                     message = f"robots.txt disallows {source.url}"
                     logger.info("%s: skipped - %s", source.name, message)
                     return result("skipped", error=message)
-                delay = await robots.crawl_delay(source.url)
-                if delay is not None and delay > settings.rate_limit_seconds:
-                    logger.debug("%s: honouring robots Crawl-delay of %.1fs", source.name, delay)
-                    await asyncio.sleep(delay - settings.rate_limit_seconds)
+                crawl_delay = await robots.crawl_delay(source.url)
+                if crawl_delay is not None and crawl_delay > settings.rate_limit_seconds:
+                    logger.debug(
+                        "%s: honouring robots Crawl-delay of %.1fs", source.name, crawl_delay
+                    )
+            else:
+                crawl_delay = None
 
-            await limiter.acquire(source.domain)
+            # The Crawl-delay is the gap between requests to the domain, so it
+            # goes through the limiter rather than being slept up front.
+            await limiter.acquire(source.domain, min_gap=crawl_delay)
             logger.debug("%s: fetching %s", source.name, source.url)
             response = await fetch_url(client, source.url, timeout=settings.request_timeout)
             headlines = parse(

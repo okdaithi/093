@@ -306,6 +306,68 @@ def test_rate_limiter_does_not_couple_separate_domains() -> None:
     assert run(check()) < 0.2
 
 
+def test_rate_limiter_min_gap_widens_the_delay() -> None:
+    async def check() -> float:
+        limiter = RateLimiter(0.0)
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        await limiter.acquire("a.example", min_gap=0.1)
+        await limiter.acquire("a.example", min_gap=0.1)
+        return loop.time() - start
+
+    assert run(check()) >= 0.1
+
+
+def test_rate_limiter_min_gap_never_shortens_the_delay() -> None:
+    async def check() -> float:
+        limiter = RateLimiter(0.1)
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        await limiter.acquire("a.example", min_gap=0.01)
+        await limiter.acquire("a.example", min_gap=0.01)
+        return loop.time() - start
+
+    assert run(check()) >= 0.1
+
+
+@respx.mock
+def test_crawl_delay_spaces_sources_on_the_same_host(settings: Settings, feed_body: bytes) -> None:
+    """Crawl-delay is the gap between requests to a host, not a per-source pause.
+
+    robotparser only accepts whole seconds, so this test waits about one second.
+    """
+    respx.get(ROBOTS_URL).mock(
+        return_value=httpx.Response(200, text="User-agent: *\nCrawl-delay: 1\nAllow: /\n")
+    )
+    hits: list[float] = []
+
+    def record(request: httpx.Request) -> httpx.Response:
+        hits.append(asyncio.get_running_loop().time())
+        return httpx.Response(200, content=feed_body)
+
+    respx.get(url__regex=r"https://feed\.example\.org/(world|business)\.xml").mock(
+        side_effect=record
+    )
+    sources = [
+        feed_source("World", "https://feed.example.org/world.xml"),
+        feed_source("Business", "https://feed.example.org/business.xml"),
+    ]
+
+    async def check() -> float:
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        results = await fetch_all(sources, settings)
+        assert all(result.status == "ok" for result in results)
+        return start
+
+    start = run(check())
+    assert len(hits) == 2
+    first, second = sorted(hits)
+    # No up-front pause before the first request; the full delay before the second.
+    assert first - start < 0.5
+    assert second - first >= 1.0
+
+
 def test_rate_limiter_disabled_at_zero() -> None:
     async def check() -> float:
         limiter = RateLimiter(0.0)
