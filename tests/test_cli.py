@@ -786,3 +786,81 @@ def test_search_history_on_current_words_adds_no_column(
     out = capsys.readouterr().out
     assert "White elephant" in out
     assert "MATCHED EARLIER TITLE" not in out
+
+
+# --------------------------------------------------------------------------
+# --tag
+# --------------------------------------------------------------------------
+
+TAGGED_CONFIG = f"""
+settings:
+  rate_limit_seconds: 0
+  user_agent: "headliner-tests/0.1 (+contact: tests@example.org)"
+sources:
+  - name: Example Wire
+    url: {FEED_URL}
+    type: rss
+    tags: [AU]
+  - name: Other Wire
+    url: https://other.example.org/rss.xml
+    type: rss
+    tags: [IE, business]
+"""
+
+
+@pytest.fixture
+def tagged_config(tmp_path: Path) -> Path:
+    path = tmp_path / "tagged.yaml"
+    path.write_text(TAGGED_CONFIG, encoding="utf-8")
+    return path
+
+
+@respx.mock
+def test_fetch_tag_fetches_only_tagged_sources(
+    tagged_config: Path, db_path: Path, feed_body: bytes
+) -> None:
+    mock_feed(feed_body)
+    other = respx.get("https://other.example.org/rss.xml").mock(
+        return_value=httpx.Response(200, content=feed_body)
+    )
+    args = ["fetch", "--sources", str(tagged_config), "--db", str(db_path), "--quiet"]
+    assert main([*args, "--tag", "au"]) == EXIT_OK
+    assert other.call_count == 0
+    conn = connect(db_path)
+    assert {row[0] for row in conn.execute("SELECT source FROM fetch_log")} == {"Example Wire"}
+    conn.close()
+
+
+def test_list_search_and_changes_filter_by_tag(
+    tagged_config: Path, db_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed(db_path)  # "Example Wire" (AU) ferry story and "Other Wire" (IE) tram story
+    common = ["--sources", str(tagged_config), "--db", str(db_path), "--quiet"]
+
+    assert main(["list", *common, "--tag", "IE", "--format", "json"]) == EXIT_OK
+    assert [h["source"] for h in json.loads(capsys.readouterr().out)] == ["Other Wire"]
+
+    assert main(["search", "ferry", *common, "--tag", "IE"]) == EXIT_OK
+    assert "No headlines found." in capsys.readouterr().out
+    assert main(["search", "ferry", *common, "--tag", "AU", "--format", "json"]) == EXIT_OK
+    assert [h["source"] for h in json.loads(capsys.readouterr().out)] == ["Example Wire"]
+
+    assert main(["changes", *common, "--tag", "business"]) == EXIT_OK
+    assert "No headline changes found." in capsys.readouterr().out
+
+
+def test_sources_command_shows_and_filters_tags(
+    tagged_config: Path, db_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    common = ["sources", "--sources", str(tagged_config), "--db", str(db_path), "--quiet"]
+    assert main(common) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "TAGS" in out and "IE,business" in out
+    assert main([*common, "--tag", "business", "--format", "json"]) == EXIT_OK
+    [only] = json.loads(capsys.readouterr().out)
+    assert (only["name"], only["tags"]) == ("Other Wire", ["IE", "business"])
+
+
+def test_unknown_tag_exits_two(tagged_config: Path, db_path: Path) -> None:
+    args = ["list", "--sources", str(tagged_config), "--db", str(db_path), "--quiet"]
+    assert main([*args, "--tag", "NZ"]) == EXIT_FATAL

@@ -16,9 +16,18 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Final, TextIO
+from urllib.parse import urlsplit
 
 from headliner import __version__
-from headliner.config import DEFAULT_CONFIG_PATH, Config, ConfigError, load_config
+from headliner.config import (
+    DEFAULT_CONFIG_PATH,
+    Config,
+    ConfigError,
+    Settings,
+    load_config,
+    parse_tags,
+)
+from headliner.discover import discover, render_yaml
 from headliner.fetcher import SourceResult, fetch_all
 from headliner.models import Headline, utcnow
 from headliner.store import (
@@ -224,7 +233,7 @@ def _summarise(results: list[SourceResult], *, dry_run: bool) -> None:
 
 def cmd_fetch(args: argparse.Namespace, config: Config) -> int:
     """Fetch every selected source, store new headlines and log the run."""
-    sources = config.select(args.only)
+    sources = config.select(args.only, args.tag)
     if not sources:
         logger.error("no enabled sources to fetch")
         return EXIT_FATAL
@@ -270,7 +279,13 @@ def cmd_list(args: argparse.Namespace, config: Config) -> int:
         config.select([args.source])
     since = utcnow() - args.since if args.since else None
     with open_db(args.db) as conn:
-        headlines = list_headlines(conn, since=since, source=args.source, limit=args.limit)
+        headlines = list_headlines(
+            conn,
+            since=since,
+            source=args.source,
+            sources=_tag_sources(args, config),
+            limit=args.limit,
+        )
     output_headlines(headlines, args.format, sys.stdout, utc=args.utc)
     return EXIT_OK
 
@@ -279,10 +294,12 @@ def cmd_search(args: argparse.Namespace) -> int:
     """Search stored headlines: current versions, or every version with --history."""
     with open_db(args.db) as conn:
         if not args.history:
-            headlines = search_headlines(conn, args.query, limit=args.limit)
+            headlines = search_headlines(
+                conn, args.query, limit=args.limit, sources=_tag_sources(args)
+            )
             output_headlines(headlines, args.format, sys.stdout, utc=args.utc)
             return EXIT_OK
-        hits = search_history(conn, args.query, limit=args.limit)
+        hits = search_history(conn, args.query, limit=args.limit, sources=_tag_sources(args))
     output_headlines(
         [hit.headline for hit in hits],
         args.format,
@@ -351,20 +368,26 @@ def output_changes(
 def cmd_changes(args: argparse.Namespace) -> int:
     """Print headline rewrites; live blogs are hidden unless asked for."""
     since = utcnow() - args.since if args.since else None
+    tagged = _tag_sources(args)
     live: LiveFilter = "only" if args.live_only else "include" if args.include_live else "exclude"
     with open_db(args.db) as conn:
         changes = list_title_changes(
             conn,
             since=since,
             source=args.source,
+            sources=tagged,
             limit=args.limit,
             live=live,
             oldest_first=args.oldest_first,
         )
         # Live rewrites only; a live blog's first headline is not a change.
         hidden = (
-            count_title_changes(conn, since=since, source=args.source, live="include")
-            - count_title_changes(conn, since=since, source=args.source, live="exclude")
+            count_title_changes(
+                conn, since=since, source=args.source, sources=tagged, live="include"
+            )
+            - count_title_changes(
+                conn, since=since, source=args.source, sources=tagged, live="exclude"
+            )
             if live == "exclude"
             else 0
         )
@@ -428,6 +451,7 @@ def _render_sources(
                 "url": by_name[status.name].url,
                 "type": by_name[status.name].type,
                 "enabled": by_name[status.name].enabled,
+                "tags": list(by_name[status.name].tags),
                 "items": status.total_items,
                 "last_success": status.last_success.isoformat() if status.last_success else None,
                 "last_status": status.last_status,
@@ -448,6 +472,7 @@ def _render_sources(
                 status.name,
                 source.type,
                 "yes" if source.enabled else "no",
+                ",".join(source.tags) or "-",
                 str(status.total_items),
                 when,
                 status.last_status or "never fetched",
@@ -455,17 +480,59 @@ def _render_sources(
         )
     render_table(
         rows,
-        ["NAME", "TYPE", "ENABLED", "ITEMS", f"LAST SUCCESS ({zone})", "LAST STATUS"],
+        ["NAME", "TYPE", "ENABLED", "TAGS", "ITEMS", f"LAST SUCCESS ({zone})", "LAST STATUS"],
         sys.stdout,
     )
 
 
 def cmd_sources(args: argparse.Namespace, config: Config) -> int:
     """List configured sources with their last fetch state."""
+    shown = config.tagged(args.tag) if args.tag else config.sources
     with open_db(args.db) as conn:
-        statuses = source_status(conn, [source.name for source in config.sources])
+        statuses = source_status(conn, [source.name for source in shown])
     _render_sources(statuses, config, args.format, utc=args.utc)
     return EXIT_OK
+
+
+def _tag_sources(args: argparse.Namespace, config: Config | None = None) -> list[str] | None:
+    """Source names for `--tag`, or None when no tag was given.
+
+    Commands that otherwise only read the database load the config just for this.
+    """
+    if not getattr(args, "tag", None):
+        return None
+    active = config or load_config(args.sources)
+    return [source.name for source in active.tagged(args.tag)]
+
+
+def cmd_discover(args: argparse.Namespace) -> int:
+    """Find feeds for site URLs and print source entries ready to paste."""
+    tags = list(parse_tags(args.tag, "--tag"))
+    for site in args.sites:
+        if urlsplit(site).scheme not in {"http", "https"} or not urlsplit(site).hostname:
+            logger.error("not an http(s) URL: %r", site)
+            return EXIT_FATAL
+    try:
+        config: Config | None = load_config(args.sources)
+    except ConfigError as exc:
+        logger.warning("%s; using default settings and not checking for existing sources", exc)
+        config = None
+    settings = config.settings if config else Settings()
+    if "you@example.com" in settings.user_agent:
+        logger.warning("user_agent still has the placeholder contact; set a real one in settings")
+
+    results = asyncio.run(discover(args.sites, settings, config=config))
+    sys.stdout.write(render_yaml(results, tags, generated=datetime.now().astimezone()))
+    found = sum(1 for result in results if result.status == "ok")
+    known = sum(1 for result in results if result.status == "configured")
+    failed = sum(1 for result in results if result.status == "failed")
+    logger.info(
+        "discover: %d feed(s) found, %d already configured, %d without a usable feed",
+        found,
+        known,
+        failed,
+    )
+    return EXIT_OK if not failed else EXIT_PARTIAL_FAILURE
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -512,6 +579,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="fetch only these sources (by configured name)",
     )
     fetch.add_argument(
+        "--tag", action="append", metavar="TAG", help="only sources with this tag (repeatable)"
+    )
+    fetch.add_argument(
         "--ignore-robots",
         action="store_true",
         help="do not consult robots.txt (off by default)",
@@ -531,6 +601,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     listing.add_argument("--source", metavar="NAME", help="restrict to one source")
     listing.add_argument(
+        "--tag", action="append", metavar="TAG", help="only sources with this tag (repeatable)"
+    )
+    listing.add_argument(
         "--limit", type=int, default=50, metavar="N", help="maximum rows (default: %(default)s)"
     )
     listing.add_argument(
@@ -542,6 +615,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     search = subparsers.add_parser("search", parents=[common], help="search stored headlines")
     search.add_argument("query", help="search terms")
+    search.add_argument(
+        "--tag",
+        action="append",
+        metavar="TAG",
+        help="only sources with this tag (repeatable; reads the config file)",
+    )
     search.add_argument(
         "--history",
         action="store_true",
@@ -567,6 +646,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="only changes seen within this age, e.g. 24h, 7d",
     )
     changes.add_argument("--source", metavar="NAME", help="restrict to one source")
+    changes.add_argument(
+        "--tag",
+        action="append",
+        metavar="TAG",
+        help="only sources with this tag (repeatable; reads the config file)",
+    )
     changes.add_argument(
         "--limit", type=int, default=50, metavar="N", help="maximum rows (default: %(default)s)"
     )
@@ -611,6 +696,22 @@ def build_parser() -> argparse.ArgumentParser:
         default="table",
         help="output format (default: %(default)s)",
     )
+    sources_cmd.add_argument(
+        "--tag", action="append", metavar="TAG", help="only sources with this tag (repeatable)"
+    )
+
+    discover_cmd = subparsers.add_parser(
+        "discover",
+        parents=[common],
+        help="find RSS/Atom feeds for site URLs and print source entries to paste",
+    )
+    discover_cmd.add_argument("sites", nargs="+", metavar="URL", help="site homepages")
+    discover_cmd.add_argument(
+        "--tag",
+        action="append",
+        metavar="TAG",
+        help="tag to put on every discovered source (repeatable), e.g. --tag AU",
+    )
 
     return parser
 
@@ -634,6 +735,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_changes(args)
         if args.command == "migrate":
             return cmd_migrate(args)
+        if args.command == "discover":
+            return cmd_discover(args)
         config = load_config(args.sources)
         if args.command == "fetch":
             return cmd_fetch(args, config)

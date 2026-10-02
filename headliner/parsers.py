@@ -333,9 +333,42 @@ def parse(
     fetched_at: datetime | None = None,
     limit: int | None = None,
 ) -> list[Headline]:
-    """Dispatch to the parser matching `source.type`."""
+    """Dispatch to the parser matching `source.type`, then apply `include_url_pattern`.
+
+    The filter runs before `limit`, so a filtered source still gets its full
+    quota of matching items.
+    """
+    include = source.include_regex
+    raw_limit = None if include is not None else limit
     if source.type == "rss":
-        return parse_feed(body, source, fetched_at=fetched_at, limit=limit)
-    if source.type == "html":
-        return parse_html(body, source, fetched_at=fetched_at, limit=limit)
-    raise ParseError(f"{source.name}: unsupported source type {source.type!r}")
+        headlines = parse_feed(body, source, fetched_at=fetched_at, limit=raw_limit)
+    elif source.type == "html":
+        headlines = parse_html(body, source, fetched_at=fetched_at, limit=raw_limit)
+    else:
+        raise ParseError(f"{source.name}: unsupported source type {source.type!r}")
+    if include is not None:
+        headlines = [headline for headline in headlines if include.search(headline.url)]
+        if limit is not None:
+            headlines = headlines[:limit]
+    return headlines
+
+
+_FEED_TYPES = ("application/rss+xml", "application/atom+xml", "application/feed+xml")
+
+
+def find_feed_links(body: bytes | str, base_url: str) -> list[str]:
+    """Feed URLs a page advertises with `<link rel="alternate" type="...rss/atom...">`.
+
+    In page order, resolved against `base_url`, without duplicates.
+    """
+    tree = _build_tree(body)
+    found: list[str] = []
+    for link in tree.select_all("link"):
+        rel = (link.attr("rel") or "").lower().split()
+        kind = (link.attr("type") or "").lower().split(";")[0].strip()
+        href = (link.attr("href") or "").strip()
+        if "alternate" in rel and kind in _FEED_TYPES and href:
+            url = urljoin(base_url, href)
+            if url not in found:
+                found.append(url)
+    return found

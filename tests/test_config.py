@@ -159,3 +159,81 @@ def test_invalid_live_url_pattern_is_a_config_error() -> None:
             "sources:\n  - {name: A, url: 'https://a.example/f', type: rss,"
             " live_url_pattern: '(unclosed'}\n"
         )
+
+
+TAGGED = """
+sources:
+  - {name: Alpha, url: 'https://a.example/f', type: rss, tags: [AU, business]}
+  - {name: Beta, url: 'https://b.example/f', type: rss, tags: au}
+  - {name: Gamma, url: 'https://c.example/f', type: rss, tags: [IE]}
+  - {name: Delta, url: 'https://d.example/f', type: rss, tags: [IE], enabled: false}
+  - {name: Plain, url: 'https://e.example/f', type: rss}
+"""
+
+
+def test_tags_parse_as_a_list_or_single_string() -> None:
+    config = parse_config(TAGGED)
+    by_name = {s.name: s for s in config.sources}
+    assert by_name["Alpha"].tags == ("AU", "business")
+    assert by_name["Beta"].tags == ("au",)
+    assert by_name["Plain"].tags == ()
+    # Case-insensitive de-duplication; the first spelling wins.
+    assert config.all_tags == ["AU", "business", "IE"]
+
+
+def test_duplicate_tags_on_one_source_collapse() -> None:
+    config = parse_config(
+        "sources:\n  - {name: A, url: 'https://a.example/f', type: rss, tags: [AU, au, AU]}\n"
+    )
+    assert config.sources[0].tags == ("AU",)
+
+
+@pytest.mark.parametrize("bad", ["'two words'", "[ok, '']", "{a: 1}", "[-leading]"])
+def test_invalid_tags_are_config_errors(bad: str) -> None:
+    with pytest.raises(ConfigError, match="tag"):
+        parse_config(
+            f"sources:\n  - {{name: A, url: 'https://a.example/f', type: rss, tags: {bad}}}\n"
+        )
+
+
+def test_select_by_tag_is_case_insensitive_and_skips_disabled() -> None:
+    config = parse_config(TAGGED)
+    assert [s.name for s in config.select(None, ["au"])] == ["Alpha", "Beta"]
+    assert [s.name for s in config.select(None, ["IE"])] == ["Gamma"]
+    assert [s.name for s in config.select(None, ["IE", "business"])] == ["Alpha", "Gamma"]
+    # Names and tags together: the named sources that also carry the tag.
+    assert [s.name for s in config.select(["Alpha", "Gamma"], ["AU"])] == ["Alpha"]
+    # A name still reaches a disabled source.
+    assert [s.name for s in config.select(["Delta"])] == ["Delta"]
+
+
+def test_tagged_includes_disabled_sources_for_stored_data() -> None:
+    config = parse_config(TAGGED)
+    assert [s.name for s in config.tagged(["ie"])] == ["Gamma", "Delta"]
+
+
+def test_unknown_tag_lists_the_tags_in_use() -> None:
+    config = parse_config(TAGGED)
+    with pytest.raises(ConfigError, match="unknown tag 'NZ'; tags in use: AU, business, IE"):
+        config.select(None, ["NZ"])
+
+
+def test_include_url_pattern_is_validated_and_compiled() -> None:
+    config = parse_config(
+        "sources:\n  - {name: A, url: 'https://a.example/f', type: rss,"
+        " include_url_pattern: '/news/'}\n"
+    )
+    regex = config.sources[0].include_regex
+    assert regex is not None and regex.search("https://a.example/NEWS/x")
+    with pytest.raises(ConfigError, match=r"include_url_pattern.*not a valid regular"):
+        parse_config(
+            "sources:\n  - {name: A, url: 'https://a.example/f', type: rss,"
+            " include_url_pattern: '(open'}\n"
+        )
+
+
+@pytest.mark.parametrize("path", ["sources.yaml", "deploy/sources.yaml"])
+def test_shipped_configs_load_with_tags(path: str) -> None:
+    config = load_config(Path(__file__).parent.parent / path)
+    assert {"AU", "IE"} <= set(config.all_tags)
+    assert all(source.tags for source in config.sources), "every shipped source is tagged"

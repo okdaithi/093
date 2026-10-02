@@ -8,7 +8,14 @@ from pathlib import Path
 
 import pytest
 from headliner.config import Source
-from headliner.parsers import ParseError, parse, parse_datetime, parse_feed, parse_html
+from headliner.parsers import (
+    ParseError,
+    find_feed_links,
+    parse,
+    parse_datetime,
+    parse_feed,
+    parse_html,
+)
 
 
 def test_parse_feed_extracts_and_normalises(feed_bytes: bytes, rss_source: Source) -> None:
@@ -191,3 +198,38 @@ def test_shipped_html_source_selectors_work_against_the_fixture(listing_bytes: b
         headlines = parse_html(listing_bytes, source)
         assert headlines, f"{source.name}: selectors matched nothing"
         assert all(headline.url.startswith("http") for headline in headlines)
+
+
+SECTIONED_FEED = b"""<?xml version="1.0"?><rss version="2.0"><channel><title>Radio</title>
+<item><title>Win a car in our big giveaway today</title><link>https://r.example/win/car</link></item>
+<item><title>Storm warning issued for the west coast</title><link>https://r.example/news/storm</link></item>
+<item><title>Breakfast show guest list announced</title><link>https://r.example/shows/guests</link></item>
+<item><title>Rail fares to rise from next month</title><link>https://r.example/news/fares</link></item>
+<item><title>Council approves new housing plan</title><link>https://r.example/news/housing</link></item>
+</channel></rss>"""
+
+
+def test_include_url_pattern_filters_before_the_limit() -> None:
+    source = Source(
+        name="Radio", url="https://r.example/feed/", type="rss", include_url_pattern="/news/"
+    )
+    titles = [h.title for h in parse(SECTIONED_FEED, source, limit=2)]
+    # The limit counts matching items only: two news stories, not one.
+    assert titles == [
+        "Storm warning issued for the west coast",
+        "Rail fares to rise from next month",
+    ]
+
+
+def test_find_feed_links_reads_alternate_links_only() -> None:
+    page = b"""<html><head>
+    <link rel="alternate" type="application/rss+xml" href="/feed/">
+    <link rel="stylesheet alternate" type="text/css" href="/style.css">
+    <link rel="alternate" type="application/atom+xml; charset=utf-8" href="https://cdn.example/atom">
+    <link rel="alternate" type="application/rss+xml" href="/feed/">
+    <link rel="alternate" hreflang="ga" href="/ga/">
+    </head></html>"""
+    assert find_feed_links(page, "https://site.example/news/") == [
+        "https://site.example/feed/",
+        "https://cdn.example/atom",
+    ]

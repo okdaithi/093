@@ -771,3 +771,56 @@ def test_upgrade_to_v3_without_url_changes_takes_no_backup(tmp_path: Path) -> No
     assert [h.headline.url for h in search_history(upgraded, "Stripe")] == [BBC]
     upgraded.close()
     assert not list(tmp_path.glob("*.bak"))
+
+
+# --------------------------------------------------------------------------
+# filtering by several sources (what --tag resolves to)
+# --------------------------------------------------------------------------
+
+
+def seed_three_sources(conn: sqlite3.Connection) -> None:
+    for source, slug in (("Alpha", "a"), ("Beta", "b"), ("Gamma", "c")):
+        store_headlines(
+            conn,
+            [
+                seen(
+                    f"{source} reports on the harbour ferry",
+                    T0,
+                    url=f"https://e.org/{slug}",
+                    source=source,
+                )
+            ],
+        )
+        store_headlines(
+            conn,
+            [
+                seen(
+                    f"{source} updates its harbour ferry story",
+                    T0 + timedelta(hours=1),
+                    url=f"https://e.org/{slug}",
+                    source=source,
+                )
+            ],
+        )
+
+
+def test_sources_filter_applies_to_every_query(conn: sqlite3.Connection) -> None:
+    seed_three_sources(conn)
+    wanted = ["alpha", "GAMMA"]
+
+    assert sorted(h.source for h in list_headlines(conn, sources=wanted)) == ["Alpha", "Gamma"]
+    assert sorted(c.source for c in list_title_changes(conn, sources=wanted)) == ["Alpha", "Gamma"]
+    assert count_title_changes(conn, sources=wanted) == 2
+    assert sorted(h.source for h in search_headlines(conn, "ferry", sources=wanted)) == [
+        "Alpha",
+        "Gamma",
+    ]
+    hits = search_history(conn, "reports", sources=wanted)
+    assert sorted(hit.headline.source for hit in hits) == ["Alpha", "Gamma"]
+
+
+def test_empty_sources_filter_matches_nothing(conn: sqlite3.Connection) -> None:
+    seed_three_sources(conn)
+    assert list_headlines(conn, sources=[]) == []
+    assert search_headlines(conn, "ferry", sources=[]) == []
+    assert len(list_headlines(conn, sources=None)) == 3
