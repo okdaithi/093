@@ -282,6 +282,10 @@ def cmd_fetch(args: argparse.Namespace, config: Config) -> int:
                     items_new=result.items_new,
                     items_changed=result.items_changed,
                     error=result.error,
+                    newest_item=max(
+                        (h.published_at for h in result.headlines if h.published_at),
+                        default=None,
+                    ),
                 )
         _summarise(results, dry_run=False)
 
@@ -451,6 +455,12 @@ def cmd_migrate(args: argparse.Namespace) -> int:
             f"{verb} {plan.urls_normalised} URL(s), folding {plan.rows_folded} row(s); "
             "indexing title history for search"
         )
+    if plan.from_version < 4:
+        verb = "would record" if args.dry_run else "recording"
+        steps.append(
+            f"{verb} previous titles for {plan.revisions_linked} revision(s); "
+            "adding the feed freshness column"
+        )
     print(
         f"{args.db}: schema version {plan.from_version} -> {plan.to_version}; "
         f"{plan.headlines} headline row(s); {'; '.join(steps)}."
@@ -480,6 +490,7 @@ def _render_sources(
                 "last_success": status.last_success.isoformat() if status.last_success else None,
                 "last_status": status.last_status,
                 "last_error": status.last_error,
+                "newest_item": status.newest_item.isoformat() if status.newest_item else None,
             }
             for status in statuses
         ]

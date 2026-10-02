@@ -16,7 +16,7 @@ from wsgiref.util import setup_testing_defaults
 import pytest
 from headliner.cli import build_parser
 from headliner.models import Headline, utcnow
-from headliner.store import connect, record_fetch, store_headlines
+from headliner.store import SCHEMA_VERSION, connect, record_fetch, store_headlines
 from headliner.web import WebApp, highlight, word_diff
 
 CONFIG = """
@@ -289,7 +289,11 @@ def test_healthz(get: Call) -> None:
     status, _, body = get("/healthz")
     assert status == "200 OK"
     payload = json.loads(body)
-    assert payload["status"] == "ok" and payload["schema"] == 3 and payload["articles"] == 4
+    assert (
+        payload["status"] == "ok"
+        and payload["schema"] == SCHEMA_VERSION
+        and payload["articles"] == 4
+    )
 
 
 def test_database_is_never_written(db_path: Path, get: Call) -> None:
@@ -427,3 +431,40 @@ def test_trends_page(get: Call) -> None:
     assert '<option value="30d" selected>' in body
     assert ">Example Wire</a></th>" not in body
     assert get("/trends?since=junk")[0] == "200 OK"
+
+
+def test_frozen_feed_shows_content_stale(db_path: Path, config_path: Path) -> None:
+    with connect(db_path) as conn:
+        now = utcnow()
+        record_fetch(
+            conn,
+            source="Example Wire",
+            started_at=now,
+            finished_at=now,
+            status="ok",
+            items_found=12,
+            items_new=0,
+            newest_item=datetime(2023, 4, 18, tzinfo=UTC),
+        )
+        conn.commit()
+    _, _, body = make_client(WebApp(db_path, config_path))("/sources")
+    assert (
+        '<span class="state warn" title="newest item 2023-04-18: feed frozen?">content stale'
+        in body
+    )
+    assert "<strong>0</strong> of 3 enabled source(s) healthy" in body
+
+
+def test_header_totals_are_cached_until_data_changes(db_path: Path, config_path: Path) -> None:
+    app = WebApp(db_path, config_path)
+    get = make_client(app)
+    assert "4 articles" in get("/")[2]
+    first = app._totals
+    get("/rewrites")
+    assert app._totals is first  # nothing written: reused
+    with connect(db_path) as conn:
+        store_headlines(
+            conn, [headline("A brand new story for the cache", "https://example.org/n")]
+        )
+        conn.commit()
+    assert "5 articles" in get("/")[2]

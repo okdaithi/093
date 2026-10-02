@@ -24,7 +24,7 @@ import sqlite3
 import threading
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from importlib import resources
 from pathlib import Path
@@ -38,7 +38,9 @@ from headliner.store import (
     SCHEMA_VERSION,
     LiveFilter,
     Revision,
+    SourceStatus,
     TitleChange,
+    Totals,
     article_history,
     connect_readonly,
     feed_turnover,
@@ -65,6 +67,9 @@ MAX_QUERY_LENGTH: Final = 200
 SUMMARY_LENGTH: Final = 280
 # A source whose last success is older than this missed at least one 6-hourly run.
 STALE_AFTER: Final = timedelta(hours=13)
+# A feed that fetches fine but whose newest item is older than this has
+# probably been frozen by its publisher (as CNN's and Xinhua's were).
+CONTENT_STALE_AFTER: Final = timedelta(days=3)
 
 SINCE_CHOICES: Final = {
     "6h": timedelta(hours=6),
@@ -327,6 +332,7 @@ class WebApp:
         }
         self._story_cache: dict[tuple[object, ...], list[Story]] = {}
         self._story_lock = threading.Lock()
+        self._totals: tuple[tuple[object, ...], Totals] | None = None
 
     # -- WSGI plumbing
 
@@ -384,7 +390,7 @@ class WebApp:
     def healthz(self) -> Response:
         try:
             with self.connection() as conn:
-                info = totals(conn)
+                info = self.totals(conn)
                 payload = {
                     "status": "ok",
                     "schema": schema_version(conn),
@@ -468,8 +474,23 @@ class WebApp:
         query = urlencode([(key, item) for key, values in params.items() for item in values])
         return f"{path}?{query}" if query else path
 
-    def stats_line(self, conn: sqlite3.Connection, clock: Clock) -> Markup:
+    def totals(self, conn: sqlite3.Connection) -> Totals:
+        """`store.totals`, recomputed only when a fetch has written something."""
+        key = tuple(
+            conn.execute(
+                "SELECT (SELECT MAX(id) FROM headline_revisions), (SELECT MAX(id) FROM fetch_log),"
+                " (SELECT MAX(id) FROM headlines)"
+            ).fetchone()
+        )
+        cached = self._totals
+        if cached is not None and cached[0] == key:
+            return cached[1]
         info = totals(conn)
+        self._totals = (key, info)
+        return info
+
+    def stats_line(self, conn: sqlite3.Connection, clock: Clock) -> Markup:
+        info = self.totals(conn)
         return render(
             "{articles} articles · {rewrites} title changes · last fetch {when} ({ago})",
             articles=f"{info.articles:,}",
@@ -940,19 +961,12 @@ class WebApp:
         healthy = 0
         for source in shown:
             status = statuses[source.name]
-            if not source.enabled:
-                state, css = "disabled", "muted"
-            elif status.last_status == "error":
-                state, css = "failed", "bad"
-            elif status.last_status == "skipped":
-                state, css = "skipped", "warn"
-            elif status.last_success is None:
-                state, css = "never fetched", "warn"
-            elif now - status.last_success > STALE_AFTER:
-                state, css = "stale", "warn"
-            else:
-                state, css = "ok", "good"
-                healthy += 1
+            state, css = source_state(source.enabled, status, now)
+            healthy += state == "ok"
+            if state == "content stale" and status.newest_item is not None:
+                status = replace(
+                    status, last_error=f"newest item {status.newest_item:%Y-%m-%d}: feed frozen?"
+                )
             rows.append(
                 render(
                     """<tr>
@@ -983,7 +997,7 @@ class WebApp:
                     detail=render(
                         '<div class="small muted">{e}</div>', e=_shorten(status.last_error, 120)
                     )
-                    if status.last_error and state in {"failed", "skipped"}
+                    if status.last_error and state in {"failed", "skipped", "content stale"}
                     else Markup(""),
                     feed=external_link(source.url, "feed ↗", "small"),
                 )
@@ -1445,6 +1459,23 @@ source's first-ever run is left out.</p>
             rows=rows,
             footer=footer,
         )
+
+
+def source_state(enabled: bool, status: SourceStatus, now: datetime) -> tuple[str, str]:
+    """A source's health as (state, css class), from its last fetches."""
+    if not enabled:
+        return "disabled", "muted"
+    if status.last_status == "error":
+        return "failed", "bad"
+    if status.last_status == "skipped":
+        return "skipped", "warn"
+    if status.last_success is None:
+        return "never fetched", "warn"
+    if now - status.last_success > STALE_AFTER:
+        return "stale", "warn"
+    if status.newest_item is not None and now - status.newest_item > CONTENT_STALE_AFTER:
+        return "content stale", "warn"
+    return "ok", "good"
 
 
 def bar(share: float) -> Markup:

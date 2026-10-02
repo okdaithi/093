@@ -122,6 +122,10 @@ def test_fetch_writes_headlines_and_exits_zero(
     assert conn.execute("SELECT COUNT(*) FROM headlines").fetchone()[0] == 5
     log = conn.execute("SELECT source, status, items_found, items_new FROM fetch_log").fetchone()
     assert (log[0], log[1], log[2], log[3]) == ("Example Wire", "ok", 5, 5)
+    # The feed's newest publication date is kept, to spot feeds that freeze.
+    newest = conn.execute("SELECT newest_item FROM fetch_log").fetchone()[0]
+    stored = conn.execute("SELECT MAX(published_at) FROM headlines").fetchone()[0]
+    assert newest is not None and newest == stored
     conn.close()
 
 
@@ -431,7 +435,7 @@ def test_migrate_dry_run_reports_and_changes_nothing(
     make_legacy_db(path)
     assert main(["migrate", "--dry-run", "--db", str(path), "--quiet"]) == EXIT_OK
     out = capsys.readouterr().out
-    assert "schema version 0 -> 3" in out
+    assert "schema version 0 -> 4" in out
     assert "would merge 1 row(s) across 1 URL(s)" in out
     assert "would flag 0 live blog(s)" in out
     assert "nothing changed" in out
