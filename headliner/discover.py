@@ -269,6 +269,8 @@ async def discover_site(
         logger.debug("%s: %s rejected: %s", site, candidate, why)
         if why == "robots.txt disallows":
             robots_blocked += 1
+        elif candidate == site:
+            reasons.append(f"{why}")
         elif candidate in advertised or why.startswith("feed is stale"):
             reasons.append(f"advertised feed {candidate}: {why}")
 

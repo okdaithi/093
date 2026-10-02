@@ -1,0 +1,12 @@
+# Third pass: current feed URLs for publishers whose first feeds were frozen.
+US
+https://feeds.content.dowjones.io/public/rss/RSSWorldNews
+http://rss.cnn.com/rss/edition.rss
+cn
+http://www.news.cn/english/rss/worldrss.xml
+https://www.globaltimes.cn/rss/china.xml
+asia
+https://www.straitstimes.com/news/world/rss.xml   SG
+https://www.straitstimes.com/news/asia/rss.xml    SG
+markets
+https://feeds.content.dowjones.io/public/rss/RSSMarketsMain
