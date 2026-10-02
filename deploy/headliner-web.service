@@ -1,0 +1,42 @@
+[Unit]
+Description=headliner read-only web viewer
+After=network.target
+
+[Service]
+Type=simple
+User=headliner
+Group=headliner
+StateDirectory=headliner
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/headliner
+# 0.0.0.0 serves the home network too (http://<nuc-ip>:8090/); use 127.0.0.1
+# to serve only through Tailscale Serve. Change it in an override:
+#   systemctl edit headliner-web   ->   [Service] / ExecStart= / ExecStart=...
+ExecStart=/opt/headliner/venv/bin/headliner web --host 0.0.0.0 --port 8090 --sources /etc/headliner/sources.yaml --db /var/lib/headliner/headlines.db
+Restart=on-failure
+RestartSec=5
+UMask=0077
+# The viewer opens the database read-only; the state directory stays writable
+# only because SQLite readers of a WAL database update its shared-memory file.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

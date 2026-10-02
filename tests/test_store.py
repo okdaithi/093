@@ -824,3 +824,95 @@ def test_empty_sources_filter_matches_nothing(conn: sqlite3.Connection) -> None:
     assert list_headlines(conn, sources=[]) == []
     assert search_headlines(conn, "ferry", sources=[]) == []
     assert len(list_headlines(conn, sources=None)) == 3
+
+
+# --- Queries for the web viewer ---------------------------------------------------
+
+
+def test_list_headlines_offset_pages_without_overlap(conn: sqlite3.Connection) -> None:
+    base = datetime(2025, 3, 4, tzinfo=UTC)
+    insert_headlines(
+        conn,
+        [
+            make_headline(
+                f"Story number {i} long enough",
+                f"https://example.org/{i}",
+                published_at=base + timedelta(minutes=i),
+            )
+            for i in range(5)
+        ],
+    )
+    first = list_headlines(conn, limit=2)
+    second = list_headlines(conn, limit=2, offset=2)
+    assert [h.url for h in first] == ["https://example.org/4", "https://example.org/3"]
+    assert [h.url for h in second] == ["https://example.org/2", "https://example.org/1"]
+
+
+def test_article_history_and_revision_counts(conn: sqlite3.Connection) -> None:
+    store_headlines(conn, [make_headline("First wording of the story")])
+    store_headlines(conn, [make_headline("Second wording of the story")])
+    store_headlines(conn, [make_headline("Unrelated item stays single", "https://example.org/b")])
+
+    found = store.article_history(conn, "https://example.org/story")
+    assert found is not None
+    current, revisions = found
+    assert current.title == "Second wording of the story"
+    assert [r.title for r in revisions] == [
+        "First wording of the story",
+        "Second wording of the story",
+    ]
+    assert store.article_history(conn, "https://example.org/missing") is None
+    assert store.revision_counts(
+        conn, ["https://example.org/story", "https://example.org/b", "https://nope.example/"]
+    ) == {"https://example.org/story": 2, "https://example.org/b": 1}
+    assert store.revision_counts(conn, []) == {}
+
+
+def test_recent_runs_groups_fetch_log_rows_by_run(conn: sqlite3.Connection) -> None:
+    def log(source: str, start: datetime, status: str, new: int) -> None:
+        record_fetch(
+            conn,
+            source=source,
+            started_at=start,
+            finished_at=start + timedelta(seconds=3),
+            status=status,
+            items_found=5,
+            items_new=new,
+            error="boom" if status == "error" else None,
+        )
+
+    morning = datetime(2026, 10, 2, 22, 0, tzinfo=UTC)
+    log("A", morning, "ok", 2)
+    log("B", morning + timedelta(seconds=2), "error", 0)
+    evening = morning + timedelta(hours=6)
+    log("A", evening, "ok", 1)
+    log("B", evening + timedelta(seconds=1), "ok", 3)
+    log("C", evening + timedelta(seconds=1), "skipped", 0)
+
+    latest, earlier = store.recent_runs(conn, limit=5)
+    assert (latest.ok, latest.skipped, latest.failed, latest.new) == (2, 1, 0, 4)
+    assert latest.started_at == evening
+    assert (earlier.ok, earlier.failed, earlier.failed_sources) == (1, 1, ("B",))
+    assert store.recent_runs(conn, limit=1) == [latest]
+
+
+def test_totals(conn: sqlite3.Connection) -> None:
+    assert store.totals(conn).articles == 0
+    store_headlines(conn, [make_headline("First wording of the story")])
+    store_headlines(conn, [make_headline("Second wording of the story")])
+    store_headlines(conn, [make_headline("Live: rolling coverage", "https://example.org/live/x")])
+    info = store.totals(conn)
+    assert (info.articles, info.rewrites, info.live, info.last_fetch) == (2, 1, 1, None)
+
+
+def test_connect_readonly_cannot_write(tmp_path: Path) -> None:
+    path = tmp_path / "ro.db"
+    with closing(connect(path)) as writable:
+        insert_headlines(writable, [make_headline()])
+    with closing(store.connect_readonly(path)) as reader:
+        assert store.schema_version(reader) == SCHEMA_VERSION
+        assert len(list_headlines(reader)) == 1
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            reader.execute("DELETE FROM headlines")
+    with pytest.raises(sqlite3.OperationalError):
+        store.connect_readonly(tmp_path / "absent.db").execute("SELECT 1")

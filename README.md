@@ -16,6 +16,8 @@ download article bodies and is not a way around a paywall.
 - Live blogs are recognised, kept out of the rewrite list by default, and
   available as a running timeline
 - One failing source never aborts the run
+- An optional read-only web viewer (`headliner web`) for browsing, rewrites,
+  search and source health in a browser
 
 ## Requirements
 
@@ -47,8 +49,8 @@ pip install -e '.[bs4]'
 
 The deployment files install Headliner as a `systemd` oneshot service that runs
 four times daily (00:00, 06:00, 12:00 and 18:00 in the server's local timezone),
-with up to five minutes of timer jitter. No inbound ports or web server are
-required.
+with up to five minutes of timer jitter. Fetching needs no inbound ports; the
+optional [web viewer](#web-viewer) listens on port 8090.
 
 On an Ubuntu 24.04 server, clone the repository and run:
 
@@ -93,6 +95,55 @@ line, so your contact address survives. The previous file is saved as
 `sources.yaml.bak-<timestamp>` and the diff is printed. If the result doesn't
 load, the backup is put back and the installer stops. Other local edits are not
 merged, so check the diff if you have them.
+
+## Web viewer
+
+`headliner web` serves a read-only view of the database in a browser:
+
+| Page | Shows |
+| --- | --- |
+| **Latest** | Headlines newest first, grouped by day, with links to the articles. A `LIVE` badge marks live blogs, and "N titles" marks rewritten articles. |
+| **Rewrites** | Each title change as a word-level diff (removed words struck through, added words highlighted), with the old title underneath. Live blogs are hidden by default, as in `changes`; the page says how many were hidden and lets you include them or show only them. |
+| **Search** | Full-text search over current titles and summaries, with matches highlighted. Tick *Include earlier titles* to search every version (like `search --history`). |
+| **Sources** | Each source's tags, item count, last success and last run status: `ok`, `failed` (with the error), `skipped`, `stale` (no success in 13 hours) or `never fetched`. Below it, the last 12 runs with their ok/skipped/failed counts and new and retitled items. |
+| **Article** | Every title one article has carried, oldest first, each diffed against the one before. Reached from "N titles" or "all titles". |
+
+Every list filters by tag (any of those ticked), source and time window, and
+filters are kept as you move between pages. Times follow the CLI: local time with
+the zone named, a header link to switch to UTC, and the UTC timestamp on hover.
+
+The viewer opens the database read-only, so it can't change it, and only answers
+`GET`/`HEAD`. Pages are plain HTML and CSS with no JavaScript and no third-party
+requests, under a strict Content-Security-Policy. Article links open in a new tab
+without sending a referrer. It needs no packages beyond headliner's own.
+`/healthz` returns JSON (`status`, `schema`, `articles`, `last_fetch`) for
+monitoring.
+
+Run it locally against any database:
+
+```bash
+headliner web --db headlines.db --sources sources.yaml   # http://127.0.0.1:8090/
+```
+
+`--host` defaults to `127.0.0.1`; `--host 0.0.0.0` serves the whole network.
+There is no login, so only listen on networks you trust.
+
+**On the server**, the installer adds `headliner-web.service`, which runs as the
+`headliner` user on port 8090, on all interfaces. Enable it once:
+
+```bash
+sudo systemctl enable --now headliner-web.service
+```
+
+Redeploys restart it on the new code. To reach it over Tailscale with HTTPS:
+
+```bash
+sudo tailscale serve --bg --https 8444 http://127.0.0.1:8090
+```
+
+To keep it off the home network and serve it only through Tailscale, change
+`--host 0.0.0.0` to `--host 127.0.0.1` with `sudo systemctl edit --full
+headliner-web.service`. Logs: `journalctl -u headliner-web.service`.
 
 ## Quickstart
 
@@ -139,6 +190,7 @@ headliner list --since 6h --format json 2>/dev/null | jq '.[].title'
 | `headliner changes` | List headlines that were rewritten after publication, newest first |
 | `headliner migrate` | Upgrade the database schema (runs automatically; `--dry-run` previews) |
 | `headliner discover URL...` | Find each site's RSS/Atom feed and print source entries to paste (see [Adding sources](#adding-sources)) |
+| `headliner web` | Serve a read-only web viewer (see [Web viewer](#web-viewer)) |
 
 Shared flags: `--sources PATH` (default `sources.yaml`), `--db PATH` (default
 `headlines.db`), `--utc` for UTC times in tables, `--verbose` for DEBUG logging,
@@ -344,7 +396,6 @@ Business Post's advertised feeds return its HTML homepage.
 `discover` exits `1` when any site had no usable feed, so it can be scripted.
 
 ## Adding a new HTML source
-## Adding a new HTML source
 
 Use `type: html` only when the site publishes no feed. Run `headliner discover`
 on it first (see [Adding sources](#adding-sources)), and look in the page source
@@ -529,6 +580,8 @@ headliner/
   parsers.py    rss/atom via feedparser, html via selectolax or beautifulsoup4
   store.py      sqlite schema, inserts, queries
   discover.py   feed discovery for `headliner discover`
+  web.py        read-only web viewer for `headliner web` (standard library WSGI)
+  static/       the viewer's stylesheet
 tests/
   fixtures/     one RSS sample, one HTML sample
 sources.yaml

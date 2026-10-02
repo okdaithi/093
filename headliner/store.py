@@ -7,7 +7,7 @@ import sqlite3
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Final, Literal
 
@@ -553,6 +553,22 @@ def connect(
     return conn
 
 
+def connect_readonly(path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
+    """Open an existing database for reading only: no schema creation or upgrade.
+
+    Raises `sqlite3.OperationalError` when the file does not exist.
+    """
+    uri = Path(path).resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=30.0, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def schema_version(conn: sqlite3.Connection) -> int:
+    """The database's `PRAGMA user_version`."""
+    return int(conn.execute("PRAGMA user_version").fetchone()[0])
+
+
 @contextmanager
 def open_db(
     path: Path | str = DEFAULT_DB_PATH, *, migrate_schema: bool = True
@@ -732,6 +748,7 @@ def list_headlines(
     source: str | None = None,
     sources: Sequence[str] | None = None,
     limit: int = 50,
+    offset: int = 0,
 ) -> list[Headline]:
     """Most recent headlines first, optionally filtered by age and source(s)."""
     clauses: list[str] = []
@@ -748,10 +765,10 @@ def list_headlines(
         params.append(source)
 
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    params.append(max(1, limit))
+    params.extend([max(1, limit), max(0, offset)])
     with closing(
         conn.execute(
-            f"SELECT {_SELECT_COLUMNS}, id FROM headlines {where} {_ORDER_BY} LIMIT ?",
+            f"SELECT {_SELECT_COLUMNS}, id FROM headlines {where} {_ORDER_BY} LIMIT ? OFFSET ?",
             params,
         )
     ) as cursor:
@@ -808,6 +825,7 @@ def list_title_changes(
     limit: int = 50,
     live: LiveFilter = "include",
     oldest_first: bool = False,
+    offset: int = 0,
 ) -> list[TitleChange]:
     """Headline rewrites, most recent first: each revision after an article's first.
 
@@ -821,9 +839,9 @@ def list_title_changes(
             f"""
             SELECT h.source, h.url, h.is_live, r.seen_at, r.old_title, r.title {sql}
             ORDER BY r.seen_at {order}, r.id {order}
-            LIMIT ?
+            LIMIT ? OFFSET ?
             """,
-            [*params, max(1, limit)],
+            [*params, max(1, limit), max(0, offset)],
         )
     ) as cursor:
         return [
@@ -1040,3 +1058,149 @@ def source_status(conn: sqlite3.Connection, names: Iterable[str]) -> list[Source
             )
         )
     return statuses
+
+
+@dataclass(frozen=True, slots=True)
+class Revision:
+    """One title an article has carried, with when it was first seen."""
+
+    title: str
+    summary: str | None
+    seen_at: datetime | None
+
+
+def article_history(conn: sqlite3.Connection, url: str) -> tuple[Headline, list[Revision]] | None:
+    """An article by its stored URL and every title it has carried, oldest first."""
+    row = conn.execute(
+        f"SELECT {_SELECT_COLUMNS}, id FROM headlines WHERE url = ?", (url,)
+    ).fetchone()
+    if row is None:
+        return None
+    with closing(
+        conn.execute(
+            """
+            SELECT title, summary, seen_at FROM headline_revisions
+            WHERE headline_id = ? ORDER BY seen_at, id
+            """,
+            (row["id"],),
+        )
+    ) as cursor:
+        revisions = [
+            Revision(title=rev["title"], summary=rev["summary"], seen_at=_parse_iso(rev["seen_at"]))
+            for rev in cursor.fetchall()
+        ]
+    return _row_to_headline(row), revisions
+
+
+def revision_counts(conn: sqlite3.Connection, urls: Sequence[str]) -> dict[str, int]:
+    """How many distinct titles each of `urls` has carried (1 = never rewritten)."""
+    if not urls:
+        return {}
+    marks = ",".join("?" * len(urls))
+    with closing(
+        conn.execute(
+            f"""
+            SELECT h.url, COUNT(r.id) AS titles
+            FROM headlines h JOIN headline_revisions r ON r.headline_id = h.id
+            WHERE h.url IN ({marks})
+            GROUP BY h.id
+            """,
+            list(urls),
+        )
+    ) as cursor:
+        return {row["url"]: int(row["titles"]) for row in cursor.fetchall()}
+
+
+@dataclass(frozen=True, slots=True)
+class RunSummary:
+    """One `fetch` run, rebuilt from its `fetch_log` rows."""
+
+    started_at: datetime
+    finished_at: datetime
+    ok: int
+    skipped: int
+    failed: int
+    found: int
+    new: int
+    changed: int
+    failed_sources: tuple[str, ...] = ()
+
+
+# fetch_log has no run id. A run's sources start within seconds of each other;
+# scheduled runs are hours apart, so a quiet gap this long separates two runs.
+RUN_GAP: Final = timedelta(minutes=10)
+
+
+def recent_runs(conn: sqlite3.Connection, *, limit: int = 12) -> list[RunSummary]:
+    """The most recent fetch runs, newest first."""
+    # Enough rows for `limit` runs of every configured source, generously.
+    with closing(
+        conn.execute(
+            """
+            SELECT source, started_at, finished_at, status, items_found, items_new,
+                   items_changed
+            FROM fetch_log ORDER BY started_at DESC, id DESC LIMIT ?
+            """,
+            (max(1, limit) * 200,),
+        )
+    ) as cursor:
+        rows = cursor.fetchall()
+
+    groups: list[list[sqlite3.Row]] = []
+    previous: datetime | None = None
+    for row in rows:
+        started = _parse_iso(row["started_at"])
+        if started is None:
+            continue
+        if previous is None or previous - started > RUN_GAP:
+            if len(groups) == limit:
+                break
+            groups.append([])
+        groups[-1].append(row)
+        previous = started
+
+    runs: list[RunSummary] = []
+    for group in groups:
+        starts = [_parse_iso(row["started_at"]) for row in group]
+        ends = [_parse_iso(row["finished_at"]) for row in group]
+        runs.append(
+            RunSummary(
+                started_at=min(value for value in starts if value),
+                finished_at=max(value for value in ends if value),
+                ok=sum(1 for row in group if row["status"] == "ok"),
+                skipped=sum(1 for row in group if row["status"] == "skipped"),
+                failed=sum(1 for row in group if row["status"] == "error"),
+                found=sum(int(row["items_found"]) for row in group),
+                new=sum(int(row["items_new"]) for row in group),
+                changed=sum(int(row["items_changed"]) for row in group),
+                failed_sources=tuple(
+                    sorted({row["source"] for row in group if row["status"] == "error"})
+                ),
+            )
+        )
+    return runs
+
+
+@dataclass(frozen=True, slots=True)
+class Totals:
+    """Database-wide counts for the web viewer's header."""
+
+    articles: int
+    rewrites: int
+    live: int
+    last_fetch: datetime | None
+
+
+def totals(conn: sqlite3.Connection) -> Totals:
+    """Article, rewrite and live-blog counts plus the latest fetch time."""
+    articles, live = conn.execute(
+        "SELECT COUNT(*), COALESCE(SUM(is_live), 0) FROM headlines"
+    ).fetchone()
+    revisions = int(conn.execute("SELECT COUNT(*) FROM headline_revisions").fetchone()[0])
+    last = conn.execute("SELECT MAX(finished_at) FROM fetch_log").fetchone()[0]
+    return Totals(
+        articles=int(articles),
+        rewrites=max(0, revisions - int(articles)),
+        live=int(live),
+        last_fetch=_parse_iso(last),
+    )

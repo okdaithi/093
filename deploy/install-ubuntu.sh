@@ -39,7 +39,7 @@ fi
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd -- "${script_dir}/.." && pwd)"
 
-for required_file in requirements.txt pyproject.toml deploy/headliner.service deploy/headliner.timer deploy/sources.yaml; do
+for required_file in requirements.txt pyproject.toml deploy/headliner.service deploy/headliner.timer deploy/headliner-web.service deploy/sources.yaml; do
     if [[ ! -f "${repo_dir}/${required_file}" ]]; then
         echo "Missing ${required_file}; run this script from a complete repository checkout." >&2
         exit 1
@@ -133,8 +133,15 @@ install -o root -g root -m 0644 \
     "${repo_dir}/deploy/headliner.service" /etc/systemd/system/headliner.service
 install -o root -g root -m 0644 \
     "${repo_dir}/deploy/headliner.timer" /etc/systemd/system/headliner.timer
+install -o root -g root -m 0644 \
+    "${repo_dir}/deploy/headliner-web.service" /etc/systemd/system/headliner-web.service
 
 systemctl daemon-reload
+# A running viewer keeps serving the old code until restarted.
+if systemctl is-active --quiet headliner-web.service; then
+    systemctl restart headliner-web.service
+    echo "Restarted headliner-web.service (web viewer) on the new code."
+fi
 
 cat <<'INSTRUCTIONS'
 Headliner is installed. Before enabling scheduled fetches:
@@ -143,4 +150,8 @@ Headliner is installed. Before enabling scheduled fetches:
   3. Optionally run once now: systemctl start headliner.service
 
 Inspect runs with: journalctl -u headliner.service
+
+Optional read-only web viewer (port 8090, home network + localhost):
+  systemctl enable --now headliner-web.service
+  Tailnet HTTPS: tailscale serve --bg --https 8444 http://127.0.0.1:8090
 INSTRUCTIONS
