@@ -1,0 +1,10 @@
+[Unit]
+Description=Back up the headliner database daily
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

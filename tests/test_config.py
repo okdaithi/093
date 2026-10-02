@@ -237,3 +237,11 @@ def test_shipped_configs_load_with_tags(path: str) -> None:
     config = load_config(Path(__file__).parent.parent / path)
     assert {"AU", "IE"} <= set(config.all_tags)
     assert all(source.tags for source in config.sources), "every shipped source is tagged"
+
+
+def test_shipped_and_development_source_lists_match() -> None:
+    """sources.yaml and deploy/sources.yaml differ only in settings and comments."""
+    root = Path(__file__).resolve().parent.parent
+    development = load_config(root / "sources.yaml")
+    shipped = load_config(root / "deploy" / "sources.yaml")
+    assert development.sources == shipped.sources

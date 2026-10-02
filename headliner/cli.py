@@ -19,6 +19,7 @@ from typing import Final, TextIO
 from urllib.parse import urlsplit
 
 from headliner import __version__
+from headliner.backup import DEFAULT_KEEP_DAILY, DEFAULT_KEEP_WEEKLY, BackupError, run_backup
 from headliner.config import (
     DEFAULT_CONFIG_PATH,
     Config,
@@ -636,6 +637,24 @@ def cmd_stories(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_backup(args: argparse.Namespace) -> int:
+    """Back up the database (verified, 0600) and prune old backups."""
+    try:
+        made, removed = run_backup(
+            args.db, args.dir, keep_daily=args.keep_daily, keep_weekly=args.keep_weekly
+        )
+    except BackupError as exc:
+        logger.error("%s", exc)
+        return EXIT_FATAL
+    logger.info(
+        "backup: %s (%.1f MB, integrity ok); %d old backup(s) removed",
+        made.path,
+        made.size / 1_000_000,
+        len(removed),
+    )
+    return EXIT_OK
+
+
 def cmd_web(args: argparse.Namespace) -> int:
     """Serve the read-only web viewer until interrupted."""
     from headliner.web import serve  # the CLI's other commands never need it
@@ -883,6 +902,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="output format (default: %(default)s)",
     )
 
+    backup_cmd = subparsers.add_parser(
+        "backup",
+        parents=[common],
+        help="copy the database to a verified backup and prune old ones",
+    )
+    backup_cmd.add_argument(
+        "--dir",
+        type=Path,
+        metavar="DIR",
+        help="where backups go (default: backups/ next to the database)",
+    )
+    backup_cmd.add_argument(
+        "--keep-daily",
+        type=int,
+        default=DEFAULT_KEEP_DAILY,
+        metavar="N",
+        help="keep the newest backup of each of the last N days (default: %(default)s)",
+    )
+    backup_cmd.add_argument(
+        "--keep-weekly",
+        type=int,
+        default=DEFAULT_KEEP_WEEKLY,
+        metavar="N",
+        help="keep the newest backup of each of the last N weeks (default: %(default)s)",
+    )
+
     web = subparsers.add_parser(
         "web", parents=[common], help="serve a read-only web viewer of the database"
     )
@@ -923,6 +968,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_web(args)
         if args.command == "stories":
             return cmd_stories(args)
+        if args.command == "backup":
+            return cmd_backup(args)
         config = load_config(args.sources)
         if args.command == "fetch":
             return cmd_fetch(args, config)

@@ -32,6 +32,7 @@ from typing import Any, Final
 from urllib.parse import parse_qs, urlencode, urlsplit
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
+from headliner.backup import default_dir, list_backups
 from headliner.config import Config, ConfigError, load_config
 from headliner.models import Headline, is_minor_change, utcnow
 from headliner.store import (
@@ -70,6 +71,10 @@ STALE_AFTER: Final = timedelta(hours=13)
 # A feed that fetches fine but whose newest item is older than this has
 # probably been frozen by its publisher (as CNN's and Xinhua's were).
 CONTENT_STALE_AFTER: Final = timedelta(days=3)
+# Runs are 6-hourly with up to 5 minutes of jitter; one missed run is worth a look.
+RUN_LATE_AFTER: Final = timedelta(hours=7)
+# Backups are daily.
+BACKUP_LATE_AFTER: Final = timedelta(hours=26)
 
 SINCE_CHOICES: Final = {
     "6h": timedelta(hours=6),
@@ -367,6 +372,8 @@ class WebApp:
             )
         if request.path == "/healthz":
             return self.healthz()
+        if request.path == "/api/status":
+            return self.api_status()
         handler = self.routes.get(request.path)
         if handler is None:
             return self.error_page("404 Not Found", "No such page.", request)
@@ -404,6 +411,111 @@ class WebApp:
         return Response(
             json.dumps(payload).encode(),
             status=status,
+            content_type="application/json",
+            headers=[("Cache-Control", "no-store")],
+        )
+
+    def api_status(self) -> Response:
+        """Everything the status check needs, as JSON, without sudo.
+
+        `status` is "ok", or "attention" with the reasons in `checks`. A source
+        that is skipped (robots.txt) is listed but does not need attention.
+        """
+        now = utcnow()
+        checks: list[str] = []
+        try:
+            with self.connection() as conn:
+                info = self.totals(conn)
+                version = schema_version(conn)
+                runs = recent_runs(conn, limit=8)
+                config = self.config
+                sources: dict[str, Any] | None = None
+                problems: list[dict[str, Any]] = []
+                if config is not None:
+                    names = [source.name for source in config.sources]
+                    statuses = {status.name: status for status in source_status(conn, names)}
+                    states: Counter[str] = Counter()
+                    for source in config.sources:
+                        status = statuses[source.name]
+                        state, _ = source_state(source.enabled, status, now)
+                        states[state] += 1
+                        if state in {"ok", "disabled"}:
+                            continue
+                        problems.append(
+                            {
+                                "name": source.name,
+                                "state": state,
+                                "error": status.last_error,
+                                "last_success": _iso_or_none(status.last_success),
+                                "newest_item": _iso_or_none(status.newest_item),
+                            }
+                        )
+                    sources = {
+                        "configured": len(config.sources),
+                        "enabled": sum(1 for source in config.sources if source.enabled),
+                        "states": dict(sorted(states.items())),
+                    }
+                    attention = [p["name"] for p in problems if p["state"] != "skipped"]
+                    if attention:
+                        checks.append(f"{len(attention)} source(s) need attention")
+                else:
+                    checks.append(f"sources file not loaded: {self._config_error}")
+        except HttpError as exc:
+            return Response(
+                json.dumps({"status": "error", "error": exc.message}).encode(),
+                status=exc.status,
+                content_type="application/json",
+                headers=[("Cache-Control", "no-store")],
+            )
+        if not runs:
+            checks.append("no fetch runs logged")
+        else:
+            if now - runs[0].finished_at > RUN_LATE_AFTER:
+                checks.append(f"last run finished {runs[0].finished_at:%Y-%m-%d %H:%M}Z")
+            if runs[0].failed:
+                checks.append(f"last run: {runs[0].failed} source(s) failed")
+        backups = list_backups(default_dir(self.db_path), self.db_path.stem)
+        if not backups:
+            checks.append("no backups")
+        elif now - backups[0].taken_at > BACKUP_LATE_AFTER:
+            checks.append(f"latest backup is from {backups[0].taken_at:%Y-%m-%d}")
+        payload: dict[str, Any] = {
+            "status": "attention" if checks else "ok",
+            "checks": checks,
+            "checked_at": now.isoformat(timespec="seconds"),
+            "schema": version,
+            "database": {
+                "bytes": self.db_path.stat().st_size,
+                "articles": info.articles,
+                "title_changes": info.rewrites,
+                "live_blogs": info.live,
+            },
+            "last_fetch": _iso_or_none(info.last_fetch),
+            "runs": [
+                {
+                    "started_at": run.started_at.isoformat(),
+                    "seconds": int((run.finished_at - run.started_at).total_seconds()),
+                    "ok": run.ok,
+                    "skipped": run.skipped,
+                    "failed": run.failed,
+                    "found": run.found,
+                    "new": run.new,
+                    "retitled": run.changed,
+                    "failed_sources": list(run.failed_sources),
+                }
+                for run in runs
+            ],
+            "sources": sources,
+            "problems": problems,
+            "backups": {
+                "count": len(backups),
+                "latest": backups[0].path.name if backups else None,
+                "latest_at": backups[0].taken_at.isoformat() if backups else None,
+                "latest_bytes": backups[0].size if backups else None,
+            },
+        }
+        return Response(
+            json.dumps(payload, indent=2).encode(),
             content_type="application/json",
             headers=[("Cache-Control", "no-store")],
         )
@@ -1476,6 +1588,10 @@ def source_state(enabled: bool, status: SourceStatus, now: datetime) -> tuple[st
     if status.newest_item is not None and now - status.newest_item > CONTENT_STALE_AFTER:
         return "content stale", "warn"
     return "ok", "good"
+
+
+def _iso_or_none(value: datetime | None) -> str | None:
+    return value.isoformat() if value else None
 
 
 def bar(share: float) -> Markup:
