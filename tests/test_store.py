@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 from headliner import store
-from headliner.models import Headline, utcnow
+from headliner.models import Headline, compute_hash, utcnow
 from headliner.store import (
     SCHEMA_VERSION,
     connect,
@@ -22,6 +22,7 @@ from headliner.store import (
     migrate,
     record_fetch,
     search_headlines,
+    search_history,
     source_status,
     store_headlines,
     upgrade_plan,
@@ -50,6 +51,7 @@ def without_fts5(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         store, "_FTS_SCHEMA", "CREATE VIRTUAL TABLE headlines_fts USING no_such_module(title);"
     )
+    monkeypatch.setattr(store, "_REVISIONS_FTS_SCHEMA", "")
 
 
 @pytest.fixture
@@ -568,5 +570,204 @@ def test_upgrade_from_v1_flags_live_blogs(tmp_path: Path) -> None:
     assert upgraded.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     flags = dict(upgraded.execute("SELECT url, is_live FROM headlines").fetchall())
     assert flags == {STORY_URL: 1, LIVE_URL: 1, "https://example.org/o": 0}
+    upgraded.close()
+    assert not list(tmp_path.glob("*.bak"))
+
+
+# --------------------------------------------------------------------------
+# search across earlier versions
+# --------------------------------------------------------------------------
+
+
+def seed_history(conn: sqlite3.Connection) -> None:
+    store_headlines(
+        conn,
+        [
+            Headline.create(
+                source="Example Wire",
+                title="Quarantine centre to become a prison",
+                url=STORY_URL,
+                fetched_at=T0,
+                summary="Architects asked to assess the Bullsbrook facility.",
+            )
+        ],
+    )
+    store_headlines(
+        conn,
+        [
+            Headline.create(
+                source="Example Wire",
+                title="Is this white elephant about to become WA's newest prison?",
+                url=STORY_URL,
+                fetched_at=T0 + timedelta(hours=6),
+                summary="The state government is weighing its options.",
+            )
+        ],
+    )
+    store_headlines(conn, [seen("Prison staffing shortfall revealed", T0, url="https://e.org/p")])
+
+
+@pytest.mark.parametrize("fts", [True, False])
+def test_search_history_finds_earlier_titles_and_summaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fts: bool
+) -> None:
+    if not fts:
+        without_fts5(monkeypatch)
+    conn = connect(tmp_path / "history.db")
+    assert has_fts(conn) is fts
+    seed_history(conn)
+
+    # The current-only search cannot see the first wording.
+    assert search_headlines(conn, "quarantine") == []
+
+    [hit] = search_history(conn, "quarantine")
+    assert hit.headline.title == "Is this white elephant about to become WA's newest prison?"
+    assert hit.matched_title == "Quarantine centre to become a prison"
+
+    # Only an earlier version's summary mentions Bullsbrook.
+    [by_summary] = search_history(conn, "Bullsbrook")
+    assert by_summary.matched_title == "Quarantine centre to become a prison"
+
+    # A word in the current title matches the current version: no "earlier" title.
+    [current] = search_history(conn, "elephant")
+    assert current.matched_title is None
+
+    # One hit per article, even when several versions match.
+    hits = search_history(conn, "prison")
+    assert sorted(h.headline.url for h in hits) == ["https://e.org/p", STORY_URL]
+    assert all(h.matched_title is None for h in hits)
+    conn.close()
+
+
+def test_search_history_handles_empty_and_odd_queries(conn: sqlite3.Connection) -> None:
+    seed_history(conn)
+    assert search_history(conn, "   ") == []
+    assert search_history(conn, '"quarantine') != []
+
+
+# --------------------------------------------------------------------------
+# upgrade to schema 3: URL re-normalisation and history index
+# --------------------------------------------------------------------------
+
+BBC = "https://www.bbc.co.uk/news/articles/c5kg0gwwpyx8o"
+
+
+def assert_history_index_ok(conn: sqlite3.Connection) -> None:
+    """FTS5 raises on this command if the index disagrees with its content table."""
+    conn.execute(
+        "INSERT INTO headline_revisions_fts(headline_revisions_fts) VALUES ('integrity-check')"
+    )
+
+
+def make_v2_db(path: Path, rows: list[tuple[str, str, datetime, int]]) -> None:
+    """A schema-2 database whose URLs still carry `at_*` parameters.
+
+    `rows` are (stored url, title, fetched_at, is_live), one article each, with
+    one revision per row as schema 2 kept them. The history index is dropped
+    so the upgrade has to rebuild it.
+    """
+    conn = connect(path)
+    for url, title, fetched, live in rows:
+        legacy_hash = f"v2:{url}:{title}"
+        cursor = conn.execute(
+            "INSERT INTO headlines (source, title, url, fetched_at, content_hash, is_live)"
+            " VALUES ('BBC News', ?, ?, ?, ?, ?)",
+            (title, url, fetched.isoformat(), legacy_hash, live),
+        )
+        conn.execute(
+            "INSERT INTO headline_revisions (headline_id, title, content_hash, seen_at)"
+            " VALUES (?, ?, ?, ?)",
+            (cursor.lastrowid, title, legacy_hash, fetched.isoformat()),
+        )
+    conn.executescript(
+        """
+        DROP TRIGGER headline_revisions_fts_insert;
+        DROP TRIGGER headline_revisions_fts_delete;
+        DROP TRIGGER headline_revisions_fts_update;
+        DROP TABLE headline_revisions_fts;
+        PRAGMA user_version = 2;
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_upgrade_to_v3_rewrites_urls_and_rehashes(tmp_path: Path) -> None:
+    path = tmp_path / "v2.db"
+    make_v2_db(
+        path, [(f"{BBC}?at_campaign=rss&at_medium=RSS", "Stripe to hire 200 in Dublin", T0, 0)]
+    )
+
+    with closing(connect(path, migrate_schema=False)) as before:
+        plan = upgrade_plan(before)
+    assert (plan.from_version, plan.urls_normalised, plan.rows_folded) == (2, 1, 0)
+
+    upgraded = connect(path)
+    assert upgraded.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    row = upgraded.execute("SELECT url, title, content_hash FROM headlines").fetchone()
+    assert row["url"] == BBC
+    [revision_hash] = upgraded.execute("SELECT content_hash FROM headline_revisions").fetchone()
+    assert row["content_hash"] == revision_hash
+    # The next fetch of the same story must not look like a rewrite.
+    again = Headline.create(
+        source="BBC News",
+        title="Stripe to hire 200 in Dublin",
+        url=f"{BBC}?at_campaign=rss&at_medium=RSS",
+        fetched_at=T0 + timedelta(hours=6),
+    )
+    assert store_headlines(upgraded, [again]) == store.InsertResult(new=0, retitled=0)
+    # The history index was rebuilt.
+    assert [h.headline.url for h in search_history(upgraded, "Stripe")] == [BBC]
+    assert_history_index_ok(upgraded)
+    upgraded.close()
+    assert (tmp_path / "v2.db.pre-v3.bak").exists()
+
+
+@pytest.mark.parametrize("clean_first", [True, False])
+def test_upgrade_to_v3_folds_rows_that_were_one_article(tmp_path: Path, clean_first: bool) -> None:
+    path = tmp_path / "v2.db"
+    first_url = BBC if clean_first else f"{BBC}?at_campaign=rss"
+    make_v2_db(
+        path,
+        [
+            (first_url, "Stripe to create 200 new jobs in Dublin", T0, 0),
+            (
+                f"{BBC}?at_campaign=newsletter",
+                "Stripe announces 200 Dublin jobs",
+                T0 + timedelta(hours=6),
+                1,
+            ),
+        ],
+    )
+    with closing(connect(path, migrate_schema=False)) as before:
+        assert upgrade_plan(before).rows_folded == 1
+
+    upgraded = connect(path)
+    [row] = upgraded.execute("SELECT id, url, title, fetched_at, is_live FROM headlines").fetchall()
+    assert (row["id"], row["url"]) == (1, BBC)
+    assert row["title"] == "Stripe announces 200 Dublin jobs"
+    assert row["fetched_at"] == T0.isoformat()
+    assert row["is_live"] == 1
+    revisions = upgraded.execute(
+        "SELECT title, content_hash FROM headline_revisions ORDER BY seen_at"
+    ).fetchall()
+    assert [r["title"] for r in revisions] == [
+        "Stripe to create 200 new jobs in Dublin",
+        "Stripe announces 200 Dublin jobs",
+    ]
+    assert [r["content_hash"] for r in revisions] == [
+        compute_hash(BBC, r["title"]) for r in revisions
+    ]
+    [change] = list_title_changes(upgraded)
+    assert change.old_title == "Stripe to create 200 new jobs in Dublin"
+    assert_history_index_ok(upgraded)
+    upgraded.close()
+
+
+def test_upgrade_to_v3_without_url_changes_takes_no_backup(tmp_path: Path) -> None:
+    path = tmp_path / "v2.db"
+    make_v2_db(path, [(BBC, "Stripe to hire 200 in Dublin", T0, 0)])
+    upgraded = connect(path)
+    assert [h.headline.url for h in search_history(upgraded, "Stripe")] == [BBC]
     upgraded.close()
     assert not list(tmp_path.glob("*.bak"))

@@ -99,6 +99,9 @@ headliner list --source "BBC News" --format csv
 # Full-text search over stored titles and summaries
 headliner search "interest rates"
 
+# ...including every earlier version of each headline and summary
+headliner search "quarantine centre" --history
+
 # Which sources are configured and when each last worked
 headliner sources
 
@@ -153,7 +156,14 @@ always use UTC ISO-8601 timestamps (`…+00:00`), whatever the display settings.
 | `--format table\|json\|csv` | Output format (default `table`) |
 
 **`search`** takes `--limit` and `--format`, and needs no config file — it only
-reads the database.
+reads the database. By default it matches each article's **current** title and
+summary. `--history` searches every earlier title and summary too and returns
+one result per article, showing its current headline:
+
+- If the current version matches, the result looks the same as a normal search.
+- If only an earlier version matched, the table adds a `MATCHED EARLIER TITLE`
+  column, and JSON and CSV add `matched_title`. It is `null`/empty when the
+  current version matched.
 
 **`sources`** takes `--format table|json`.
 
@@ -338,7 +348,7 @@ migration and is safe to re-run.
 
 There is one row per article, keyed on the normalised `url` (`UNIQUE`). URL
 normalisation lowercases the scheme and host, drops the fragment, strips tracking
-parameters (`utm_*`, `fbclid`, `gclid` and friends) and sorts the rest, so the
+parameters (`utm_*`, `at_*`, `fbclid`, `gclid` and friends) and sorts the rest, so the
 same article arriving through two different links stores once. `title`,
 `summary` and `content_hash` always hold the most recently seen version;
 `fetched_at` is when the article was first seen. `is_live` is `1` once any
@@ -361,9 +371,10 @@ so feeds that alternate between two titles do not grow the history every run.
 `items_changed` (rewrites seen) and `error`. This is what `headliner sources`
 reads.
 
-Search uses an FTS5 index over titles and summaries, kept current by triggers.
-On a SQLite build without FTS5 the index is not created and search falls back to
-`LIKE`.
+Search uses FTS5 indexes kept current by triggers: `headlines_fts` over current
+titles and summaries, and `headline_revisions_fts` over every version for
+`search --history`. On a SQLite build without FTS5 the indexes are not created
+and search falls back to `LIKE`.
 
 Querying it directly is fine:
 
@@ -371,7 +382,6 @@ Querying it directly is fine:
 sqlite3 headlines.db "SELECT source, COUNT(*) FROM headlines GROUP BY 1 ORDER BY 2 DESC;"
 ```
 
-Search matches an article's current title and summary only, not earlier titles.
 
 ### Schema upgrades
 
@@ -391,6 +401,17 @@ Version 2 adds `headlines.is_live` and flags existing live blogs, checking each
 article's URL and every title in its history against the built-in rules. It only
 adds a column, so no backup is taken. A source's own `live_url_pattern` takes
 effect for its articles the next time they are fetched.
+
+Version 3 re-normalises every stored URL. Normalisation now also strips `at_*`
+tracking parameters, which the BBC adds to every feed link
+(`?at_campaign=rss&at_medium=RSS`). Without this, a change to those values would
+make every BBC article look new. The upgrade:
+
+1. copies the database to `<db>.pre-v3.bak` (only if a URL changes),
+2. rewrites changed URLs; where two rows turn out to be one article, keeps the
+   oldest, moves the other's title history onto it and keeps the latest title,
+3. recomputes content hashes, which include the URL, for every row and revision,
+4. builds the search index over title history.
 
 To see what an upgrade will do first:
 
