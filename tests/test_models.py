@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
@@ -10,6 +11,7 @@ from headliner.models import (
     InvalidHeadlineError,
     clean_text,
     compute_hash,
+    looks_live,
     normalise_url,
     to_utc,
 )
@@ -120,3 +122,63 @@ def test_as_dict_is_json_ready() -> None:
     payload = headline.as_dict()
     assert payload["published_at"] == "2025-03-04T09:00:00+00:00"
     assert payload["summary"] is None
+
+
+# Real examples from the shipped sources.
+@pytest.mark.parametrize(
+    ("url", "title"),
+    [
+        (
+            "https://www.theguardian.com/australia-news/live/2026/oct/02/labor-albanese",
+            "Australia news live: Israeli embassy condemns flydubai claims",
+        ),
+        (
+            "https://www.theguardian.com/world/live/2026/oct/02/france-schools-protests",
+            "400 French schools closed on Friday as protests escalate",
+        ),
+        (
+            "https://www.aljazeera.com/news/liveblog/2026/10/2/iran-war-live-us-moves",
+            "Iran war live: US moves 2,000 Marines to Middle East",
+        ),
+        (
+            "https://www.france24.com/en/europe/20261002-live-russia-hits-kyiv",
+            "Live: Russia hits Kyiv's Southern Bridge again",
+        ),
+        ("https://www.bbc.co.uk/news/live/c1234567", "Storm Amy: Latest as wind warnings issued"),
+        ("https://example.org/story", "Election live updates: polls close in the west"),
+    ],
+)
+def test_looks_live_recognises_live_blogs(url: str, title: str) -> None:
+    assert looks_live(url, title)
+
+
+@pytest.mark.parametrize(
+    ("url", "title"),
+    [
+        (
+            "https://www.abc.net.au/news/2026-10-02/how-to-protect-your-garden-and-live-in-harmony",
+            "How to protect your garden and live in harmony with possums",
+        ),
+        ("https://example.org/delivery/2026/oct/02/story", "Courier firm to deliver on Sundays"),
+        ("https://example.org/story", "Band to play live at the festival tonight"),
+        ("https://example.org/lives/2026/obituary", "A life lived for music"),
+    ],
+)
+def test_looks_live_ignores_ordinary_stories(url: str, title: str) -> None:
+    assert not looks_live(url, title)
+
+
+def test_looks_live_uses_a_source_pattern() -> None:
+    pattern = re.compile(r"/as-it-happened/", re.IGNORECASE)
+    url = "https://example.org/as-it-happened/budget-night"
+    assert not looks_live(url, "Budget night: every announcement")
+    assert looks_live(url, "Budget night: every announcement", pattern)
+
+
+def test_headline_create_sets_is_live() -> None:
+    live = Headline.create(
+        source="X", title="Iran war live: latest updates", url="https://example.org/a"
+    )
+    plain = Headline.create(source="X", title="An ordinary headline here", url="https://e.org/b")
+    assert live.is_live and live.as_dict()["is_live"] is True
+    assert not plain.is_live

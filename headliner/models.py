@@ -93,6 +93,26 @@ def normalise_url(url: str, *, drop_query: bool = False) -> str:
     return urlunsplit((scheme, netloc, path, query, ""))
 
 
+# Live blogs re-headline on every update. Only a whole `live`/`liveblog` path
+# segment or a "… live:" style title counts, so a story about how to "live in
+# harmony" is not a live blog.
+_LIVE_PATH_RE = re.compile(r"/(?:live|liveblog)(?:/|$)", re.IGNORECASE)
+_LIVE_TITLE_RE = re.compile(r"(?:^|\s)live(?:\s+(?:updates|blog))?\s*[:|–—]", re.IGNORECASE)  # noqa: RUF001
+
+
+def looks_live(url: str, title: str, extra_url_pattern: re.Pattern[str] | None = None) -> bool:
+    """True when the URL or title marks a live blog.
+
+    `extra_url_pattern` is a source's own `live_url_pattern`, searched in the
+    full URL in addition to the built-in rules.
+    """
+    return bool(
+        _LIVE_PATH_RE.search(urlsplit(url).path)
+        or _LIVE_TITLE_RE.search(title)
+        or (extra_url_pattern is not None and extra_url_pattern.search(url))
+    )
+
+
 def compute_hash(url: str, title: str) -> str:
     """sha256 over the normalised url and title — the dedup key."""
     payload = f"{normalise_url(url)}\n{clean_text(title).casefold()}"
@@ -128,6 +148,7 @@ class Headline:
     fetched_at: datetime
     summary: str | None
     content_hash: str
+    is_live: bool = False
 
     @classmethod
     def create(
@@ -139,11 +160,13 @@ class Headline:
         published_at: datetime | None = None,
         fetched_at: datetime | None = None,
         summary: str | None = None,
+        live_url_pattern: re.Pattern[str] | None = None,
     ) -> Headline:
         """Normalise raw parser output into a `Headline`.
 
         Raises `InvalidHeadlineError` when the row lacks a usable URL or when
         the title is empty or shorter than `MIN_TITLE_LENGTH` characters.
+        `is_live` comes from `looks_live`, with the source's own pattern if any.
         """
         clean_url = (url or "").strip()
         if not clean_url:
@@ -161,14 +184,16 @@ class Headline:
             )
 
         clean_summary = clean_text(summary) or None
+        canonical_url = normalise_url(clean_url)
         return cls(
             source=source,
             title=clean_title,
-            url=normalise_url(clean_url),
+            url=canonical_url,
             published_at=to_utc(published_at),
             fetched_at=to_utc(fetched_at) or utcnow(),
             summary=clean_summary,
             content_hash=compute_hash(clean_url, clean_title),
+            is_live=looks_live(canonical_url, clean_title, live_url_pattern),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -181,4 +206,5 @@ class Headline:
             "fetched_at": self.fetched_at.isoformat(),
             "summary": self.summary,
             "content_hash": self.content_hash,
+            "is_live": self.is_live,
         }

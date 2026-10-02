@@ -46,6 +46,7 @@ class SourceResult:
     items_found: int = 0
     items_new: int = 0
     items_changed: int = 0
+    items_changed_live: int = 0
     error: str | None = None
     headlines: list[Headline] = field(default_factory=list)
 
