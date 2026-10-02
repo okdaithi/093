@@ -932,3 +932,62 @@ def test_minor_rewrites_are_counted_and_filtered(conn: sqlite3.Connection) -> No
     assert count_title_changes(conn, minor=False) == 1
     assert store.hidden_changes(conn, live="exclude", minor=False) == (0, 1)
     assert store.totals(conn).rewrites == 1
+
+
+def test_trend_queries(conn: sqlite3.Connection) -> None:
+    now = utcnow()
+    early = now - timedelta(hours=10)
+
+    def at(when: datetime, title: str, url: str, source: str = "Example Wire") -> Headline:
+        return Headline.create(source=source, title=title, url=url, fetched_at=when)
+
+    store_headlines(conn, [at(early, "Council approves harbour plan", "https://example.org/a")])
+    store_headlines(
+        conn,
+        [
+            at(
+                early + timedelta(hours=1),
+                "Council approves 'harbour' plan",
+                "https://example.org/a",
+            )
+        ],
+    )  # minor: ignored
+    store_headlines(
+        conn,
+        [at(early + timedelta(hours=6), "Council rejects harbour plan", "https://example.org/a")],
+    )
+    store_headlines(
+        conn,
+        [
+            at(early, "Ferry timetable unchanged this week", "https://example.org/b"),
+            at(now, "Live: storm updates", "https://example.org/live/s"),
+            at(now, "Other outlet story about trains", "https://o.example/c", source="Other Daily"),
+        ],
+    )
+
+    rows = store.first_seen(conn, since=now - timedelta(days=1))
+    assert [(row.source, row.is_live) for row in rows].count(("Example Wire", True)) == 1
+    assert len(rows) == 4
+
+    stats = {stat.source: stat for stat in store.rewrite_stats(conn, since=now - timedelta(days=1))}
+    wire = stats["Example Wire"]
+    assert (wire.articles, wire.rewritten) == (2, 1)  # the live blog is excluded
+    assert wire.median_delay == timedelta(hours=6)
+    assert wire.share == 0.5
+    assert stats["Other Daily"].median_delay is None
+
+    for found, new, status in ((10, 10, "ok"), (10, 10, "ok"), (10, 4, "ok"), (0, 0, "error")):
+        record_fetch(
+            conn,
+            source="Example Wire",
+            started_at=now,
+            finished_at=now,
+            status=status,
+            items_found=found,
+            items_new=new,
+        )
+    [turnover] = store.feed_turnover(conn, since=now - timedelta(days=1))
+    # The first-ever run (all new) is left out.
+    assert (turnover.ok, turnover.failed, turnover.found, turnover.new) == (2, 1, 20, 14)
+    assert turnover.all_new == 1
+    assert turnover.share_new == 0.7

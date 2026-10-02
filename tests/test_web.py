@@ -413,3 +413,17 @@ def test_story_page_and_latest_badge(db_path: Path, config_path: Path) -> None:
     status, _, body = get("/story?url=https%3A%2F%2Fexample.org%2Fxss")
     assert status == "200 OK" and "Only one outlet has reported this so far." in body
     assert get("/story?url=https%3A%2F%2Fnope.example%2F")[0] == "404 Not Found"
+
+
+def test_trends_page(get: Call) -> None:
+    status, _, body = get("/trends")
+    assert status == "200 OK"
+    assert "Articles per day" in body and 'class="heat h' in body
+    assert "Rewrites by outlet" in body and "Feed turnover" in body
+    assert re.search(
+        r'<td class="num">2</td>\s*<td class="num">1</td>', body
+    )  # 2 articles, 1 rewritten
+    _, _, body = get("/trends?tag=IE&since=30d")
+    assert '<option value="30d" selected>' in body
+    assert ">Example Wire</a></th>" not in body
+    assert get("/trends?since=junk")[0] == "200 OK"
