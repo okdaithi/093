@@ -1,0 +1,44 @@
+# Second pass for 2026-10-03-global.txt: publisher feed URLs on hosts the homepages don't
+# advertise. Each is fetched and checked like any other candidate (robots.txt respected).
+
+IE galway
+https://www.rte.ie/feeds/rss/?index=/news/galway/
+https://www.galwaybayfm.ie/galway-bay-fm-news-desk/feed/
+https://www.advertiser.ie/galway/rss.xml
+
+US
+http://rss.cnn.com/rss/cnn_us.rss
+https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml
+https://feeds.a.dj.com/rss/RSSWorldNews.xml
+http://rssfeeds.usatoday.com/usatoday-NewsTopStories
+https://rss.politico.com/politics-news.xml
+https://api.axios.com/feed/
+https://thespectator.com/feed/
+
+UK
+https://www.dailymail.co.uk/news/index.rss
+https://www.spectator.co.uk/feed/
+https://www.lbc.co.uk/rss/
+
+cn
+http://www.xinhuanet.com/english/rss/worldrss.xml
+http://www.chinadaily.com.cn/rss/world_rss.xml
+https://www.globaltimes.cn/rss/outbrain.xml
+https://www.taiwannews.com.tw/rss/en          TW
+https://www.cgtn.com/subscribe/rss/section/world.xml
+https://www.caixinglobal.com/rss.xml
+
+asia
+https://timesofindia.indiatimes.com/rssfeedstopstories.cms              IN
+https://economictimes.indiatimes.com/rssfeedstopstories.cms             IN business
+https://www.channelnewsasia.com/rssfeeds/8395986                        SG
+https://e.vnexpress.net/rss/news.rss                                    VN
+https://en.yna.co.kr/RSS/news.xml                                       KR
+https://asia.nikkei.com/rss/feed/nar                                    JP business
+https://www.thestandard.com.hk/newsfeed/latest/news.xml                 HK
+https://www.thejakartapost.com/rss                                      ID
+
+markets
+https://feeds.a.dj.com/rss/RSSMarketsMain.xml
+https://cms.zerohedge.com/fullrss2.xml
+https://www.kitco.com/rss/news.xml                                      commodities

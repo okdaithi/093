@@ -1,0 +1,89 @@
+# Source request, 2026-10-03. Run: headliner discover --batch <this file> --report report.md
+# Header lines are tags for the URLs below. Two-letter tags are countries; a country after a
+# URL replaces the group's. lang-zh marks Chinese-language sites (see README: search limits).
+
+IE galway
+https://www.galwaybeo.ie/
+https://www.galwaydaily.com/news/
+https://www.rte.ie/news/galway/
+https://www.galwaybayfm.ie/galway-bay-fm-news-desk/
+https://www.advertiser.ie/galway
+
+US
+https://thespectator.com/
+https://www.msnbc.com/
+https://www.foxnews.com/
+https://edition.cnn.com/us
+https://www.nytimes.com/
+https://www.wsj.com/
+https://www.usatoday.com/
+https://nypost.com/
+https://www.politico.com/
+https://thehill.com/
+https://www.axios.com/
+https://www.breitbart.com/
+
+UK
+https://www.telegraph.co.uk/
+https://www.independent.co.uk/
+https://www.spectator.co.uk/
+https://www.gbnews.com/
+https://www.lbc.co.uk/
+https://www.standard.co.uk/
+https://inews.co.uk/
+https://www.express.co.uk/
+https://www.thesun.co.uk/
+https://www.dailymail.co.uk/home/index.html
+https://www.thetimes.com/
+https://www.mirror.co.uk/
+
+cn
+https://www.scmp.com/              HK
+https://english.news.cn/home.htm
+http://www.chinadaily.com.cn/
+https://www.globaltimes.cn/index.html
+https://www.taiwannews.com.tw/en/  TW
+https://www.caixinglobal.com/
+https://www.cgtn.com/
+https://www.chinadaily.com.cn/
+
+cn-intel CN
+http://www.cicir.ac.cn/NEW/index.html        think-tank lang-zh
+http://www.qstheory.cn/                      party lang-zh
+https://www.stats.gov.cn/                    government lang-zh
+https://www.gov.cn/                          government lang-zh
+https://www.guancha.cn/                      commentary lang-zh
+http://www.ce.cn/                            economy lang-zh
+https://www.ciis.org.cn/english/             think-tank
+http://www.cicir.ac.cn/NEW/en-us/index.html  think-tank
+https://m.ccps.com.cn/                       party lang-zh
+http://eng.chinamil.com.cn/                  military
+
+asia
+https://timesofindia.indiatimes.com/india    IN
+https://www.thestandard.com.hk/              HK
+https://japantoday.com/                      JP
+https://www.straitstimes.com/global          SG
+https://www.channelnewsasia.com/international SG
+https://www.thejakartapost.com/              ID
+https://e.vnexpress.net/                     VN
+https://www.japantimes.co.jp/                JP
+https://www.koreaherald.com/                 KR
+https://en.yna.co.kr/                        KR
+https://economictimes.indiatimes.com/        IN business
+https://timesofindia.indiatimes.com/         IN
+https://asia.nikkei.com/                     JP business
+
+markets
+https://www.bloomberg.com/markets
+https://www.reuters.com/business/finance/
+https://www.wsj.com/finance
+https://www.investing.com/news/latest-news
+https://www.hedgeweek.com/
+https://www.pionline.com/
+https://www.project-syndicate.org/           commentary
+https://thedailyshot.com/
+https://oilprice.com/                        energy
+https://www.kitco.com/                       commodities
+https://www.coindesk.com/                    crypto
+https://www.zerohedge.com/

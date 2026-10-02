@@ -27,7 +27,15 @@ from headliner.config import (
     load_config,
     parse_tags,
 )
-from headliner.discover import discover, render_yaml
+from headliner.discover import (
+    BatchEntry,
+    BatchError,
+    discover,
+    mark_duplicate_feeds,
+    parse_batch,
+    render_report,
+    render_yaml,
+)
 from headliner.fetcher import SourceResult, fetch_all
 from headliner.models import Headline, utcnow
 from headliner.store import (
@@ -524,7 +532,20 @@ def _tag_sources(args: argparse.Namespace, config: Config | None = None) -> list
 def cmd_discover(args: argparse.Namespace) -> int:
     """Find feeds for site URLs and print source entries ready to paste."""
     tags = list(parse_tags(args.tag, "--tag"))
-    for site in args.sites:
+    batch: list[BatchEntry] = []
+    if args.batch is not None:
+        try:
+            batch = parse_batch(args.batch.read_text(encoding="utf-8"))
+            for entry in batch:
+                parse_tags(list(entry.tags), f"{args.batch}: {entry.url}")
+        except (OSError, BatchError, ConfigError) as exc:
+            logger.error("%s", exc)
+            return EXIT_FATAL
+    sites = [entry.url for entry in batch] + list(args.sites)
+    if not sites:
+        logger.error("give site URLs, or --batch FILE")
+        return EXIT_FATAL
+    for site in sites:
         if urlsplit(site).scheme not in {"http", "https"} or not urlsplit(site).hostname:
             logger.error("not an http(s) URL: %r", site)
             return EXIT_FATAL
@@ -537,8 +558,14 @@ def cmd_discover(args: argparse.Namespace) -> int:
     if "you@example.com" in settings.user_agent:
         logger.warning("user_agent still has the placeholder contact; set a real one in settings")
 
-    results = asyncio.run(discover(args.sites, settings, config=config))
+    results = asyncio.run(discover(sites, settings, config=config))
+    for result, entry in zip(results, batch, strict=False):
+        result.tags, result.group = entry.tags, entry.group
+    mark_duplicate_feeds(results, config)
     sys.stdout.write(render_yaml(results, tags, generated=datetime.now().astimezone()))
+    if args.report is not None:
+        args.report.write_text(render_report(results), encoding="utf-8")
+        logger.info("triage report written to %s", args.report)
     found = sum(1 for result in results if result.status == "ok")
     known = sum(1 for result in results if result.status == "configured")
     failed = sum(1 for result in results if result.status == "failed")
@@ -790,7 +817,20 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[common],
         help="find RSS/Atom feeds for site URLs and print source entries to paste",
     )
-    discover_cmd.add_argument("sites", nargs="+", metavar="URL", help="site homepages")
+    discover_cmd.add_argument("sites", nargs="*", metavar="URL", help="site homepages")
+    discover_cmd.add_argument(
+        "--batch",
+        type=Path,
+        metavar="FILE",
+        help="read sites from FILE: group header lines give tags to the URLs below them "
+        "(see README)",
+    )
+    discover_cmd.add_argument(
+        "--report",
+        type=Path,
+        metavar="FILE",
+        help="also write a Markdown triage table (one row per site) to FILE",
+    )
     discover_cmd.add_argument(
         "--tag",
         action="append",
