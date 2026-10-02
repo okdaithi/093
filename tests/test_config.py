@@ -181,6 +181,19 @@ def test_tags_parse_as_a_list_or_single_string() -> None:
     assert config.all_tags == ["AU", "business", "IE"]
 
 
+def test_group_sets_the_publisher() -> None:
+    config = parse_config(
+        "sources:\n"
+        "  - {name: A, url: 'https://a.example/rss', type: rss, group: nine}\n"
+        "  - {name: B, url: 'https://b.example/rss', type: rss}\n"
+    )
+    assert [s.publisher for s in config.sources] == ["nine", "B"]
+    with pytest.raises(ConfigError, match="group"):
+        parse_config(
+            "sources:\n  - {name: A, url: 'https://a.example/rss', type: rss, group: ''}\n"
+        )
+
+
 def test_duplicate_tags_on_one_source_collapse() -> None:
     config = parse_config(
         "sources:\n  - {name: A, url: 'https://a.example/f', type: rss, tags: [AU, au, AU]}\n"

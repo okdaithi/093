@@ -63,7 +63,7 @@ from headliner.store import (
     source_status,
     totals,
 )
-from headliner.stories import MAX_STORY_HEADLINES, Story, by_url, cluster, words
+from headliner.stories import MAX_STORY_HEADLINES, Story, by_url, cluster, spans, words
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +114,11 @@ RISING_TOP: Final = 15
 RISING_MIN_COUNT: Final = 3
 RISING_MIN_SOURCES: Final = 2
 BIG_STORIES: Final = 10
+# Source profile: days covered, stories it broke, distinctive words listed.
+PROFILE_DAYS: Final = 14
+PROFILE_STORIES: Final = 5
+PROFILE_WORDS: Final = 20
+PROFILE_MIN_WORD: Final = 3
 
 SECURITY_HEADERS: Final = [
     (
@@ -356,10 +361,12 @@ class WebApp:
             "/article": self.page_article,
             "/stories": self.page_stories,
             "/story": self.page_story,
+            "/source": self.page_source,
             "/trends": self.page_trends,
         }
         self._story_cache: dict[tuple[object, ...], list[Story]] = {}
         self._story_lock = threading.Lock()
+        self._publishers: tuple[Config | None, dict[str, str]] = (None, {})
         self._totals: tuple[tuple[object, ...], Totals] | None = None
 
     # -- WSGI plumbing
@@ -944,13 +951,13 @@ or <a href="{switch}">show times in {other}</a>.</footer>
         parts = []
         if headline.is_live:
             parts.append(Markup('<span class="badge live">LIVE</span>'))
-        if story is not None and len(story.sources) > 1:
+        if story is not None and self.reach(story) > 1:
             parts.append(
                 render(
-                    '<a class="badge outlets" href="{h}" title="Other outlets reporting this">'
-                    "{n} outlets</a>",
+                    '<a class="badge outlets" href="{h}" title="{t}">{n} outlets</a>',
                     h=self.link(request, "/story", url=headline.url),
-                    n=len(story.sources),
+                    n=self.reach(story),
+                    t=self.reach_note(story),
                 )
             )
         if titles > 1:
@@ -1243,14 +1250,17 @@ or <a href="{switch}">show times in {other}</a>.</footer>
             rows.append(
                 render(
                     """<tr>
-  <td><a href="{list}">{name}</a> <span class="muted small">{type}</span></td>
+  <td><a href="{profile}">{name}</a> <span class="muted small">{type}</span>{group}</td>
   <td>{tags}</td>
   <td class="num">{items}</td>
   <td>{success} <span class="muted small">{ago}</span></td>
   <td><span class="state {css}" title="{error}">{state}</span>{detail}</td>
   <td>{feed}</td>
 </tr>""",
-                    list=self.link(request, "/latest", source=source.name, tag=None),
+                    profile=self.link(request, "/source", name=source.name, tag=None),
+                    group=render(' <span class="chip small">{g}</span>', g=source.group)
+                    if source.group
+                    else EMPTY,
                     name=source.name,
                     type=source.type,
                     tags=join(
@@ -1401,6 +1411,29 @@ or <a href="{switch}">show times in {other}</a>.</footer>
             self._story_cache[key] = result
         return result
 
+    def publishers(self) -> dict[str, str]:
+        """Source name (casefolded) -> publisher: its `group:`, or itself."""
+        config = self.config
+        if config is None:
+            return {}
+        if self._publishers[0] is not config:
+            self._publishers = (
+                config,
+                {source.name.casefold(): source.publisher for source in config.sources},
+            )
+        return self._publishers[1]
+
+    def reach(self, story: Story) -> int:
+        """Independent outlets on a story: mastheads of one group count once."""
+        publisher = self.publishers()
+        return len({publisher.get(name.casefold(), name) for name in story.sources})
+
+    def reach_note(self, story: Story) -> str:
+        mastheads = len(story.sources)
+        if mastheads == self.reach(story):
+            return "Outlets reporting this"
+        return f"{mastheads} mastheads; ones sharing a newsroom or copy count once"
+
     def tag_counts(self, story: Story) -> Markup:
         """'AU 3 · IE 1': outlets per tag, from the config."""
         config = self.config
@@ -1420,9 +1453,10 @@ or <a href="{switch}">show times in {other}</a>.</footer>
         counts = revision_counts(conn, [headline.url for headline in story.headlines])
         return join(
             render(
-                '<li><span class="meta">{time} <span class="source">{source}</span> {badges}'
-                "</span> {title}</li>",
+                '<li><span class="meta">{time} <a class="source" href="{profile}">{source}</a>'
+                " {badges}</span> {title}</li>",
                 time=clock.time(headline.published_at or headline.fetched_at, "%a %H:%M"),
+                profile=self.link(request, "/source", name=headline.source, tag=None),
                 source=headline.source,
                 badges=self.badges(headline, counts.get(headline.url, 1), request),
                 title=external_link(headline.url, headline.title),
@@ -1444,13 +1478,13 @@ or <a href="{switch}">show times in {other}</a>.</footer>
         chosen = [
             story
             for story in self.stories(conn, window)
-            if len(story.sources) >= minimum
+            if self.reach(story) >= minimum
             and (filters.named is None or any(n.casefold() in wanted for n in story.sources))
         ]
         if newest:
             chosen.sort(key=lambda story: story.last_seen, reverse=True)
         else:
-            chosen.sort(key=lambda story: (len(story.sources), story.last_seen), reverse=True)
+            chosen.sort(key=lambda story: (self.reach(story), story.last_seen), reverse=True)
         page = request.page
         shown = chosen[(page - 1) * STORIES_PAGE_SIZE : page * STORIES_PAGE_SIZE]
         cards = join(self.story_card(request, conn, story) for story in shown)
@@ -1510,7 +1544,8 @@ Headlines are grouped by shared words, so the occasional grouping is wrong.</p>
         )
         return render(
             """<li class="story{compact}" data-seen="{seen}">
-  <div class="meta">{first} to {last} · <strong>{n} outlets</strong> {tags}</div>
+  <div class="meta">{first} to {last} ·
+    <strong title="{note}">{n} outlets</strong> {tags}</div>
   <h3><a href="{href}">{title}</a></h3>
   {members}
 </li>""",
@@ -1518,7 +1553,8 @@ Headlines are grouped by shared words, so the occasional grouping is wrong.</p>
             seen=_iso_or_none(min(headline.fetched_at for headline in story.headlines)),
             first=clock.time(story.first_seen, "%a %H:%M"),
             last=clock.time(story.last_seen, "%a %H:%M"),
-            n=len(story.sources),
+            n=self.reach(story),
+            note=self.reach_note(story),
             tags=self.tag_counts(story),
             href=self.link(request, "/story", url=(story.lead or story.headlines[0]).url),
             title=story.title,
@@ -1551,21 +1587,261 @@ Headlines are grouped by shared words, so the occasional grouping is wrong.</p>
             )
         lone = (
             Markup('<p class="muted">Only one outlet has reported this so far.</p>')
-            if len(story.sources) < 2
+            if self.reach(story) < 2
+            else EMPTY
+        )
+        framing = (
+            render(
+                """<h2>How each outlet put it</h2>
+<p class="muted">Oldest first, with the time after the first report. <span class="shared">Faded
+words</span> are used by most outlets; <mark class="own">highlighted</mark> ones by this outlet
+alone.</p>
+<ol class="framing">{rows}</ol>""",
+                rows=self.framing_rows(request, conn, story),
+            )
+            if len(story.headlines) > 1
             else EMPTY
         )
         return render(
             """<h1>{title}</h1>
-<p class="meta"><strong>{n} outlet(s)</strong> {tags}</p>
+<p class="meta"><strong title="{note}">{n} outlet(s)</strong> {tags}</p>
 {lone}
-<h2>{count} headline(s), oldest first</h2>
-<ol class="members wide">{members}</ol>""",
+{framing}
+<details><summary>{count} headline(s) with times and sources</summary>
+<ol class="members wide">{members}</ol></details>""",
             title=story.title,
-            n=len(story.sources),
+            n=self.reach(story),
+            note=self.reach_note(story),
             tags=self.tag_counts(story),
             lone=lone,
+            framing=framing,
             count=len(story.headlines),
             members=self.story_members(request, conn, story),
+        )
+
+    def framing_rows(self, request: Request, conn: sqlite3.Connection, story: Story) -> Markup:
+        """Each headline with the words most outlets share faded, and its own words marked."""
+        headlines = story.headlines
+        stems = [{stem for stem, _ in words(headline.title)} for headline in headlines]
+        used_by: Counter[str] = Counter()
+        for own in stems:
+            used_by.update(own)
+        total = len(headlines)
+        counts = revision_counts(conn, [headline.url for headline in headlines])
+        first = story.first_seen
+
+        def marked(title: str) -> Markup:
+            parts: list[object] = []
+            at = 0
+            for start, end, stem in spans(title):
+                parts.append(title[at:start])
+                text = title[start:end]
+                if stem is None:
+                    parts.append(text)
+                elif used_by[stem] * 2 > total:
+                    parts.append(render('<span class="shared">{t}</span>', t=text))
+                elif used_by[stem] == 1:
+                    parts.append(render('<mark class="own">{t}</mark>', t=text))
+                else:
+                    parts.append(text)
+                at = end
+            parts.append(title[at:])
+            return join(parts)
+
+        rows = []
+        for index, headline in enumerate(headlines):
+            when = headline.published_at or headline.fetched_at
+            after = when - first
+            rows.append(
+                render(
+                    '<li><span class="meta"><span class="after">{after}</span> '
+                    '<a class="source" href="{profile}">{source}</a> {badges}</span>'
+                    "<span>{title}</span></li>",
+                    after="first"
+                    if index == 0 or after < timedelta(minutes=1)
+                    else "+" + _duration(after)
+                    if after >= timedelta(hours=1)
+                    else f"+{int(after.total_seconds() // 60)} min",
+                    profile=self.link(request, "/source", name=headline.source, tag=None),
+                    source=headline.source,
+                    badges=self.badges(headline, counts.get(headline.url, 1), request),
+                    title=external_link(headline.url, marked(headline.title)),
+                )
+            )
+        return join(rows)
+
+    # -- Source profiles
+
+    def page_source(self, request: Request, conn: sqlite3.Connection) -> Markup:
+        """One outlet: volume, publishing hours, rewrites, stories it broke, its words."""
+        config = self.config
+        wanted = request.get("name", "")
+        source = next(
+            (
+                s
+                for s in (config.sources if config else ())
+                if s.name.casefold() == wanted.casefold()
+            ),
+            None,
+        )
+        if source is None:
+            raise HttpError("404 Not Found", "No configured source by that name.")
+        clock = Clock(request.utc)
+        now = utcnow()
+        days = PROFILE_DAYS
+        today = clock.shown(now).date()
+        day_list = [today - timedelta(days=offset) for offset in range(days - 1, -1, -1)]
+        since = datetime.combine(day_list[0], time.min, tzinfo=clock.shown(now).tzinfo).astimezone(
+            UTC
+        )
+        name = source.name.casefold()
+        everyone = first_seen(conn, since=since)
+        rows = [row for row in everyone if row.source.casefold() == name]
+        per_day: Counter[Any] = Counter(clock.shown(row.fetched_at).date() for row in rows)
+        heat = (
+            count_strip(
+                [(day.strftime("%-d"), day.strftime("%a %-d %b"), per_day[day]) for day in day_list]
+            )
+            if rows
+            else Markup('<p class="empty">No articles in this period.</p>')
+        )
+        hours = self.hour_strip(clock, rows)
+
+        stat = next(
+            (s for s in rewrite_stats(conn, since=since) if s.source.casefold() == name), None
+        )
+        rewrites = (
+            render(
+                "<p>{r} of {a} articles reworded ({pct}), median {d} after first fetch. "
+                '<a href="{h}">See its rewrites →</a></p>',
+                r=stat.rewritten,
+                a=stat.articles,
+                pct=f"{stat.share:.0%}",
+                d=_duration(stat.median_delay),
+                h=self.link(request, "/rewrites", source=source.name, tag=None, since="30d"),
+            )
+            if stat and stat.articles
+            else Markup('<p class="empty">No articles in this period.</p>')
+        )
+
+        broke = sorted(
+            (
+                story
+                for story in self.stories(conn, "7d")
+                if self.reach(story) >= 2 and story.headlines[0].source.casefold() == name
+            ),
+            key=lambda story: (self.reach(story), story.last_seen),
+            reverse=True,
+        )[:PROFILE_STORIES]
+        joined = sum(
+            1
+            for story in self.stories(conn, "7d")
+            if self.reach(story) >= 2 and any(s.casefold() == name for s in story.sources)
+        )
+        first_cards = (
+            render(
+                '<ol class="stories">{c}</ol>',
+                c=join(self.story_card(request, conn, story, compact=True) for story in broke),
+            )
+            if broke
+            else Markup('<p class="empty">None in the last 7 days.</p>')
+        )
+
+        # Words this outlet uses far more than outlets overall.
+        mine: Counter[str] = Counter()
+        overall: Counter[str] = Counter()
+        spelling: dict[str, Counter[str]] = {}
+        ignored = {stem for stem, _ in words(source.name)}
+        for row in everyone:
+            own = row.source.casefold() == name
+            for stem, plain in dict(words(row.title)).items():
+                if stem in ignored or stem.isdigit():
+                    continue
+                overall[stem] += 1
+                if own:
+                    mine[stem] += 1
+                    spelling.setdefault(stem, Counter())[plain] += 1
+        share = len(rows) / len(everyone) if everyone else 0.0
+        distinctive = sorted(
+            (
+                (count / (overall[stem] * share or 1), count, stem)
+                for stem, count in mine.items()
+                if count >= PROFILE_MIN_WORD
+            ),
+            reverse=True,
+        )[:PROFILE_WORDS]
+        word_chips = join(
+            render(
+                '<a class="chip" href="{h}" title="{n} headlines">{w}</a>',
+                h=self.link(
+                    request,
+                    "/search",
+                    q=spelling[stem].most_common(1)[0][0],
+                    source=source.name,
+                    tag=None,
+                    since=None,
+                ),
+                n=count,
+                w=spelling[stem].most_common(1)[0][0],
+            )
+            for _, count, stem in distinctive
+        )
+
+        status = source_status(conn, [source.name])[0]
+        state, css = source_state(source.enabled, status, now)
+        return render(
+            """<h1>{name}</h1>
+<p class="meta"><span class="state {css}">{state}</span> · {tags}{group} ·
+<a href="{latest}">latest headlines</a> · {feed}</p>
+<p>{n} articles in the last {days} days; in {joined} multi-outlet stories this week.</p>
+<h2>Articles per day</h2>
+{heat}
+<h2>When it publishes ({zone})</h2>
+<p class="muted">Articles by the hour they were first fetched, so this follows the fetch
+schedule as much as the outlet's own rhythm.</p>
+{hours}
+<h2>Rewrites</h2>
+{rewrites}
+<h2>Stories it reported first · last 7 days</h2>
+{first}
+<h2>Its words</h2>
+<p class="muted">Headline words this outlet uses far more than the others do.</p>
+<p class="chips">{words}</p>""",
+            name=source.name,
+            css=css,
+            state=state,
+            tags=join(
+                render(
+                    '<a class="chip" href="{h}">{t}</a>',
+                    h=self.link(request, "/sources", tag=tag),
+                    t=tag,
+                )
+                for tag in source.tags
+            ),
+            group=render(' <span class="chip" title="Publisher group">{g}</span>', g=source.group)
+            if source.group
+            else EMPTY,
+            latest=self.link(request, "/latest", source=source.name, tag=None),
+            feed=external_link(source.url, "feed ↗"),
+            n=f"{len(rows):,}",
+            days=days,
+            joined=joined,
+            heat=heat,
+            zone=clock.zone,
+            hours=hours,
+            rewrites=rewrites,
+            first=first_cards,
+            words=word_chips or Markup('<span class="empty">Not enough headlines yet.</span>'),
+        )
+
+    @staticmethod
+    def hour_strip(clock: Clock, rows: Sequence[FirstSeen]) -> Markup:
+        """Articles per hour of day, shown time: one row of 24 shaded cells."""
+        if not rows:
+            return Markup('<p class="empty">No articles in this period.</p>')
+        per_hour = Counter(clock.shown(row.fetched_at).hour for row in rows)
+        return count_strip(
+            [(f"{hour:02d}", f"{hour:02d}:00", per_hour[hour]) for hour in range(24)]
         )
 
     # -- Briefing
@@ -1577,9 +1853,9 @@ Headlines are grouped by shared words, so the occasional grouping is wrong.</p>
         recent = [
             story
             for story in self.stories(conn, "24h")
-            if len(story.sources) >= 2 and now - story.last_seen <= BRIEFING_WINDOW
+            if self.reach(story) >= 2 and now - story.last_seen <= BRIEFING_WINDOW
         ]
-        recent.sort(key=lambda story: (len(story.sources), story.last_seen), reverse=True)
+        recent.sort(key=lambda story: (self.reach(story), story.last_seen), reverse=True)
         top = recent[:BRIEFING_TOP]
         shown = {id(story) for story in top}
 
@@ -1821,6 +2097,10 @@ over the rest of the period. Click one to search for it.</p>
 click a cell for that day's articles. ▲/▼ compares each total with the previous {days}
 days.</p>
 {heat}
+<h3>By hour of day</h3>
+<p class="muted">All articles in the period by the hour they were first fetched: gaps
+between fetch runs show as empty hours.</p>
+{hours}
 <h2>Rewrites by outlet</h2>
 <p class="muted">Of the articles first seen in this period (live blogs excluded), how many
 were reworded later. Punctuation-only changes don't count. The delay is from when the article
@@ -1863,6 +2143,7 @@ source's first-ever run is left out.</p>
             zone=clock.zone,
             days=days,
             heat=heat,
+            hours=self.hour_strip(clock, rows),
             min=MIN_REWRITE_SAMPLE,
             rewrite_rows=rewrite_rows or Markup('<tr><td colspan="5">No articles yet.</td></tr>'),
             rewrite_total=rewrite_total,
@@ -1940,9 +2221,9 @@ source's first-ever run is left out.</p>
             (
                 story
                 for story in self.stories(conn, "7d")
-                if len(story.sources) >= 2 and story.last_seen >= since
+                if self.reach(story) >= 2 and story.last_seen >= since
             ),
-            key=lambda story: (len(story.sources), story.last_seen),
+            key=lambda story: (self.reach(story), story.last_seen),
             reverse=True,
         )[:BIG_STORIES]
         if not stories:
@@ -2005,7 +2286,7 @@ source's first-ever run is left out.</p>
                 render(
                     '<tr><th scope="row"><a href="{h}">{source}</a></th>{cells}'
                     '<td class="num">{total}{change}</td></tr>',
-                    h=self.link(request, "/latest", source=source, tag=None),
+                    h=self.link(request, "/source", name=source, tag=None, since=None),
                     source=source,
                     cells=join(cell(source, day, counts.get(day, 0)) for day in days),
                     total=sum(counts.values()),
@@ -2053,6 +2334,25 @@ source's first-ever run is left out.</p>
             head=head,
             rows=table_rows(rest),
         )
+
+
+def count_strip(cells: Sequence[tuple[str, str, int]]) -> Markup:
+    """One row of shaded count cells under short labels: (label, hover name, count)."""
+    peak = max((count for _, _, count in cells), default=0) or 1
+    return render(
+        '<div class="scroll"><table class="heatmap hours"><thead><tr>{h}</tr></thead>'
+        "<tbody><tr>{c}</tr></tbody></table></div>",
+        h=join(render('<th class="day">{l}</th>', l=label) for label, _, _ in cells),
+        c=join(
+            render(
+                '<td class="heat h{l}" title="{n} · {name}">{n}</td>',
+                l=0 if not count else max(1, math.ceil(HEAT_LEVELS * count / peak)),
+                n=count or "",
+                name=name,
+            )
+            for _, name, count in cells
+        ),
+    )
 
 
 def sparkline(values: Sequence[int]) -> Markup:
