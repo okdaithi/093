@@ -3,22 +3,26 @@ set -euo pipefail
 
 usage() {
     cat <<'USAGE'
-Usage: sudo bash deploy/install-ubuntu.sh [--update-sources]
+Usage: sudo bash deploy/install-ubuntu.sh [--keep-sources]
 
 Installs or updates headliner as a systemd service.
 
-  --update-sources  Replace /etc/headliner/sources.yaml with the shipped
-                    deploy/sources.yaml, keeping its user_agent line (your
-                    contact address). The previous file is kept as
-                    sources.yaml.bak-<timestamp> and the change is shown.
-                    Without this flag the live file is never modified.
+By default /etc/headliner/sources.yaml is brought up to date with the shipped
+deploy/sources.yaml, keeping its user_agent line (your contact address). The
+previous file is kept as sources.yaml.bak-<timestamp>, the change is shown,
+and if the new file does not load the old one is restored.
+
+  --keep-sources    Leave the live sources.yaml untouched (the shipped one is
+                    still written next to it as sources.yaml.dist).
+  --update-sources  Accepted for compatibility; updating is the default.
 USAGE
 }
 
-update_sources=false
+update_sources=true
 for arg in "$@"; do
     case "${arg}" in
         --update-sources) update_sources=true ;;
+        --keep-sources) update_sources=false ;;
         -h | --help)
             usage
             exit 0
@@ -85,8 +89,8 @@ if [[ ! -e /etc/headliner/sources.yaml ]]; then
         "${repo_dir}/deploy/sources.yaml" /etc/headliner/sources.yaml
 else
     echo "Keeping existing /etc/headliner/sources.yaml"
-    # Ship the current defaults alongside so changes (e.g. retired feeds) can
-    # be merged by hand; the live file is never overwritten.
+    # Ship the current defaults alongside; unless --keep-sources, they then
+    # replace the live file (user_agent kept, backed up, validated).
     install -o root -g headliner -m 0640 \
         "${repo_dir}/deploy/sources.yaml" /etc/headliner/sources.yaml.dist
     if [[ "${update_sources}" == true ]] \
@@ -121,7 +125,7 @@ except ConfigError as exc:
     elif ! cmp -s /etc/headliner/sources.yaml /etc/headliner/sources.yaml.dist; then
         echo "NOTE: /etc/headliner/sources.yaml differs from the shipped defaults." >&2
         echo "      Review with: diff -u /etc/headliner/sources.yaml /etc/headliner/sources.yaml.dist" >&2
-        echo "      To adopt them (keeping your user_agent): rerun with --update-sources" >&2
+        echo "      To adopt them (keeping your user_agent): rerun without --keep-sources" >&2
     fi
 fi
 
