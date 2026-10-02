@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -151,6 +152,27 @@ def test_parse_dispatches_on_type(
 )
 def test_parse_datetime(raw: str | None, expected: datetime | None) -> None:
     assert parse_datetime(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("2025-03-04T09:00:00", datetime(2025, 3, 4, 9, 0, tzinfo=UTC)),
+        ("2025-03-04", datetime(2025, 3, 4, 0, 0, tzinfo=UTC)),
+        ("2025-03-04T09:00:00+08:00", datetime(2025, 3, 4, 1, 0, tzinfo=UTC)),
+    ],
+)
+def test_parse_datetime_treats_naive_iso_as_utc_regardless_of_host_tz(
+    raw: str, expected: datetime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A naive timestamp must not be read as the server's local time."""
+    monkeypatch.setenv("TZ", "Australia/Perth")
+    time.tzset()
+    try:
+        assert parse_datetime(raw) == expected
+    finally:
+        monkeypatch.undo()
+        time.tzset()
 
 
 def test_shipped_html_source_selectors_work_against_the_fixture(listing_bytes: bytes) -> None:

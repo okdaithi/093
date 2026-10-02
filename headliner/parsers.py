@@ -17,7 +17,7 @@ from urllib.parse import urljoin
 import feedparser
 
 from headliner.config import Source
-from headliner.models import Headline, InvalidHeadlineError, clean_text, utcnow
+from headliner.models import Headline, InvalidHeadlineError, clean_text, to_utc, utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -69,9 +69,11 @@ def parse_datetime(value: str | None) -> datetime | None:
     if not text:
         return None
 
+    # Naive values are treated as UTC (via `to_utc`); `astimezone` on a naive
+    # datetime would read it as the host's local time instead.
     candidate = text.replace("Z", "+00:00") if text.endswith("Z") else text
     try:
-        return datetime.fromisoformat(candidate).astimezone(UTC)
+        return to_utc(datetime.fromisoformat(candidate))
     except ValueError:
         pass
 
@@ -80,14 +82,13 @@ def parse_datetime(value: str | None) -> datetime | None:
     except (TypeError, ValueError):
         parsed = None
     if parsed is not None:
-        return parsed.astimezone(UTC) if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+        return to_utc(parsed)
 
     for fmt in _DATE_FORMATS:
         try:
-            naive = datetime.strptime(text, fmt)
+            return to_utc(datetime.strptime(text, fmt))
         except ValueError:
             continue
-        return naive.astimezone(UTC) if naive.tzinfo else naive.replace(tzinfo=UTC)
 
     logger.debug("unparseable date %r", text)
     return None
