@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 from pathlib import Path
 
 import httpx
@@ -11,17 +12,30 @@ import pytest
 import respx
 from headliner.cli import EXIT_FATAL, EXIT_OK, EXIT_PARTIAL_FAILURE, main
 from headliner.config import Settings, parse_config
-from headliner.discover import Discovery, discover, render_yaml
+from headliner.discover import (
+    BatchError,
+    Discovery,
+    discover,
+    mark_duplicate_feeds,
+    parse_batch,
+    render_report,
+    render_yaml,
+)
 
 SITE = "https://news.example.com/"
 ALLOW_ALL = "User-agent: *\nAllow: /\n"
 DISALLOW_ALL = "User-agent: *\nDisallow: /\n"
 
 
-def rss(title: str, links: list[str]) -> bytes:
+# Recent enough not to count as a stale feed, whenever the tests run.
+PUBLISHED = (datetime.now(UTC) - timedelta(days=1)).replace(microsecond=0)
+
+
+def rss(title: str, links: list[str], published: datetime = PUBLISHED) -> bytes:
+    stamp = format_datetime(published, usegmt=True)
     items = "".join(
         f"<item><title>Headline number {i} about the harbour</title><link>{link}</link>"
-        "<pubDate>Fri, 02 Oct 2026 09:00:00 GMT</pubDate></item>"
+        f"<pubDate>{stamp}</pubDate></item>"
         for i, link in enumerate(links)
     )
     return (
@@ -69,7 +83,7 @@ def test_advertised_feed_is_used_and_named_from_its_title(
     assert found.feed_url == f"{SITE}rss/latest.xml"
     assert found.name == "Example News"
     assert found.items == 3
-    assert found.newest == datetime(2026, 10, 2, 9, 0, tzinfo=UTC)
+    assert found.newest == PUBLISHED
 
 
 def test_falls_back_to_platform_feed_paths(mocked: respx.MockRouter, settings: Settings) -> None:
@@ -132,10 +146,29 @@ def test_already_configured_sites_are_not_fetched(
     catch_all(mocked)
     config = "sources:\n  - {name: Example News, url: 'https://news.example.com/rss', type: rss}\n"
 
-    [known] = run([f"{SITE}world/"], settings, config)
-    assert known.status == "configured"
+    known, generic = run([SITE, f"{SITE}news/"], settings, config)
+    assert known.status == generic.status == "configured"
     assert known.existing == "Example News"
     assert not mocked.calls
+
+
+def test_section_of_a_configured_site_is_still_discovered(
+    mocked: respx.MockRouter, settings: Settings
+) -> None:
+    """rte.ie is configured, but rte.ie/news/galway may have its own feed."""
+    mocked.get(f"{SITE}robots.txt").mock(return_value=httpx.Response(200, text=ALLOW_ALL))
+    mocked.get(f"{SITE}regions/galway/").mock(
+        return_value=httpx.Response(200, text=page("/feeds/galway.xml"))
+    )
+    mocked.get(f"{SITE}feeds/galway.xml").mock(
+        return_value=httpx.Response(200, content=rss("Galway", [f"{SITE}regions/galway/a"]))
+    )
+    catch_all(mocked)
+    config = "sources:\n  - {name: Example News, url: 'https://news.example.com/rss', type: rss}\n"
+
+    [found] = run([f"{SITE}regions/galway/"], settings, config)
+    assert found.status == "ok"
+    assert found.feed_url == f"{SITE}feeds/galway.xml"
 
 
 def test_section_url_suggests_an_include_pattern(
@@ -250,3 +283,144 @@ def test_cli_discover_rejects_non_http_urls(discover_config: Path) -> None:
 def test_cli_discover_rejects_bad_tags(discover_config: Path) -> None:
     args = ["discover", "--sources", str(discover_config), "--quiet", "--tag", "two words", SITE]
     assert main(args) == EXIT_FATAL
+
+
+BATCH = """
+# pasted 2026-10-03
+IE galway
+https://www.galwaybeo.ie/
+https://www.rte.ie/news/galway/
+
+cn
+https://www.scmp.com/  HK
+http://www.chinadaily.com.cn/
+https://www.chinadaily.com.cn/
+
+cn-intel CN
+http://www.cicir.ac.cn/NEW/index.html think-tank
+"""
+
+
+def test_batch_headers_become_tags_and_duplicates_are_dropped() -> None:
+    entries = parse_batch(BATCH)
+    assert [(entry.url, entry.tags) for entry in entries] == [
+        ("https://www.galwaybeo.ie/", ("IE", "galway")),
+        ("https://www.rte.ie/news/galway/", ("IE", "galway")),
+        ("https://www.scmp.com/", ("HK",)),  # a country after the URL replaces the group's
+        ("http://www.chinadaily.com.cn/", ("CN",)),  # the https repeat is dropped
+        ("http://www.cicir.ac.cn/NEW/index.html", ("CN", "cn-intel", "think-tank")),
+    ]
+    assert entries[0].group == "IE galway"
+
+
+def test_batch_rejects_untagged_and_malformed_lines() -> None:
+    with pytest.raises(BatchError, match="no tags"):
+        parse_batch("https://example.org/\n")
+    with pytest.raises(BatchError, match="line 2"):
+        parse_batch("US\nftp://example.org/\n")
+
+
+def test_duplicate_feeds_and_report() -> None:
+    results = [
+        Discovery(
+            site="https://a.example/",
+            status="ok",
+            feed_url="https://a.example/rss",
+            name="A",
+            items=5,
+            tags=("US",),
+            group="US",
+        ),
+        Discovery(
+            site="https://a.example/us",
+            status="ok",
+            feed_url="https://a.example/rss",
+            name="A US",
+            items=5,
+            tags=("US",),
+            group="US",
+        ),
+        Discovery(
+            site="https://b.example/",
+            status="failed",
+            note="robots.txt blocks",
+            tags=("UK",),
+            group="UK",
+        ),
+    ]
+    mark_duplicate_feeds(results)
+    assert results[1].status == "configured"
+    assert results[1].note == "same feed as https://a.example/"
+    report = render_report(results)
+    assert "| US | https://a.example/ | found | https://a.example/rss | 5 | US |" in report
+    assert "| UK | https://b.example/ | FAILED | robots.txt blocks |  | UK |" in report
+    assert report.endswith("1 found, 1 already configured, 1 failed.\n")
+    snippet = render_yaml(results, [], generated=datetime(2026, 10, 3, tzinfo=UTC))
+    assert "  # == US ==\n  # https://a.example/ -> 5 items" in snippet
+    assert "    tags: [US]" in snippet
+    assert parse_config("sources:\n" + snippet).sources[0].tags == ("US",)
+
+
+def test_cli_discover_batch_writes_report(
+    mocked: respx.MockRouter, discover_config: Path, tmp_path: Path
+) -> None:
+    mocked.get(f"{SITE}robots.txt").mock(return_value=httpx.Response(200, text=ALLOW_ALL))
+    mocked.get(SITE).mock(return_value=httpx.Response(200, text=page("/feed/")))
+    mocked.get(f"{SITE}feed/").mock(
+        return_value=httpx.Response(200, content=rss("Example News", [f"{SITE}a"]))
+    )
+    catch_all(mocked)
+    batch = tmp_path / "batch.txt"
+    batch.write_text(f"NZ regional\n{SITE}\n", encoding="utf-8")
+    report = tmp_path / "report.md"
+    args = ["discover", "--sources", str(discover_config), "--quiet", "--batch", str(batch)]
+    assert main([*args, "--report", str(report)]) == EXIT_OK
+    assert "| NZ regional | https://news.example.com/ | found |" in report.read_text()
+    batch.write_text(f"{SITE}\n", encoding="utf-8")
+    assert main(args) == EXIT_FATAL
+
+
+def test_a_feed_url_given_as_the_site_is_used_directly(
+    mocked: respx.MockRouter, settings: Settings
+) -> None:
+    feed = "https://rss.example.com/services/home.xml"
+    mocked.get("https://rss.example.com/robots.txt").mock(
+        return_value=httpx.Response(200, text=ALLOW_ALL)
+    )
+    mocked.get(feed).mock(
+        return_value=httpx.Response(200, content=rss("Example Times", [f"{SITE}a", f"{SITE}b"]))
+    )
+    catch_all(mocked)
+    [found] = run([feed], settings)
+    assert (found.status, found.feed_url, found.items) == ("ok", feed, 2)
+
+
+def test_feed_already_in_config_is_reported_as_configured() -> None:
+    config = parse_config(
+        "sources:\n"
+        "  - {name: RTE News, url: 'https://www.rte.ie/feeds/rss/?index=/news/', type: rss}\n"
+    )
+    results = [
+        Discovery(
+            site="https://www.rte.ie/news/galway/",
+            status="ok",
+            name="RTE",
+            feed_url="https://www.rte.ie/feeds/rss/?index=/news/",
+            items=60,
+        )
+    ]
+    mark_duplicate_feeds(results, config)
+    assert (results[0].status, results[0].existing) == ("configured", "RTE News")
+
+
+def test_stale_feed_is_rejected_with_its_date(mocked: respx.MockRouter, settings: Settings) -> None:
+    feed = "https://rss.example.com/frozen.xml"
+    mocked.get("https://rss.example.com/robots.txt").mock(
+        return_value=httpx.Response(200, text=ALLOW_ALL)
+    )
+    old = rss("Frozen", [f"{SITE}a"], published=datetime(2018, 1, 24, 9, tzinfo=UTC))
+    mocked.get(feed).mock(return_value=httpx.Response(200, content=old))
+    catch_all(mocked)
+    [failed] = run([feed], settings)
+    assert failed.status == "failed"
+    assert "feed is stale: newest item 2018-01-24" in failed.note

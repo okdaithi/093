@@ -430,6 +430,48 @@ Business Post's advertised feeds return its HTML homepage.
 
 `discover` exits `1` when any site had no usable feed, so it can be scripted.
 
+### Adding many sources at once: batch files
+
+For more than a handful of sites, paste them into a batch file under group header
+lines. Each header line's words become the tags of the URLs below it:
+
+```text
+# batches/2026-10-03-global.txt
+IE galway
+https://www.galwaybeo.ie/
+https://www.galwaydaily.com/news/
+
+asia
+https://japantoday.com/                  JP
+https://asia.nikkei.com/                 JP business
+
+cn-intel CN
+http://www.cicir.ac.cn/NEW/index.html    think-tank lang-zh
+```
+
+- **Tags.** Two-letter tags are country codes and are upper-cased (`cn` becomes
+  `CN`); all others are lower-cased. Words after a URL add tags to that site
+  alone, and a country code there replaces the group's (SCMP is `HK` in a `cn`
+  group). Country tags are listed first.
+- **Duplicates.** Repeated sites (the same host and path, over http or https)
+  are checked once. A feed that two sites lead to is kept for the first, and a
+  feed already in the config is reported as configured.
+- **Feeds on other hosts.** Publishers often serve feeds from another host
+  (`rss.nytimes.com`, `feeds.a.dj.com`). Put the feed URL itself in the batch
+  file and it is checked like any other candidate.
+- **Sections.** A section URL on a site that is already configured
+  (`https://www.rte.ie/news/galway/`) is still searched for a feed of its own.
+
+```bash
+headliner discover --batch batches/2026-10-03-global.txt --report report.md > new.yaml
+```
+
+`new.yaml` holds the entries grouped by header, ready to paste after tidying
+names. `report.md` is a triage table with one row per site: found (with the
+feed and item count), already configured, or failed (with the reason). Keep
+batch files in `batches/` as a record of what was requested and why sites were
+or weren't added.
+
 ## Adding a new HTML source
 
 Use `type: html` only when the site publishes no feed. Run `headliner discover`
