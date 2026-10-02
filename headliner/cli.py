@@ -535,6 +535,23 @@ def cmd_discover(args: argparse.Namespace) -> int:
     return EXIT_OK if not failed else EXIT_PARTIAL_FAILURE
 
 
+def cmd_web(args: argparse.Namespace) -> int:
+    """Serve the read-only web viewer until interrupted."""
+    from headliner.web import serve  # the CLI's other commands never need it
+
+    config_path = args.sources if args.sources.exists() else None
+    if config_path is None:
+        logger.warning(
+            "no sources file at %s; tag filters and the Sources page are off", args.sources
+        )
+    try:
+        serve(args.db, config_path, host=args.host, port=args.port)
+    except OSError as exc:
+        logger.error("cannot listen on %s:%d: %s", args.host, args.port, exc)
+        return EXIT_FATAL
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Assemble the argparse command tree."""
     parser = argparse.ArgumentParser(
@@ -713,6 +730,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="tag to put on every discovered source (repeatable), e.g. --tag AU",
     )
 
+    web = subparsers.add_parser(
+        "web", parents=[common], help="serve a read-only web viewer of the database"
+    )
+    web.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="address to listen on (default: %(default)s; 0.0.0.0 for the whole network)",
+    )
+    web.add_argument(
+        "--port", type=int, default=8090, help="port to listen on (default: %(default)s)"
+    )
+
     return parser
 
 
@@ -737,6 +766,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_migrate(args)
         if args.command == "discover":
             return cmd_discover(args)
+        if args.command == "web":
+            return cmd_web(args)
         config = load_config(args.sources)
         if args.command == "fetch":
             return cmd_fetch(args, config)
