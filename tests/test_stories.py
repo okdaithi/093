@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from headliner.models import Headline
-from headliner.stories import by_url, cluster, tokens
+from headliner.stories import by_url, cluster, is_media, tokens
 
 BASE = datetime(2026, 10, 2, 8, 0, tzinfo=UTC)
 
@@ -127,3 +127,27 @@ def test_tokens_fold_case_possessives_plurals_and_stopwords() -> None:
         "barrel",
     ]
     assert tokens("survived") == tokens("surviving") == tokens("survives")
+
+
+def test_media_items_are_recognised() -> None:
+    assert is_media(item("BBC News", "Watch: Christa Pike's lawyer speaks", "w1"))
+    assert is_media(item("BBC News", "In pictures \N{EN DASH} the hornet hunt", "w2"))
+    assert is_media(item("ABC News AU", "Baird remembered", "video/baird"))
+    assert not is_media(item("RTE News", "Watchdog fines bank", "w3"))
+    assert not is_media(PIKE[1])
+
+
+def test_a_video_clip_does_not_name_the_story() -> None:
+    clip = item(
+        "BBC News",
+        "Watch: Christa Pike in critical condition after surviving two lethal injections",
+        "clip",
+        -1,
+    )
+    story = by_url(cluster([clip, *PIKE]))[clip.url]
+    assert clip in story.headlines
+    assert story.lead is not clip
+    # A pair is named by its first headline, unless that one is the clip.
+    pair = by_url(cluster([clip, PIKE[1]]))[clip.url]
+    assert pair.lead is PIKE[1]
+    assert by_url(cluster(PIKE[1:3]))[PIKE[1].url].lead is PIKE[1]

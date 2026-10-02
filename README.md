@@ -102,6 +102,7 @@ merged, so check the diff if you have them.
 
 | Page | Shows |
 | --- | --- |
+| **Briefing** | The home page. A health line (all normal, or what needs attention, from the same checks as `/api/status`); the stories reported by the most outlets in the last 12 hours; then, by country, the stories that country's outlets lead on (the larger their share of a story's outlets, the higher it ranks, and each story appears once); and the notable rewrites of the last 24 hours (no live blogs, no punctuation-only changes). |
 | **Latest** | Headlines newest first, grouped by day, with links to the articles. A `LIVE` badge marks live blogs, and "N titles" marks rewritten articles. |
 | **Stories** | Headlines from different outlets grouped into stories (see [Stories](#stories)): most widely covered first or newest first, with outlets per tag ("AU 3 · IE 1") and each outlet's headline. Latest and Search mark grouped headlines "N outlets", linking to the story. |
 | **Rewrites** | Each title change as a word-level diff (removed words struck through, added words highlighted), with the old title underneath. Live blogs and minor (punctuation-only) changes are hidden by default, as in `changes`; the page says how many of each were hidden and lets you show them. |
@@ -111,12 +112,30 @@ merged, so check the diff if you have them.
 | **Article** | Every title one article has carried, oldest first, each diffed against the one before. Reached from "N titles" or "all titles". |
 
 Every list filters by tag (any of those ticked), source and time window, and
-filters are kept as you move between pages. Times follow the CLI: local time with
-the zone named, a header link to switch to UTC, and the UTC timestamp on hover.
+filters are kept as you move between pages. Tags are grouped into countries (two
+capital letters, such as `AU`) and regions & topics, and the source menu is grouped
+by each source's country. On phones the tags and sources panel starts closed; active
+filters are always shown as chips underneath, and following a chip removes it. A
+story is named after its most typical headline, but never a video, gallery or live
+item ("Watch: …") when an ordinary article is in the group. Times follow the CLI:
+local time with the zone named, a link to switch to UTC (in the header, and in the
+footer on phones), and the UTC timestamp on hover.
+
+A small script (`static/app.js`, served by the viewer itself) adds three
+conveniences; every page works the same without it:
+- Filters apply as soon as a box is ticked or a menu changed, so there is no
+  *Apply* button (it stays on the Search page and without JavaScript).
+- The tags and sources panel opens on wide screens.
+- **New since your last visit:** articles and stories first fetched after your
+  previous visit get an accent bar, a divider marks where the earlier ones start,
+  and the Latest tab shows how many are new. The time of your visit is kept in
+  your browser (`localStorage`) only; the count comes from `/api/new?since=<ISO
+  time>`, which returns `{"latest": N}`.
 
 The viewer opens the database read-only, so it can't change it, and only answers
-`GET`/`HEAD`. Pages are plain HTML and CSS with no JavaScript and no third-party
-requests, under a strict Content-Security-Policy. Article links open in a new tab
+`GET`/`HEAD`. Pages are plain HTML and CSS plus that one script, with no inline
+script and no third-party requests, under a strict Content-Security-Policy
+(scripts, styles and requests from the viewer itself only). Article links open in a new tab
 without sending a referrer. It needs no packages beyond headliner's own.
 `/healthz` returns JSON (`status`, `schema`, `articles`, `last_fetch`) for
 monitoring. `/api/status` returns everything a status check needs, readable

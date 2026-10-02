@@ -50,6 +50,23 @@ STOPWORDS: Final = frozenset(_STOPWORDS_TEXT.split())
 _WORD = re.compile(r"[^\W_]+(?:['\u2019][^\W_]+)*")
 
 
+_MEDIA_TITLE: Final = re.compile(
+    r"^\s*(?:watch|video|listen|live|podcast|in pictures|pictures|photos|gallery)"
+    r"\s*[:|\N{EN DASH}\N{EM DASH}-]",
+    re.I,
+)
+_MEDIA_PATH: Final = re.compile(r"/(?:videos?|av|live|podcasts?|audio|gallery)/", re.I)
+
+
+def is_media(headline: Headline) -> bool:
+    """A video, audio, gallery or live item: a poor name for a whole story."""
+    return (
+        headline.is_live
+        or bool(_MEDIA_TITLE.match(headline.title))
+        or bool(_MEDIA_PATH.search(headline.url))
+    )
+
+
 # Crude suffix stripping, enough for "survived"/"surviving"/"survives" to meet.
 _SUFFIXES: Final = ("ings", "ing", "edly", "ed", "es", "s", "e")
 _KEEP_ENDINGS: Final = ("ss", "us", "is")
@@ -199,12 +216,18 @@ def cluster(
 
     stories = []
     for group in clusters:
-        lead_index = group.members[0]
-        if len(group.members) > 2:
-            norm = group.norm()
-            lead_index = max(
-                group.members, key=lambda index: _cosine(vectors[index], group.centroid, norm)
-            )
+        # The most typical headline names the story (the first, for a pair),
+        # but never a "Watch:" clip or live blog when an article is in the group.
+        norm = group.norm()
+        typical = len(group.members) > 2
+        lead_index = max(
+            group.members,
+            key=lambda index: (
+                not is_media(items[index]),
+                _cosine(vectors[index], group.centroid, norm) if typical else 0.0,
+                -index,
+            ),
+        )
         stories.append(
             Story(headlines=[items[index] for index in group.members], lead=items[lead_index])
         )

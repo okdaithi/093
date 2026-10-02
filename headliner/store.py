@@ -1372,6 +1372,12 @@ def first_seen(conn: sqlite3.Connection, *, since: datetime) -> list[FirstSeen]:
         return rows
 
 
+def count_new(conn: sqlite3.Connection, *, since: datetime) -> int:
+    """How many articles were first stored after `since`."""
+    row = conn.execute("SELECT COUNT(*) FROM headlines WHERE fetched_at > ?", (_iso(since),))
+    return int(row.fetchone()[0])
+
+
 @dataclass(frozen=True, slots=True)
 class RewriteStat:
     """How often one outlet rewrites its headlines, live blogs excluded."""
