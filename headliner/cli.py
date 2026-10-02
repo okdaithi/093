@@ -13,7 +13,7 @@ import logging
 import re
 import sys
 from collections.abc import Sequence
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Final, TextIO
 
@@ -78,8 +78,35 @@ def configure_logging(*, verbose: bool, quiet: bool) -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
-def _format_dt(value: datetime | None) -> str:
-    return value.strftime("%Y-%m-%d %H:%M") if value else "-"
+def time_column(values: Sequence[datetime | None], *, utc: bool) -> tuple[list[str], str]:
+    """Format a table column of datetimes and name its timezone for the header.
+
+    Stored values are UTC. Table output shows them in local time (the `TZ`
+    environment variable or the system zone) unless `utc` is set. When the
+    column spans a daylight-saving change, each cell carries its own zone
+    abbreviation and the header just says "local".
+    """
+    shown = [
+        (value.astimezone(UTC) if utc else value.astimezone()) if value else None
+        for value in values
+    ]
+    zones = {value.tzname() or "local" for value in shown if value}
+    if utc:
+        label = "UTC"
+    elif len(zones) == 1:
+        label = next(iter(zones))
+    elif not zones:
+        label = datetime.now().astimezone().tzname() or "local"
+    else:
+        label = "local"
+    per_cell = label == "local" and len(zones) > 1
+    cells = [
+        "-"
+        if value is None
+        else value.strftime("%Y-%m-%d %H:%M") + (f" {value.tzname()}" if per_cell else "")
+        for value in shown
+    ]
+    return cells, label
 
 
 def _truncate(text: str, width: int) -> str:
@@ -103,8 +130,13 @@ def render_table(rows: list[list[str]], headers: list[str], stream: TextIO) -> N
         print(body.rstrip(), file=stream)
 
 
-def output_headlines(headlines: list[Headline], fmt: str, stream: TextIO) -> None:
-    """Write headlines to `stream` as a table, JSON or CSV."""
+def output_headlines(
+    headlines: list[Headline], fmt: str, stream: TextIO, *, utc: bool = False
+) -> None:
+    """Write headlines to `stream` as a table, JSON or CSV.
+
+    JSON and CSV always carry UTC ISO-8601 timestamps; only the table follows `utc`.
+    """
     if fmt == "json":
         json.dump([headline.as_dict() for headline in headlines], stream, indent=2)
         stream.write("\n")
@@ -128,16 +160,17 @@ def output_headlines(headlines: list[Headline], fmt: str, stream: TextIO) -> Non
     if not headlines:
         print("No headlines found.", file=stream)
         return
+    published, zone = time_column([headline.published_at for headline in headlines], utc=utc)
     rows = [
         [
             _truncate(headline.source, 22),
-            _format_dt(headline.published_at),
+            when,
             _truncate(headline.title, 78),
             headline.url,
         ]
-        for headline in headlines
+        for headline, when in zip(headlines, published, strict=True)
     ]
-    render_table(rows, ["SOURCE", "PUBLISHED", "TITLE", "URL"], stream)
+    render_table(rows, ["SOURCE", f"PUBLISHED ({zone})", "TITLE", "URL"], stream)
 
 
 def _summarise(results: list[SourceResult], *, dry_run: bool) -> None:
@@ -175,7 +208,7 @@ def cmd_fetch(args: argparse.Namespace, config: Config) -> int:
     if args.dry_run:
         for result in results:
             if result.headlines:
-                output_headlines(result.headlines, "table", sys.stdout)
+                output_headlines(result.headlines, "table", sys.stdout, utc=args.utc)
                 print(file=sys.stdout)
         _summarise(results, dry_run=True)
     else:
@@ -208,7 +241,7 @@ def cmd_list(args: argparse.Namespace, config: Config) -> int:
     since = utcnow() - args.since if args.since else None
     with open_db(args.db) as conn:
         headlines = list_headlines(conn, since=since, source=args.source, limit=args.limit)
-    output_headlines(headlines, args.format, sys.stdout)
+    output_headlines(headlines, args.format, sys.stdout, utc=args.utc)
     return EXIT_OK
 
 
@@ -216,12 +249,17 @@ def cmd_search(args: argparse.Namespace) -> int:
     """Search stored headlines."""
     with open_db(args.db) as conn:
         headlines = search_headlines(conn, args.query, limit=args.limit)
-    output_headlines(headlines, args.format, sys.stdout)
+    output_headlines(headlines, args.format, sys.stdout, utc=args.utc)
     return EXIT_OK
 
 
-def output_changes(changes: list[TitleChange], fmt: str, stream: TextIO) -> None:
-    """Write headline rewrites to `stream` as a table, JSON or CSV."""
+def output_changes(
+    changes: list[TitleChange], fmt: str, stream: TextIO, *, utc: bool = False
+) -> None:
+    """Write headline rewrites to `stream` as a table, JSON or CSV.
+
+    JSON and CSV always carry UTC ISO-8601 timestamps; only the table follows `utc`.
+    """
     if fmt == "json":
         payload = [
             {
@@ -255,16 +293,17 @@ def output_changes(changes: list[TitleChange], fmt: str, stream: TextIO) -> None
     if not changes:
         print("No headline changes found.", file=stream)
         return
+    changed, zone = time_column([change.changed_at for change in changes], utc=utc)
     rows = [
         [
-            _format_dt(change.changed_at),
+            when,
             _truncate(change.source, 22),
             _truncate(change.old_title, 60),
             _truncate(change.new_title, 60),
         ]
-        for change in changes
+        for change, when in zip(changes, changed, strict=True)
     ]
-    render_table(rows, ["CHANGED", "SOURCE", "OLD TITLE", "NEW TITLE"], stream)
+    render_table(rows, [f"CHANGED ({zone})", "SOURCE", "OLD TITLE", "NEW TITLE"], stream)
 
 
 def cmd_changes(args: argparse.Namespace) -> int:
@@ -272,7 +311,7 @@ def cmd_changes(args: argparse.Namespace) -> int:
     since = utcnow() - args.since if args.since else None
     with open_db(args.db) as conn:
         changes = list_title_changes(conn, since=since, source=args.source, limit=args.limit)
-    output_changes(changes, args.format, sys.stdout)
+    output_changes(changes, args.format, sys.stdout, utc=args.utc)
     return EXIT_OK
 
 
@@ -302,7 +341,9 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _render_sources(statuses: list[SourceStatus], config: Config, fmt: str) -> None:
+def _render_sources(
+    statuses: list[SourceStatus], config: Config, fmt: str, *, utc: bool = False
+) -> None:
     by_name = {source.name: source for source in config.sources}
     if fmt == "json":
         payload = [
@@ -322,8 +363,9 @@ def _render_sources(statuses: list[SourceStatus], config: Config, fmt: str) -> N
         sys.stdout.write("\n")
         return
 
+    successes, zone = time_column([status.last_success for status in statuses], utc=utc)
     rows = []
-    for status in statuses:
+    for status, when in zip(statuses, successes, strict=True):
         source = by_name[status.name]
         rows.append(
             [
@@ -331,13 +373,13 @@ def _render_sources(statuses: list[SourceStatus], config: Config, fmt: str) -> N
                 source.type,
                 "yes" if source.enabled else "no",
                 str(status.total_items),
-                _format_dt(status.last_success),
+                when,
                 status.last_status or "never fetched",
             ]
         )
     render_table(
         rows,
-        ["NAME", "TYPE", "ENABLED", "ITEMS", "LAST SUCCESS", "LAST STATUS"],
+        ["NAME", "TYPE", "ENABLED", "ITEMS", f"LAST SUCCESS ({zone})", "LAST STATUS"],
         sys.stdout,
     )
 
@@ -346,7 +388,7 @@ def cmd_sources(args: argparse.Namespace, config: Config) -> int:
     """List configured sources with their last fetch state."""
     with open_db(args.db) as conn:
         statuses = source_status(conn, [source.name for source in config.sources])
-    _render_sources(statuses, config, args.format)
+    _render_sources(statuses, config, args.format, utc=args.utc)
     return EXIT_OK
 
 
@@ -372,6 +414,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_DB_PATH,
         metavar="PATH",
         help="SQLite database path (default: %(default)s)",
+    )
+    common.add_argument(
+        "--utc",
+        action="store_true",
+        help="show table times in UTC instead of local time (JSON and CSV are always UTC)",
     )
     verbosity = common.add_mutually_exclusive_group()
     verbosity.add_argument("-v", "--verbose", action="store_true", help="log at DEBUG level")

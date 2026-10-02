@@ -122,7 +122,16 @@ headliner list --since 6h --format json 2>/dev/null | jq '.[].title'
 | `headliner migrate` | Upgrade the database schema (runs automatically; `--dry-run` previews) |
 
 Shared flags: `--sources PATH` (default `sources.yaml`), `--db PATH` (default
-`headlines.db`), `--verbose` for DEBUG logging, `--quiet` for errors only.
+`headlines.db`), `--utc` for UTC times in tables, `--verbose` for DEBUG logging,
+`--quiet` for errors only.
+
+**Times.** Everything is stored in UTC. Table output shows local time, taken from
+`TZ` or the system timezone, and names the zone in the column header, e.g.
+`PUBLISHED (AWST)`. `--utc` shows UTC instead, and `TZ=Europe/Dublin headliner
+list` shows any other zone. If a column spans a daylight-saving change, the header
+says `local` and each time carries its own abbreviation. JSON and CSV output
+always use UTC ISO-8601 timestamps (`…+00:00`), whatever the display settings.
+`--since` is a duration, so it doesn't depend on the timezone.
 
 **`fetch`**
 

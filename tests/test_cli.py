@@ -6,13 +6,22 @@ import csv
 import io
 import json
 import sqlite3
+import time
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
 import pytest
 import respx
-from headliner.cli import EXIT_FATAL, EXIT_OK, EXIT_PARTIAL_FAILURE, main, parse_duration
+from headliner.cli import (
+    EXIT_FATAL,
+    EXIT_OK,
+    EXIT_PARTIAL_FAILURE,
+    main,
+    parse_duration,
+    time_column,
+)
 from headliner.models import Headline
 from headliner.store import connect, insert_headlines
 
@@ -449,3 +458,140 @@ def test_migrate_applies_the_upgrade(tmp_path: Path, capsys: pytest.CaptureFixtu
 
 def test_migrate_without_a_database_exits_two(tmp_path: Path) -> None:
     assert main(["migrate", "--db", str(tmp_path / "missing.db"), "--quiet"]) == EXIT_FATAL
+
+
+# --------------------------------------------------------------------------
+# time display: local by default, UTC on request, machine formats always UTC
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def local_tz(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[str], None]]:
+    """Switch the process timezone for one test, restoring it afterwards."""
+
+    def use(name: str) -> None:
+        monkeypatch.setenv("TZ", name)
+        time.tzset()
+
+    yield use
+    monkeypatch.undo()
+    time.tzset()
+
+
+def test_time_column_shows_local_time_with_zone(local_tz: Callable[[str], None]) -> None:
+    local_tz("Australia/Perth")
+    cells, zone = time_column(
+        [datetime(2026, 10, 2, 11, 48, tzinfo=UTC), datetime(2026, 10, 2, 20, 0, tzinfo=UTC), None],
+        utc=False,
+    )
+    assert zone == "AWST"
+    # 20:00 UTC is the next morning in Perth.
+    assert cells == ["2026-10-02 19:48", "2026-10-03 04:00", "-"]
+
+
+def test_time_column_utc_option(local_tz: Callable[[str], None]) -> None:
+    local_tz("Australia/Perth")
+    cells, zone = time_column([datetime(2026, 10, 2, 11, 48, tzinfo=UTC)], utc=True)
+    assert (cells, zone) == (["2026-10-02 11:48"], "UTC")
+
+
+def test_time_column_across_daylight_saving_labels_each_cell(
+    local_tz: Callable[[str], None],
+) -> None:
+    local_tz("Australia/Sydney")
+    cells, zone = time_column(
+        [datetime(2026, 1, 15, 0, 0, tzinfo=UTC), datetime(2026, 7, 15, 0, 0, tzinfo=UTC)],
+        utc=False,
+    )
+    assert zone == "local"
+    assert cells == ["2026-01-15 11:00 AEDT", "2026-07-15 10:00 AEST"]
+
+
+def test_time_column_with_no_dates_still_names_the_zone(
+    local_tz: Callable[[str], None],
+) -> None:
+    local_tz("Australia/Perth")
+    assert time_column([None], utc=False) == (["-"], "AWST")
+
+
+def seed_at(db_path: Path, published_at: datetime) -> None:
+    conn = connect(db_path)
+    insert_headlines(
+        conn,
+        [
+            Headline.create(
+                source="Example Wire",
+                title="Ferry service restored following repairs",
+                url="https://example.org/ferry",
+                published_at=published_at,
+            )
+        ],
+    )
+    conn.close()
+
+
+def test_list_table_is_local_by_default_and_utc_on_request(
+    config_path: Path,
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    local_tz: Callable[[str], None],
+) -> None:
+    local_tz("Australia/Perth")
+    seed_at(db_path, datetime.now(UTC).replace(hour=11, minute=48, second=0, microsecond=0))
+    base = ["list", "--sources", str(config_path), "--db", str(db_path), "--quiet"]
+
+    assert main(base) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "PUBLISHED (AWST)" in out
+    assert " 19:48 " in out
+
+    assert main([*base, "--utc"]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "PUBLISHED (UTC)" in out
+    assert " 11:48 " in out
+
+
+def test_machine_formats_stay_utc_in_any_timezone(
+    config_path: Path,
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    local_tz: Callable[[str], None],
+) -> None:
+    local_tz("Australia/Perth")
+    published = datetime(2026, 10, 2, 11, 48, tzinfo=UTC)
+    seed_at(db_path, published)
+    base = ["list", "--sources", str(config_path), "--db", str(db_path), "--quiet"]
+
+    assert main([*base, "--format", "json"]) == EXIT_OK
+    [item] = json.loads(capsys.readouterr().out)
+    assert item["published_at"] == "2026-10-02T11:48:00+00:00"
+
+    assert main([*base, "--format", "csv"]) == EXIT_OK
+    [row] = list(csv.DictReader(io.StringIO(capsys.readouterr().out)))
+    assert row["published_at"] == "2026-10-02T11:48:00+00:00"
+
+
+@respx.mock
+def test_changes_and_sources_tables_label_the_zone(
+    config_path: Path,
+    db_path: Path,
+    feed_body: bytes,
+    capsys: pytest.CaptureFixture[str],
+    local_tz: Callable[[str], None],
+) -> None:
+    local_tz("Australia/Perth")
+    args = ["fetch", "--sources", str(config_path), "--db", str(db_path), "--quiet"]
+    mock_feed(feed_body)
+    main(args)
+    mock_feed(feed_body.replace(b"long-delayed housing bill", b"housing bill after long delay"))
+    main(args)
+    capsys.readouterr()
+
+    assert main(["changes", "--db", str(db_path), "--quiet"]) == EXIT_OK
+    assert "CHANGED (AWST)" in capsys.readouterr().out
+    assert main(["changes", "--db", str(db_path), "--quiet", "--utc"]) == EXIT_OK
+    assert "CHANGED (UTC)" in capsys.readouterr().out
+
+    sources = ["sources", "--sources", str(config_path), "--db", str(db_path), "--quiet"]
+    assert main(sources) == EXIT_OK
+    assert "LAST SUCCESS (AWST)" in capsys.readouterr().out
