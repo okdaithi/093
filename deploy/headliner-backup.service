@@ -1,0 +1,27 @@
+[Unit]
+Description=Back up the headliner database
+# Never run alongside a fetch: the backup API copes, but there is no need.
+After=headliner.service
+
+[Service]
+Type=oneshot
+User=headliner
+Group=headliner
+StateDirectory=headliner
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/headliner
+# Verified copies in /var/lib/headliner/backups, mode 0600; keeps the newest of
+# each of the last 7 days and 4 weeks.
+ExecStart=/opt/headliner/venv/bin/headliner backup --db /var/lib/headliner/headlines.db
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=

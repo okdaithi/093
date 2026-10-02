@@ -119,7 +119,22 @@ The viewer opens the database read-only, so it can't change it, and only answers
 requests, under a strict Content-Security-Policy. Article links open in a new tab
 without sending a referrer. It needs no packages beyond headliner's own.
 `/healthz` returns JSON (`status`, `schema`, `articles`, `last_fetch`) for
-monitoring.
+monitoring. `/api/status` returns everything a status check needs, readable
+without access to the database:
+- `status`: `ok`, or `attention` with the reasons listed in `checks`. Reasons
+  include a run that is late or had failures, sources that need attention, and
+  missing or stale backups.
+- the last 8 runs
+- per-source states, plus details for any source that isn't `ok`
+- database size and counts
+- the newest backup
+
+Sources that are only `skipped` (by robots.txt) are listed, but don't count
+towards `attention`.
+
+```bash
+curl -s https://<host>:8444/api/status | python3 -m json.tool
+```
 
 Run it locally against any database:
 
@@ -146,6 +161,32 @@ sudo tailscale serve --bg --https 8444 http://127.0.0.1:8090
 To keep it off the home network and serve it only through Tailscale, change
 `--host 0.0.0.0` to `--host 127.0.0.1` with `sudo systemctl edit --full
 headliner-web.service`. Logs: `journalctl -u headliner-web.service`.
+
+## Backups
+
+Title history can't be fetched again, so back the database up.
+`headliner backup` uses SQLite's online backup API, which takes a consistent
+snapshot even while a fetch is writing. Each copy is:
+- private (mode 0600) from its first byte
+- checked with `PRAGMA integrity_check` before it is renamed into place, so a
+  half-written or corrupt file is never mistaken for a backup
+
+By default copies go into `backups/` next to the database, named
+`headlines-<UTC time>.db`. The newest copy from each of the last 7 days and
+the last 4 weeks is kept (`--keep-daily`, `--keep-weekly`); others are deleted.
+
+On the server, the installer adds `headliner-backup.timer`, which runs daily at
+03:30, and enables it once `headliner.timer` is enabled. Backups land in
+`/var/lib/headliner/backups/`. They protect against corruption and bad
+upgrades, not against losing the disk; copy them elsewhere if that matters.
+To restore:
+
+```bash
+sudo systemctl stop headliner.timer headliner-web.service
+sudo -u headliner cp /var/lib/headliner/backups/headlines-<time>.db /var/lib/headliner/headlines.db
+sudo rm -f /var/lib/headliner/headlines.db-wal /var/lib/headliner/headlines.db-shm
+sudo systemctl start headliner.timer headliner-web.service
+```
 
 ## Quickstart
 
@@ -194,6 +235,7 @@ headliner list --since 6h --format json 2>/dev/null | jq '.[].title'
 | `headliner discover URL...` | Find each site's RSS/Atom feed and print source entries to paste (see [Adding sources](#adding-sources)) |
 | `headliner stories` | Stories reported by several outlets, most widely covered first (see [Stories](#stories)) |
 | `headliner web` | Serve a read-only web viewer (see [Web viewer](#web-viewer)) |
+| `headliner backup` | Copy the database to a verified, private backup and prune old ones (see [Backups](#backups)) |
 
 Shared flags: `--sources PATH` (default `sources.yaml`), `--db PATH` (default
 `headlines.db`), `--utc` for UTC times in tables, `--verbose` for DEBUG logging,

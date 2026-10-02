@@ -468,3 +468,34 @@ def test_header_totals_are_cached_until_data_changes(db_path: Path, config_path:
         )
         conn.commit()
     assert "5 articles" in get("/")[2]
+
+
+def test_api_status_reports_runs_sources_and_backups(db_path: Path, config_path: Path) -> None:
+    get = make_client(WebApp(db_path, config_path))
+    status, headers, body = get("/api/status")
+    assert status == "200 OK" and headers["Content-Type"] == "application/json"
+    payload = json.loads(body)
+    assert payload["status"] == "attention"
+    assert "no backups" in payload["checks"]
+    assert "last run: 1 source(s) failed" in payload["checks"]
+    assert payload["schema"] == SCHEMA_VERSION
+    assert payload["database"]["articles"] == 4
+    assert payload["runs"][0]["failed_sources"] == ["Other Daily"]
+    assert payload["sources"]["configured"] == 3
+    assert {p["name"]: p["state"] for p in payload["problems"]} == {
+        "Other Daily": "failed",
+        "Quiet Times": "never fetched",
+    }
+
+    from headliner.backup import take_backup
+
+    take_backup(db_path, db_path.parent / "backups")
+    payload = json.loads(get("/api/status")[2])
+    assert payload["backups"]["count"] == 1
+    assert "no backups" not in payload["checks"]
+
+
+def test_api_status_without_database(tmp_path: Path, config_path: Path) -> None:
+    status, _, body = make_client(WebApp(tmp_path / "absent.db", config_path))("/api/status")
+    assert status == "503 Service Unavailable"
+    assert json.loads(body)["status"] == "error"
