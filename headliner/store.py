@@ -1265,3 +1265,160 @@ def totals(conn: sqlite3.Connection) -> Totals:
         live=int(live),
         last_fetch=_parse_iso(last),
     )
+
+
+# --- Trends ------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class FirstSeen:
+    """When an article was first stored, for per-day counts."""
+
+    source: str
+    fetched_at: datetime
+    is_live: bool
+
+
+def first_seen(conn: sqlite3.Connection, *, since: datetime) -> list[FirstSeen]:
+    """Every article first stored since `since`, oldest first."""
+    with closing(
+        conn.execute(
+            "SELECT source, fetched_at, is_live FROM headlines WHERE fetched_at >= ?"
+            " ORDER BY fetched_at",
+            (_iso(since),),
+        )
+    ) as cursor:
+        rows = []
+        for row in cursor.fetchall():
+            when = _parse_iso(row["fetched_at"])
+            if when is not None:
+                rows.append(FirstSeen(row["source"], when, bool(row["is_live"])))
+        return rows
+
+
+@dataclass(frozen=True, slots=True)
+class RewriteStat:
+    """How often one outlet rewrites its headlines, live blogs excluded."""
+
+    source: str
+    articles: int
+    rewritten: int
+    # From first seen to the first rewrite that changed words, per rewritten article.
+    delays: tuple[timedelta, ...]
+
+    @property
+    def share(self) -> float:
+        return self.rewritten / self.articles if self.articles else 0.0
+
+    @property
+    def median_delay(self) -> timedelta | None:
+        if not self.delays:
+            return None
+        ordered = sorted(self.delays)
+        middle = len(ordered) // 2
+        if len(ordered) % 2:
+            return ordered[middle]
+        return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def rewrite_stats(conn: sqlite3.Connection, *, since: datetime) -> list[RewriteStat]:
+    """Per source, of articles first seen since `since`: how many were reworded, and how soon.
+
+    Minor rewrites (case, punctuation, spacing) do not count.
+    """
+    with closing(
+        conn.execute(
+            """
+            SELECT h.id, h.source, r.title, r.seen_at
+            FROM headlines h JOIN headline_revisions r ON r.headline_id = h.id
+            WHERE h.fetched_at >= ? AND h.is_live = 0
+            ORDER BY h.id, r.seen_at, r.id
+            """,
+            (_iso(since),),
+        )
+    ) as cursor:
+        rows = cursor.fetchall()
+
+    articles: dict[str, int] = {}
+    rewritten: dict[str, int] = {}
+    delays: dict[str, list[timedelta]] = {}
+    current = None
+    first_title = ""
+    first_at: datetime | None = None
+    done = False
+    for row in rows:
+        source = row["source"]
+        if row["id"] != current:
+            current, done = row["id"], False
+            first_title, first_at = row["title"], _parse_iso(row["seen_at"])
+            articles[source] = articles.get(source, 0) + 1
+            continue
+        if done or is_minor_change(first_title, row["title"]):
+            continue
+        done = True
+        rewritten[source] = rewritten.get(source, 0) + 1
+        seen = _parse_iso(row["seen_at"])
+        if seen is not None and first_at is not None:
+            delays.setdefault(source, []).append(seen - first_at)
+    return [
+        RewriteStat(
+            source=source,
+            articles=count,
+            rewritten=rewritten.get(source, 0),
+            delays=tuple(delays.get(source, [])),
+        )
+        for source, count in articles.items()
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class Turnover:
+    """One source's fetch history: reliability and how much of its feed is new each run."""
+
+    source: str
+    ok: int
+    failed: int
+    skipped: int
+    found: int
+    new: int
+    # Successful runs where every item in the feed was new: stories that came
+    # and went between those runs were probably missed.
+    all_new: int
+
+    @property
+    def share_new(self) -> float:
+        return self.new / self.found if self.found else 0.0
+
+
+def feed_turnover(conn: sqlite3.Connection, *, since: datetime) -> list[Turnover]:
+    """Per source, over fetch runs since `since`; each source's first-ever run is left out
+    (everything is new then)."""
+    with closing(
+        conn.execute(
+            """
+            SELECT source, status, items_found, items_new FROM fetch_log
+            WHERE started_at >= ?
+              AND id NOT IN (SELECT MIN(id) FROM fetch_log GROUP BY source COLLATE NOCASE)
+            """,
+            (_iso(since),),
+        )
+    ) as cursor:
+        rows = cursor.fetchall()
+    stats: dict[str, dict[str, int]] = {}
+    for row in rows:
+        entry = stats.setdefault(
+            row["source"],
+            {"ok": 0, "failed": 0, "skipped": 0, "found": 0, "new": 0, "all_new": 0},
+        )
+        status = row["status"]
+        if status == "ok":
+            entry["ok"] += 1
+            found, new = int(row["items_found"]), int(row["items_new"])
+            entry["found"] += found
+            entry["new"] += new
+            entry["all_new"] += int(found > 0 and new >= found)
+        elif status == "error":
+            entry["failed"] += 1
+        else:
+            entry["skipped"] += 1
+    return [Turnover(source=source, **entry) for source, entry in stats.items()]

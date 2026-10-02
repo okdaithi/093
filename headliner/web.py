@@ -17,6 +17,7 @@ import difflib
 import html
 import json
 import logging
+import math
 import re
 import socketserver
 import sqlite3
@@ -40,11 +41,14 @@ from headliner.store import (
     TitleChange,
     article_history,
     connect_readonly,
+    feed_turnover,
+    first_seen,
     hidden_changes,
     list_headlines,
     list_title_changes,
     recent_runs,
     revision_counts,
+    rewrite_stats,
     schema_version,
     search_headlines,
     search_history,
@@ -81,6 +85,8 @@ STORY_WINDOWS: Final = {
 # The window behind "N outlets" badges and /story links.
 STORY_LINK_WINDOW: Final = "3d"
 STORIES_PAGE_SIZE: Final = 30
+TREND_WINDOWS: Final = {"7d": 7, "14d": 14, "30d": 30}
+HEAT_LEVELS: Final = 5
 
 SECURITY_HEADERS: Final = [
     (
@@ -317,6 +323,7 @@ class WebApp:
             "/article": self.page_article,
             "/stories": self.page_stories,
             "/story": self.page_story,
+            "/trends": self.page_trends,
         }
         self._story_cache: dict[tuple[object, ...], list[Story]] = {}
         self._story_lock = threading.Lock()
@@ -485,6 +492,7 @@ class WebApp:
                 ("/stories", "Stories"),
                 ("/rewrites", "Rewrites"),
                 ("/search", "Search"),
+                ("/trends", "Trends"),
                 ("/sources", "Sources"),
             )
         )
@@ -1258,6 +1266,203 @@ Headlines are grouped by shared words, so the occasional grouping is wrong.</p>
             count=len(story.headlines),
             members=self.story_members(request, conn, story),
         )
+
+    # -- Trends
+
+    def page_trends(self, request: Request, conn: sqlite3.Connection) -> Markup:
+        filters = self.filters(request)
+        window = request.get("since", "7d")
+        if window not in TREND_WINDOWS:
+            window = "7d"
+        clock = Clock(request.utc)
+        days = TREND_WINDOWS[window]
+        today = clock.shown(utcnow()).date()
+        day_list = [today - timedelta(days=offset) for offset in range(days - 1, -1, -1)]
+        start_local = datetime.combine(day_list[0], datetime.min.time())
+        start_local = start_local.replace(tzinfo=clock.shown(utcnow()).tzinfo)
+        since = start_local.astimezone(UTC)
+        wanted = {name.casefold() for name in filters.named} if filters.named is not None else None
+
+        def keep(source: str) -> bool:
+            return wanted is None or source.casefold() in wanted
+
+        # Articles per source per local day, and live blogs per day.
+        per_day: dict[str, Counter[Any]] = {}
+        live_per_day: Counter[Any] = Counter()
+        for row in first_seen(conn, since=since):
+            if not keep(row.source):
+                continue
+            day = clock.shown(row.fetched_at).date()
+            per_day.setdefault(row.source, Counter())[day] += 1
+            live_per_day[day] += int(row.is_live)
+        heat = self.heatmap(request, per_day, live_per_day, day_list)
+
+        stats = sorted(
+            (stat for stat in rewrite_stats(conn, since=since) if keep(stat.source)),
+            key=lambda stat: (stat.share, stat.rewritten),
+            reverse=True,
+        )
+        rewrite_rows = join(
+            render(
+                """<tr><td><a href="{h}">{source}</a></td><td class="num">{articles}</td>
+<td class="num">{rewritten}</td><td><span class="barwrap">{bar}<span>{pct}</span></span></td>
+<td class="num">{delay}</td></tr>""",
+                h=self.link(request, "/rewrites", source=stat.source, tag=None),
+                source=stat.source,
+                articles=stat.articles,
+                rewritten=stat.rewritten,
+                bar=bar(stat.share),
+                pct=f"{stat.share:.0%}",
+                delay=_duration(stat.median_delay),
+            )
+            for stat in stats
+        )
+
+        turnover = sorted(
+            (row for row in feed_turnover(conn, since=since) if keep(row.source)),
+            key=lambda row: (row.share_new, row.all_new),
+            reverse=True,
+        )
+        turnover_rows = join(
+            render(
+                """<tr><td>{source}</td><td class="num">{ok}</td>
+<td class="num {fcss}">{failed}</td><td class="num">{skipped}</td>
+<td class="num">{per_run}</td><td><span class="barwrap">{bar}<span>{pct}</span></span></td>
+<td class="num {acss}">{all_new}</td></tr>""",
+                source=row.source,
+                ok=row.ok,
+                failed=row.failed,
+                fcss="bad" if row.failed else "",
+                skipped=row.skipped,
+                per_run=f"{row.found / row.ok:.0f}" if row.ok else "-",
+                bar=bar(row.share_new),
+                pct=f"{row.share_new:.0%}" if row.ok else "-",
+                all_new=row.all_new,
+                acss="warn" if row.ok and row.all_new * 2 >= row.ok else "",
+            )
+            for row in turnover
+        )
+        return render(
+            """<h1>Trends</h1>
+{form}
+<h2>Articles per day</h2>
+<p class="muted">New articles by the day they were first fetched ({zone}). Darker is more.</p>
+{heat}
+<h2>Rewrites by outlet</h2>
+<p class="muted">Of the articles first seen in this period (live blogs excluded), how many
+were reworded later. Punctuation-only changes don't count. The delay is from when the article
+was first fetched to when the new wording was, so it can't be shorter than the time between
+fetch runs.</p>
+<div class="scroll"><table>
+<thead><tr><th>Source</th><th class="num">Articles</th><th class="num">Rewritten</th>
+<th>Share</th><th class="num">Median delay</th></tr></thead>
+<tbody>{rewrite_rows}</tbody></table></div>
+<h2>Feed turnover and reliability</h2>
+<p class="muted">How much of each feed is new at each run. A feed that is entirely new run
+after run (<span class="warn">highlighted</span> when it happens in half the runs or more) is
+probably dropping stories between runs, so fetching more often would catch more. Each
+source's first-ever run is left out.</p>
+<div class="scroll"><table>
+<thead><tr><th>Source</th><th class="num">OK</th><th class="num">Failed</th>
+<th class="num">Skipped</th><th class="num">Items/run</th><th>New per run</th>
+<th class="num">Runs all new</th></tr></thead>
+<tbody>{turnover_rows}</tbody></table></div>""",
+            form=self.filter_form(
+                request,
+                filters,
+                since=None,
+                extra=render(
+                    '<label>Period <select name="since">{o}</select></label>',
+                    o=join(
+                        render(
+                            '<option value="{v}"{s}>last {v}</option>',
+                            v=key,
+                            s=Markup(" selected") if key == window else EMPTY,
+                        )
+                        for key in TREND_WINDOWS
+                    ),
+                ),
+            ),
+            zone=clock.zone,
+            heat=heat,
+            rewrite_rows=rewrite_rows or Markup('<tr><td colspan="5">No articles yet.</td></tr>'),
+            turnover_rows=turnover_rows
+            or Markup('<tr><td colspan="7">No runs logged yet.</td></tr>'),
+        )
+
+    def heatmap(
+        self,
+        request: Request,
+        per_day: dict[str, Counter[Any]],
+        live_per_day: Counter[Any],
+        days: list[Any],
+    ) -> Markup:
+        if not per_day:
+            return Markup('<p class="empty">No articles in this period.</p>')
+        peak = max(count for counts in per_day.values() for count in counts.values())
+        totals_by_day: Counter[Any] = Counter()
+        for counts in per_day.values():
+            totals_by_day.update(counts)
+
+        def cell(count: int) -> Markup:
+            level = 0 if count == 0 else max(1, math.ceil(HEAT_LEVELS * count / peak))
+            return render('<td class="heat h{l}" title="{n}">{n}</td>', l=level, n=count or "")
+
+        ordered = sorted(per_day.items(), key=lambda item: -sum(item[1].values()))
+        rows = join(
+            render(
+                '<tr><th scope="row"><a href="{h}">{source}</a></th>{cells}'
+                '<td class="num">{total}</td></tr>',
+                h=self.link(request, "/", source=source, tag=None),
+                source=source,
+                cells=join(cell(counts.get(day, 0)) for day in days),
+                total=sum(counts.values()),
+            )
+            for source, counts in ordered
+        )
+        head = join(
+            render(
+                '<th class="day" title="{full}">{d}</th>',
+                full=day.isoformat(),
+                d=day.strftime("%a %-d"),
+            )
+            for day in days
+        )
+        footer = render(
+            '<tr class="sum"><th scope="row">All sources</th>{t}<td class="num">{all}</td></tr>'
+            '<tr class="sum"><th scope="row">of which live blogs</th>{l}'
+            '<td class="num">{lt}</td></tr>',
+            t=join(render('<td class="num">{n}</td>', n=totals_by_day.get(day, 0)) for day in days),
+            all=sum(totals_by_day.values()),
+            l=join(render('<td class="num">{n}</td>', n=live_per_day.get(day, 0)) for day in days),
+            lt=sum(live_per_day.values()),
+        )
+        return render(
+            '<div class="scroll"><table class="heatmap"><thead><tr><th>Source</th>{head}'
+            '<th class="num">Total</th></tr></thead><tbody>{rows}</tbody><tfoot>{footer}</tfoot>'
+            "</table></div>",
+            head=head,
+            rows=rows,
+            footer=footer,
+        )
+
+
+def bar(share: float) -> Markup:
+    """A small horizontal bar for a 0..1 share, as inline SVG (no inline CSS needed)."""
+    width = max(0.0, min(1.0, share)) * 100
+    return render(
+        '<svg class="bar" viewBox="0 0 100 8" preserveAspectRatio="none" aria-hidden="true">'
+        '<rect class="track" width="100" height="8"/><rect class="fill" width="{w}" height="8"/>'
+        "</svg>",
+        w=f"{width:.1f}",
+    )
+
+
+def _duration(value: timedelta | None) -> str:
+    if value is None:
+        return "-"
+    hours = value.total_seconds() / 3600
+    return f"{hours:.0f} h" if hours < 48 else f"{hours / 24:.1f} d"
 
 
 class _ReadOnly:
