@@ -107,7 +107,7 @@ merged, so check the diff if you have them.
 | **Rewrites** | Each title change as a word-level diff (removed words struck through, added words highlighted), with the old title underneath. Live blogs and minor (punctuation-only) changes are hidden by default, as in `changes`; the page says how many of each were hidden and lets you show them. |
 | **Search** | Full-text search over current titles and summaries, with matches highlighted. Tick *Include earlier titles* to search every version (like `search --history`). |
 | **Trends** | Over 7, 14 or 30 days: **articles per day** per source (heatmap by local day, with totals and live blogs); **rewrites by outlet**, meaning the share of each outlet's articles that were later reworded (punctuation-only changes and live blogs excluded) and the median delay; **feed turnover and reliability**, meaning ok/failed/skipped runs, items per run, how much of each feed is new per run, and how many runs were entirely new. A feed that is entirely new run after run is likely dropping stories between runs, so fetching more often would help. Each source's first-ever run is left out. |
-| **Sources** | Each source's tags, item count, last success and last run status: `ok`, `failed` (with the error), `skipped`, `stale` (no success in 13 hours) or `never fetched`. Below it, the last 12 runs with their ok/skipped/failed counts and new and retitled items. |
+| **Sources** | Each source's tags, item count, last success and last run status: `ok`, `failed` (with the error), `skipped`, `stale` (no success in 13 hours), `content stale` (fetches fine, but the newest item is over 3 days old: the publisher has probably frozen the feed) or `never fetched`. Below it, the last 12 runs with their ok/skipped/failed counts and new and retitled items. |
 | **Article** | Every title one article has carried, oldest first, each diffed against the one before. Reached from "N titles" or "all titles". |
 
 Every list filters by tag (any of those ticked), source and time window, and
@@ -614,6 +614,15 @@ make every BBC article look new. The upgrade:
    oldest, moves the other's title history onto it and keeps the latest title,
 3. recomputes content hashes, which include the URL, for every row and revision,
 4. builds the search index over title history.
+
+Version 4 stores, on each revision, the title it replaced (`prev_title`) and
+whether the change was minor (`is_minor`). Rewrite queries become plain indexed
+filters instead of a window function over the whole history: on 100,000
+revisions the Rewrites page drops from about 3 seconds to 0.16. It also adds
+`fetch_log.newest_item`, the newest publication date in each fetched feed, so
+feeds that stop updating can be spotted (see the Sources page). The upgrade
+only adds columns derived from stored data, so no backup is taken; it takes
+about 4 seconds per 100,000 revisions.
 
 To see what an upgrade will do first:
 

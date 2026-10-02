@@ -17,7 +17,6 @@ from headliner.models import (
     is_minor_change,
     looks_live,
     normalise_url,
-    title_key,
     to_utc,
     utcnow,
 )
@@ -29,8 +28,10 @@ DEFAULT_DB_PATH: Final = Path("headlines.db")
 # Stored in `PRAGMA user_version`. 0 is the original layout (dedup on URL and
 # title); 1 keys `headlines` on URL and keeps titles in `headline_revisions`;
 # 2 adds `headlines.is_live` for live blogs; 3 re-normalises stored URLs (BBC
-# `at_*` tracking parameters) and indexes `headline_revisions` for search.
-SCHEMA_VERSION: Final = 3
+# `at_*` tracking parameters) and indexes `headline_revisions` for search; 4
+# stores each revision's previous title and whether the change was minor, so
+# rewrite queries are plain filters, and each fetch's newest item date.
+SCHEMA_VERSION: Final = 4
 
 _SCHEMA: Final = """
 CREATE TABLE IF NOT EXISTS headlines (
@@ -59,7 +60,9 @@ CREATE TABLE IF NOT EXISTS fetch_log (
     items_found  INTEGER NOT NULL DEFAULT 0,
     items_new    INTEGER NOT NULL DEFAULT 0,
     error        TEXT,
-    items_changed INTEGER NOT NULL DEFAULT 0
+    items_changed INTEGER NOT NULL DEFAULT 0,
+    -- Newest publication date in the feed at this run; NULL when undated.
+    newest_item  TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_fetch_log_source ON fetch_log(source, finished_at DESC);
@@ -73,6 +76,10 @@ CREATE TABLE IF NOT EXISTS headline_revisions (
     summary       TEXT,
     content_hash  TEXT    NOT NULL,
     seen_at       TEXT    NOT NULL,
+    -- The title of the revision before this one (by seen_at, id); NULL for the first.
+    prev_title    TEXT,
+    -- 1 when only case, punctuation or spacing differ from prev_title (`title_key`).
+    is_minor      INTEGER NOT NULL DEFAULT 0,
     UNIQUE (headline_id, content_hash)
 );
 
@@ -184,6 +191,8 @@ class SourceStatus:
     last_success: datetime | None
     last_status: str | None
     last_error: str | None
+    # Newest publication date seen in the feed at the last successful run.
+    newest_item: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,6 +242,7 @@ class UpgradePlan:
     live_articles: int = 0
     urls_normalised: int = 0
     rows_folded: int = 0
+    revisions_linked: int = 0
 
     @property
     def needed(self) -> bool:
@@ -294,6 +304,11 @@ def upgrade_plan(conn: sqlite3.Connection) -> UpgradePlan:
         targets, groups = _normalisation_plan(conn)
         urls_normalised = sum(1 for _, (old, new) in targets.items() if old != new)
         rows_folded = sum(len({targets[i][0] for i in ids}) - 1 for ids in groups.values())
+    revisions_linked = 0
+    if version < 4 and _table_exists(conn, "headline_revisions"):
+        revisions_linked = int(
+            conn.execute("SELECT COUNT(*) FROM headline_revisions").fetchone()[0]
+        )
     return UpgradePlan(
         version,
         SCHEMA_VERSION,
@@ -303,6 +318,7 @@ def upgrade_plan(conn: sqlite3.Connection) -> UpgradePlan:
         live_articles,
         urls_normalised,
         rows_folded,
+        revisions_linked,
     )
 
 
@@ -455,6 +471,60 @@ def _upgrade_to_v3(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _add_missing_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    present = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    for name, definition in columns.items():
+        if name not in present:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+
+def _upgrade_to_v4(conn: sqlite3.Connection) -> None:
+    """Store each revision's previous title and minor flag; add `fetch_log.newest_item`.
+
+    Before v4 these were derived on every query with a window function over
+    the whole history plus a Python call per row. Additive and derived from
+    data already stored, so no backup is taken.
+    """
+    count = int(conn.execute("SELECT COUNT(*) FROM headline_revisions").fetchone()[0])
+    if count:
+        logger.info("upgrading database: recording previous titles for %d revision(s)", count)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        _add_missing_columns(
+            conn,
+            "headline_revisions",
+            {"prev_title": "TEXT", "is_minor": "INTEGER NOT NULL DEFAULT 0"},
+        )
+        _add_missing_columns(conn, "fetch_log", {"newest_item": "TEXT"})
+        ids = [row[0] for row in conn.execute("SELECT id FROM headlines").fetchall()]
+        for headline_id in ids:
+            _link_revisions(conn, headline_id)
+        conn.execute("PRAGMA user_version = 4")
+    except BaseException:
+        conn.rollback()
+        raise
+    conn.commit()
+
+
+def _link_revisions(conn: sqlite3.Connection, headline_id: int) -> None:
+    """Set `prev_title` and `is_minor` on every revision of one article."""
+    previous: str | None = None
+    updates = []
+    for rev_id, title, stored_prev, stored_minor in conn.execute(
+        "SELECT id, title, prev_title, is_minor FROM headline_revisions"
+        " WHERE headline_id = ? ORDER BY seen_at, id",
+        (headline_id,),
+    ).fetchall():
+        minor = int(previous is not None and is_minor_change(previous, title))
+        if stored_prev != previous or stored_minor != minor:
+            updates.append((previous, minor, rev_id))
+        previous = title
+    if updates:
+        conn.executemany(
+            "UPDATE headline_revisions SET prev_title = ?, is_minor = ? WHERE id = ?", updates
+        )
+
+
 def _row_exists(conn: sqlite3.Connection, headline_id: int) -> bool:
     return (
         conn.execute("SELECT 1 FROM headlines WHERE id = ?", (headline_id,)).fetchone() is not None
@@ -543,12 +613,13 @@ def migrate(conn: sqlite3.Connection) -> None:
         _upgrade_to_v2(conn)
     if int(conn.execute("PRAGMA user_version").fetchone()[0]) < 3:
         _upgrade_to_v3(conn)
+    if int(conn.execute("PRAGMA user_version").fetchone()[0]) < 4:
+        _upgrade_to_v4(conn)
 
 
 def _prepare(conn: sqlite3.Connection) -> None:
-    """Row access by name, and `title_key` callable from SQL for minor-change filters."""
+    """Row access by name."""
     conn.row_factory = sqlite3.Row
-    conn.create_function("headliner_title_key", 1, title_key, deterministic=True)
 
 
 def connect(
@@ -593,8 +664,14 @@ def open_db(
         conn.close()
 
 
-def _add_revision(conn: sqlite3.Connection, headline_id: int, headline: Headline) -> bool:
-    """Record `headline`'s title for this article; False if it was seen before."""
+def _add_revision(
+    conn: sqlite3.Connection, headline_id: int, headline: Headline, *, first: bool = False
+) -> bool:
+    """Record `headline`'s title for this article; False if it was seen before.
+
+    Keeps `prev_title`/`is_minor` right for the whole article, even when the
+    new revision is not the latest by time (a feed reporting an older version).
+    """
     cursor = conn.execute(
         """
         INSERT OR IGNORE INTO headline_revisions
@@ -609,7 +686,10 @@ def _add_revision(conn: sqlite3.Connection, headline_id: int, headline: Headline
             _iso(headline.fetched_at),
         ),
     )
-    return cursor.rowcount == 1
+    added = cursor.rowcount == 1
+    if added and not first:
+        _link_revisions(conn, headline_id)
+    return added
 
 
 def store_headlines(conn: sqlite3.Connection, headlines: Iterable[Headline]) -> InsertResult:
@@ -649,7 +729,7 @@ def store_headlines(conn: sqlite3.Connection, headlines: Iterable[Headline]) -> 
                 )
                 headline_id = cursor.lastrowid
                 assert headline_id is not None
-                _add_revision(conn, headline_id, headline)
+                _add_revision(conn, headline_id, headline, first=True)
                 new += 1
                 continue
 
@@ -699,6 +779,7 @@ def record_fetch(
     items_new: int,
     items_changed: int = 0,
     error: str | None = None,
+    newest_item: datetime | None = None,
 ) -> None:
     """Append one row to `fetch_log`."""
     with conn:
@@ -706,8 +787,8 @@ def record_fetch(
             """
             INSERT INTO fetch_log
                 (source, started_at, finished_at, status, items_found, items_new,
-                 items_changed, error)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 items_changed, error, newest_item)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 source,
@@ -718,6 +799,7 @@ def record_fetch(
                 items_new,
                 items_changed,
                 error,
+                _iso(newest_item),
             ),
         )
 
@@ -803,12 +885,9 @@ def _changes_query(
 ) -> tuple[str, list[Any]]:
     """FROM/WHERE for `list_title_changes` and `count_title_changes`."""
     # A live blog's first headline is part of its timeline, so `only` keeps it.
-    clauses = [] if live == "only" else ["r.old_title IS NOT NULL"]
+    clauses = [] if live == "only" else ["r.prev_title IS NOT NULL"]
     if not minor:
-        clauses.append(
-            "(r.old_title IS NULL"
-            " OR headliner_title_key(r.old_title) <> headliner_title_key(r.title))"
-        )
+        clauses.append("r.is_minor = 0")
     params: list[Any] = []
     if live == "exclude":
         clauses.append("h.is_live = 0")
@@ -826,11 +905,7 @@ def _changes_query(
         params.extend(in_params)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     sql = f"""
-        FROM (
-            SELECT id, headline_id, title, seen_at,
-                   LAG(title) OVER (PARTITION BY headline_id ORDER BY seen_at, id) AS old_title
-            FROM headline_revisions
-        ) r
+        FROM headline_revisions r
         JOIN headlines h ON h.id = r.headline_id
         {where}
     """
@@ -862,7 +937,8 @@ def list_title_changes(
     with closing(
         conn.execute(
             f"""
-            SELECT h.source, h.url, h.is_live, r.seen_at, r.old_title, r.title {sql}
+            SELECT h.source, h.url, h.is_live, r.seen_at, r.prev_title, r.title, r.is_minor
+            {sql}
             ORDER BY r.seen_at {order}, r.id {order}
             LIMIT ? OFFSET ?
             """,
@@ -874,11 +950,10 @@ def list_title_changes(
                 source=row["source"],
                 url=row["url"],
                 changed_at=_parse_iso(row["seen_at"]),
-                old_title=row["old_title"],
+                old_title=row["prev_title"],
                 new_title=row["title"],
                 is_live=bool(row["is_live"]),
-                is_minor=row["old_title"] is not None
-                and is_minor_change(row["old_title"], row["title"]),
+                is_minor=bool(row["is_minor"]),
             )
             for row in cursor.fetchall()
         ]
@@ -1095,7 +1170,7 @@ def source_status(conn: sqlite3.Connection, names: Iterable[str]) -> list[Source
         ).fetchone()
         success_row = conn.execute(
             """
-            SELECT finished_at FROM fetch_log
+            SELECT finished_at, newest_item FROM fetch_log
             WHERE source = ? COLLATE NOCASE AND status = 'ok'
             ORDER BY finished_at DESC LIMIT 1
             """,
@@ -1114,6 +1189,7 @@ def source_status(conn: sqlite3.Connection, names: Iterable[str]) -> list[Source
                 name=name,
                 total_items=int(count_row["total"]) if count_row else 0,
                 last_success=_parse_iso(success_row["finished_at"]) if success_row else None,
+                newest_item=_parse_iso(success_row["newest_item"]) if success_row else None,
                 last_status=last_row["status"] if last_row else None,
                 last_error=last_row["error"] if last_row else None,
             )
@@ -1329,7 +1405,7 @@ def rewrite_stats(conn: sqlite3.Connection, *, since: datetime) -> list[RewriteS
     with closing(
         conn.execute(
             """
-            SELECT h.id, h.source, r.title, r.seen_at
+            SELECT h.id, h.source, r.seen_at, r.is_minor
             FROM headlines h JOIN headline_revisions r ON r.headline_id = h.id
             WHERE h.fetched_at >= ? AND h.is_live = 0
             ORDER BY h.id, r.seen_at, r.id
@@ -1343,17 +1419,16 @@ def rewrite_stats(conn: sqlite3.Connection, *, since: datetime) -> list[RewriteS
     rewritten: dict[str, int] = {}
     delays: dict[str, list[timedelta]] = {}
     current = None
-    first_title = ""
     first_at: datetime | None = None
     done = False
     for row in rows:
         source = row["source"]
         if row["id"] != current:
             current, done = row["id"], False
-            first_title, first_at = row["title"], _parse_iso(row["seen_at"])
+            first_at = _parse_iso(row["seen_at"])
             articles[source] = articles.get(source, 0) + 1
             continue
-        if done or is_minor_change(first_title, row["title"]):
+        if done or row["is_minor"]:
             continue
         done = True
         rewritten[source] = rewritten.get(source, 0) + 1

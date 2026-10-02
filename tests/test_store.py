@@ -991,3 +991,114 @@ def test_trend_queries(conn: sqlite3.Connection) -> None:
     assert (turnover.ok, turnover.failed, turnover.found, turnover.new) == (2, 1, 20, 14)
     assert turnover.all_new == 1
     assert turnover.share_new == 0.7
+
+
+# --- Schema v4: stored previous titles -----------------------------------------------
+
+REFERENCE_CHANGES = """
+    SELECT id, LAG(title) OVER (PARTITION BY headline_id ORDER BY seen_at, id) AS prev
+    FROM headline_revisions
+"""
+
+
+def assert_links_match_reference(conn: sqlite3.Connection) -> None:
+    """Stored prev_title/is_minor equal what the v3 window function derived."""
+    from headliner.models import is_minor_change
+
+    reference = {row[0]: row[1] for row in conn.execute(REFERENCE_CHANGES).fetchall()}
+    stored = conn.execute("SELECT id, title, prev_title, is_minor FROM headline_revisions")
+    for rev_id, title, prev, minor in stored.fetchall():
+        assert prev == reference[rev_id], rev_id
+        assert bool(minor) == (prev is not None and is_minor_change(prev, title)), rev_id
+
+
+def test_stored_links_match_window_function_on_messy_history(conn: sqlite3.Connection) -> None:
+    base = datetime(2026, 10, 1, tzinfo=UTC)
+    titles = [
+        "Minister says no to the harbour plan",
+        "Minister says 'no' to the harbour plan",  # minor
+        "Minister rejects the harbour plan",
+        "Minister says no to the harbour plan",  # flip back: no new revision
+        "Minister rejects harbour plan outright",
+    ]
+    for hours, title in enumerate(titles):
+        store_headlines(
+            conn,
+            [
+                Headline.create(
+                    source="Example Wire",
+                    title=title,
+                    url="https://example.org/plan",
+                    fetched_at=base + timedelta(hours=hours),
+                )
+            ],
+        )
+    # A feed reporting an older wording after a newer one (out-of-order seen_at).
+    store_headlines(
+        conn,
+        [
+            Headline.create(
+                source="Example Wire",
+                title="Early draft headline about the plan",
+                url="https://example.org/plan",
+                fetched_at=base - timedelta(hours=1),
+            )
+        ],
+    )
+    store_headlines(conn, [make_headline("Unrelated story stays single", "https://example.org/x")])
+
+    assert_links_match_reference(conn)
+    changes = list_title_changes(conn, oldest_first=True)
+    assert changes[0].old_title == "Early draft headline about the plan"
+    assert [change.is_minor for change in changes].count(True) == 1
+    assert count_title_changes(conn, minor=False) == len(changes) - 1
+
+
+def test_upgrade_from_v3_fills_links_and_freshness_column(tmp_path: Path) -> None:
+    path = tmp_path / "v3.db"
+    with closing(connect(path)) as conn:
+        store_headlines(conn, [make_headline("First wording of the story")])
+        store_headlines(conn, [make_headline("First wording of the story!")])
+        store_headlines(conn, [make_headline("Completely new wording now")])
+        record_fetch(
+            conn,
+            source="Example Wire",
+            started_at=utcnow(),
+            finished_at=utcnow(),
+            status="ok",
+            items_found=1,
+            items_new=1,
+        )
+        # Turn it back into a v3 database.
+        conn.execute("ALTER TABLE headline_revisions DROP COLUMN prev_title")
+        conn.execute("ALTER TABLE headline_revisions DROP COLUMN is_minor")
+        conn.execute("ALTER TABLE fetch_log DROP COLUMN newest_item")
+        conn.execute("PRAGMA user_version = 3")
+        conn.commit()
+
+    with closing(connect(path, migrate_schema=False)) as old:
+        plan = upgrade_plan(old)
+        assert (plan.from_version, plan.revisions_linked) == (3, 3)
+
+    with closing(connect(path)) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 4
+        assert_links_match_reference(conn)
+        assert [c.is_minor for c in list_title_changes(conn, oldest_first=True)] == [True, False]
+        assert conn.execute("SELECT newest_item FROM fetch_log").fetchone()[0] is None
+    assert not list(tmp_path.glob("*.bak"))  # additive: no backup
+
+
+def test_source_status_reports_newest_item(conn: sqlite3.Connection) -> None:
+    newest = datetime(2023, 4, 18, 22, 3, tzinfo=UTC)
+    record_fetch(
+        conn,
+        source="Example Wire",
+        started_at=utcnow(),
+        finished_at=utcnow(),
+        status="ok",
+        items_found=5,
+        items_new=0,
+        newest_item=newest,
+    )
+    [status] = source_status(conn, ["Example Wire"])
+    assert status.newest_item == newest
