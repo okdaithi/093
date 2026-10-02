@@ -29,7 +29,13 @@ install -d -o root -g root -m 0755 /opt/headliner
 python3 -m venv /opt/headliner/venv
 /opt/headliner/venv/bin/python -m pip install --upgrade pip
 /opt/headliner/venv/bin/python -m pip install -r "${repo_dir}/requirements.txt"
-/opt/headliner/venv/bin/python -m pip install --no-deps "${repo_dir}"
+# Build from a scratch copy: an in-tree build as root would leave root-owned
+# build/ and *.egg-info directories in the checkout, and a stale build/lib
+# could carry deleted modules into later installs.
+build_dir="$(mktemp -d)"
+trap 'rm -rf -- "${build_dir}"' EXIT
+cp -r "${repo_dir}/pyproject.toml" "${repo_dir}/README.md" "${repo_dir}/headliner" "${build_dir}/"
+/opt/headliner/venv/bin/python -m pip install --no-deps "${build_dir}"
 
 install -d -o root -g headliner -m 0750 /etc/headliner
 if [[ ! -e /etc/headliner/sources.yaml ]]; then
