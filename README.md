@@ -61,7 +61,11 @@ sudo bash deploy/install-ubuntu.sh
 The installer creates a restricted `headliner` system account, a Python virtual
 environment in `/opt/headliner/venv`, a persistent database at
 `/var/lib/headliner/headlines.db`, and installs the service and timer units. It
-does not enable the timer automatically. First replace `you@example.com` in
+also prints the deployed Git commit and, when GitHub can provide it, the
+associated pull request's title, status, last update, merge time, and link.
+This lookup is informational and does not block installation; without GitHub
+access the commit is still shown with a note that PR information is unavailable.
+It does not enable the timer automatically. First replace `you@example.com` in
 `/etc/headliner/sources.yaml` with a monitored contact address, then enable the
 schedule and optionally perform the initial run:
 
