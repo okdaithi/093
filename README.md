@@ -162,7 +162,9 @@ reads the database.
 | `concurrency` | integer > 0 | `5` | How many sources are fetched at once |
 
 A `Crawl-delay` in a site's `robots.txt` is honoured when it asks for longer than
-`rate_limit_seconds`.
+`rate_limit_seconds`: it becomes the minimum gap between requests to that domain,
+including across several sources on the same site. Python's `robotparser` only
+reads whole-second values, so a fractional `Crawl-delay` is ignored.
 
 ### `sources`
 
