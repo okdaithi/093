@@ -36,6 +36,7 @@ _KNOWN_SOURCE_KEYS: Final = frozenset(
         "live_url_pattern",
         "tags",
         "include_url_pattern",
+        "group",
         *_HTML_REQUIRED,
     }
 )
@@ -89,6 +90,14 @@ class Source:
     # Keep only items whose URL matches (case-insensitive search), e.g. "/news/"
     # to drop competitions and show pages from a radio station's site-wide feed.
     include_url_pattern: str | None = None
+    # Mastheads sharing a newsroom or syndicated copy (e.g. "nine" for The Age,
+    # SMH and WAtoday) count once when counting outlets on a story.
+    group: str | None = None
+
+    @property
+    def publisher(self) -> str:
+        """Who stands behind this source: its group, or the source itself."""
+        return self.group or self.name
 
     @property
     def include_regex(self) -> re.Pattern[str] | None:
@@ -338,6 +347,7 @@ def _parse_source(raw: Any, index: int, file_label: str) -> Source:
         live_url_pattern=live_url_pattern,
         tags=tags,
         include_url_pattern=include_url_pattern,
+        group=_optional_str(mapping, "group", where),
     )
 
 

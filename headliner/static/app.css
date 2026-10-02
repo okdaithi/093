@@ -225,3 +225,14 @@ tr.lowsample svg.bar { opacity: 0.5; }
 details.more-rows > summary { cursor: pointer; color: var(--link); margin: 0.4rem 0; }
 details.section > summary { cursor: pointer; }
 details.section > summary h2 { display: inline; }
+
+/* Story framing and source profiles */
+ol.framing { list-style: none; padding: 0; margin: 0.5rem 0 1rem; }
+ol.framing li { display: flex; flex-direction: column; gap: 0.1rem; padding: 0.5rem 0; border-bottom: 1px solid var(--line); }
+ol.framing li > span:last-child { font-size: 1.05rem; }
+ol.framing .after { display: inline-block; min-width: 4.5rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+.shared { color: var(--muted); }
+mark.own { background: var(--mark); color: inherit; padding: 0 0.1em; border-radius: 2px; }
+a.source { color: inherit; font-weight: 600; }
+.heatmap.hours td, .heatmap.hours th { min-width: 1.6rem; padding: 0.3rem 0.15rem; }
+p.chips .chip { margin: 0 0.25rem 0.3rem 0; display: inline-block; }

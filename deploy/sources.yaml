@@ -27,6 +27,7 @@ sources:
   - name: WAtoday
     url: https://www.watoday.com.au/rss/feed.xml
     type: rss
+    group: nine
     tags: [AU]
 
   - name: The West Australian
@@ -37,16 +38,19 @@ sources:
   - name: Sydney Morning Herald
     url: https://www.smh.com.au/rss/feed.xml
     type: rss
+    group: nine
     tags: [AU]
 
   - name: The Age
     url: https://www.theage.com.au/rss/feed.xml
     type: rss
+    group: nine
     tags: [AU]
 
   - name: Australian Financial Review
     url: https://www.afr.com/rss/feed.xml
     type: rss
+    group: nine
     tags: [AU, business]
 
   - name: MacroBusiness
@@ -103,16 +107,19 @@ sources:
   - name: Irish Mirror
     url: https://www.irishmirror.ie/?service=rss
     type: rss
+    group: reach
     tags: [IE]
 
   - name: Dublin Live
     url: https://www.dublinlive.ie/?service=rss
     type: rss
+    group: reach
     tags: [IE]
 
   - name: Crime World
     url: https://www.crimeworld.com/rss/
     type: rss
+    group: reach
     tags: [IE]
 
   - name: Gript
@@ -124,12 +131,14 @@ sources:
   - name: Newstalk
     url: https://www.newstalk.com/feed/
     type: rss
+    group: bauer-ie
     tags: [IE]
     include_url_pattern: "/news/"
 
   - name: Today FM
     url: https://www.todayfm.com/feed/
     type: rss
+    group: bauer-ie
     tags: [IE]
     include_url_pattern: "/news/"
 
@@ -168,12 +177,14 @@ sources:
   - name: NPR News
     url: https://feeds.npr.org/1001/rss.xml
     type: rss
+    group: npr
     tags: [US]
 
   # robots.txt currently disallows this page, so every run skips it.
   - name: NPR Text
     url: https://text.npr.org/
     type: html
+    group: npr
     tags: [US]
     article_selector: ".topic-container li"
     title_selector: "a"
@@ -185,6 +196,7 @@ sources:
   - name: GalwayBeo
     url: https://www.galwaybeo.ie/?service=rss
     type: rss
+    group: reach
     tags: [IE, galway]
 
   - name: Galway Daily
@@ -214,6 +226,7 @@ sources:
   - name: WSJ World
     url: https://feeds.content.dowjones.io/public/rss/RSSWorldNews
     type: rss
+    group: dow-jones
     tags: [US]
 
   - name: New York Post
@@ -268,11 +281,13 @@ sources:
   - name: Daily Express
     url: https://www.express.co.uk/?service=rss
     type: rss
+    group: reach
     tags: [UK]
 
   - name: The Mirror
     url: https://www.mirror.co.uk/?service=rss
     type: rss
+    group: reach
     tags: [UK]
 
   - name: Daily Mail
@@ -302,11 +317,13 @@ sources:
   - name: Times of India
     url: https://timesofindia.indiatimes.com/rssfeedstopstories.cms
     type: rss
+    group: times-group
     tags: [IN, asia]
 
   - name: Economic Times
     url: https://economictimes.indiatimes.com/rssfeedstopstories.cms
     type: rss
+    group: times-group
     tags: [IN, asia, business]
 
   - name: The Straits Times
@@ -356,6 +373,7 @@ sources:
   - name: WSJ Markets
     url: https://feeds.content.dowjones.io/public/rss/RSSMarketsMain
     type: rss
+    group: dow-jones
     tags: [markets]
 
   - name: Hedgeweek

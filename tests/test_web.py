@@ -398,7 +398,7 @@ def test_stories_page_groups_outlets(db_path: Path, config_path: Path) -> None:
     status, _, body = get("/stories")
     assert status == "200 OK"
     assert "1 stories reported by 2 or more outlets in the last 24h" in body
-    assert "<strong>2 outlets</strong>" in body
+    assert ">2 outlets</strong>" in body
     assert '<span class="chip">AU 1</span>' in body and '<span class="chip">IE 1</span>' in body
     assert "Budget surplus" not in body
     _, _, body = get("/stories?tag=IE&min=3")
@@ -414,7 +414,9 @@ def test_story_page_and_latest_badge(db_path: Path, config_path: Path) -> None:
     assert body.count('class="badge outlets"') == 2
     status, _, body = get("/story?url=https%3A%2F%2Fexample.org%2Fbridge")
     assert status == "200 OK"
-    assert "2 headline(s), oldest first" in body and "Other Daily" in body
+    assert "2 headline(s) with times" in body and "Other Daily" in body
+    assert "How each outlet put it" in body and '<span class="after">first</span>' in body
+    assert '<span class="shared">Harbour</span>' in body
     status, _, body = get("/story?url=https%3A%2F%2Fexample.org%2Fxss")
     assert status == "200 OK" and "Only one outlet has reported this so far." in body
     assert get("/story?url=https%3A%2F%2Fnope.example%2F")[0] == "404 Not Found"
@@ -432,6 +434,38 @@ def test_trends_page(get: Call) -> None:
     assert '<option value="30d" selected>' in body
     assert ">Example Wire</a></th>" not in body
     assert get("/trends?since=junk")[0] == "200 OK"
+
+
+def test_grouped_mastheads_count_once(db_path: Path, tmp_path: Path) -> None:
+    config = tmp_path / "grouped.yaml"
+    config.write_text(
+        CONFIG.replace("tags: [IE, business]}", "tags: [IE, business], group: wire}").replace(
+            "tags: [AU]}", "tags: [AU], group: wire}"
+        ),
+        encoding="utf-8",
+    )
+    seed_story(db_path)
+    get = make_client(WebApp(db_path, config))
+    _, _, body = get("/stories?min=2")
+    assert "No stories match." in body  # two mastheads, one publisher
+    _, _, body = get("/story?url=https%3A%2F%2Fexample.org%2Fbridge")
+    assert ">1 outlet(s)</strong>" in body and "2 mastheads" in body
+    _, _, body = get("/sources")
+    assert '<span class="chip small">wire</span>' in body
+
+
+def test_source_profile(db_path: Path, config_path: Path) -> None:
+    seed_story(db_path)
+    get = make_client(WebApp(db_path, config_path))
+    status, _, body = get("/source?name=example+wire")
+    assert status == "200 OK"
+    assert "<h1>Example Wire</h1>" in body and "When it publishes" in body
+    assert 'class="heatmap hours"' in body and "Stories it reported first" in body
+    assert get("/source?name=Nobody")[0] == "404 Not Found"
+    _, _, body = get("/sources")
+    assert 'href="/source?name=Example+Wire"' in body
+    _, _, body = get("/trends")
+    assert "By hour of day" in body and 'href="/source?name=' in body
 
 
 def test_trends_rising_topics_and_day_links(db_path: Path, config_path: Path) -> None:

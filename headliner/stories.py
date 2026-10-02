@@ -93,6 +93,15 @@ def words(text: str) -> list[tuple[str, str]]:
     return out
 
 
+def spans(text: str) -> list[tuple[int, int, str | None]]:
+    """Each word of `text` as (start, end, stem), the stem None for stopwords."""
+    out = []
+    for match in _WORD.finditer(text):
+        found = words(match.group())
+        out.append((match.start(), match.end(), found[0][0] if found else None))
+    return out
+
+
 def tokens(text: str) -> list[str]:
     """Content words of `text`: lowercased, possessives and suffixes folded, stopwords out."""
     return [word for word, _ in words(text)]
