@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -711,16 +711,35 @@ _SELECT_COLUMNS: Final = (
 _ORDER_BY: Final = "ORDER BY COALESCE(published_at, fetched_at) DESC, id DESC"
 
 
+def _in_sources(column: str, sources: Sequence[str] | None) -> tuple[str | None, list[Any]]:
+    """A `column IN (...)` clause for a set of source names (case-insensitive).
+
+    None means no filter; an empty list matches nothing (e.g. a tag whose
+    sources have all been removed).
+    """
+    if sources is None:
+        return None, []
+    if not sources:
+        return "0", []
+    marks = ",".join("?" * len(sources))
+    return f"{column} COLLATE NOCASE IN ({marks})", list(sources)
+
+
 def list_headlines(
     conn: sqlite3.Connection,
     *,
     since: datetime | None = None,
     source: str | None = None,
+    sources: Sequence[str] | None = None,
     limit: int = 50,
 ) -> list[Headline]:
-    """Most recent headlines first, optionally filtered by age and source."""
+    """Most recent headlines first, optionally filtered by age and source(s)."""
     clauses: list[str] = []
     params: list[Any] = []
+    in_clause, in_params = _in_sources("source", sources)
+    if in_clause:
+        clauses.append(in_clause)
+        params.extend(in_params)
     if since is not None:
         clauses.append("COALESCE(published_at, fetched_at) >= ?")
         params.append(_iso(since))
@@ -743,7 +762,11 @@ LiveFilter = Literal["exclude", "include", "only"]
 
 
 def _changes_query(
-    *, since: datetime | None, source: str | None, live: LiveFilter
+    *,
+    since: datetime | None,
+    source: str | None,
+    live: LiveFilter,
+    sources: Sequence[str] | None = None,
 ) -> tuple[str, list[Any]]:
     """FROM/WHERE for `list_title_changes` and `count_title_changes`."""
     # A live blog's first headline is part of its timeline, so `only` keeps it.
@@ -759,6 +782,10 @@ def _changes_query(
     if source:
         clauses.append("h.source = ? COLLATE NOCASE")
         params.append(source)
+    in_clause, in_params = _in_sources("h.source", sources)
+    if in_clause:
+        clauses.append(in_clause)
+        params.extend(in_params)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     sql = f"""
         FROM (
@@ -777,6 +804,7 @@ def list_title_changes(
     *,
     since: datetime | None = None,
     source: str | None = None,
+    sources: Sequence[str] | None = None,
     limit: int = 50,
     live: LiveFilter = "include",
     oldest_first: bool = False,
@@ -786,7 +814,7 @@ def list_title_changes(
     `live` keeps, drops or isolates live blogs. With `"only"` the result is
     each live blog's timeline, its first headline included (`old_title` None).
     """
-    sql, params = _changes_query(since=since, source=source, live=live)
+    sql, params = _changes_query(since=since, source=source, live=live, sources=sources)
     order = "ASC" if oldest_first else "DESC"
     with closing(
         conn.execute(
@@ -816,10 +844,11 @@ def count_title_changes(
     *,
     since: datetime | None = None,
     source: str | None = None,
+    sources: Sequence[str] | None = None,
     live: LiveFilter = "include",
 ) -> int:
     """How many rows `list_title_changes` would return without a limit."""
-    sql, params = _changes_query(since=since, source=source, live=live)
+    sql, params = _changes_query(since=since, source=source, live=live, sources=sources)
     return int(conn.execute(f"SELECT COUNT(*) {sql}", params).fetchone()[0])
 
 
@@ -838,11 +867,14 @@ def search_headlines(
     query: str,
     *,
     limit: int = 50,
+    sources: Sequence[str] | None = None,
 ) -> list[Headline]:
     """Full-text search over titles and summaries, falling back to LIKE."""
     term = query.strip()
     if not term:
         return []
+    in_clause, in_params = _in_sources("h.source", sources)
+    and_sources = f"AND {in_clause}" if in_clause else ""
 
     if has_fts(conn):
         match = _fts_query(term)
@@ -854,11 +886,11 @@ def search_headlines(
                         SELECT {", ".join(f"h.{c}" for c in _SELECT_COLUMNS.split(", "))}
                         FROM headlines_fts f
                         JOIN headlines h ON h.id = f.rowid
-                        WHERE headlines_fts MATCH ?
+                        WHERE headlines_fts MATCH ? {and_sources}
                         ORDER BY bm25(headlines_fts), COALESCE(h.published_at, h.fetched_at) DESC
                         LIMIT ?
                         """,
-                        (match, max(1, limit)),
+                        (match, *in_params, max(1, limit)),
                     )
                 ) as cursor:
                     return [_row_to_headline(row) for row in cursor.fetchall()]
@@ -869,12 +901,13 @@ def search_headlines(
     with closing(
         conn.execute(
             f"""
-            SELECT {_SELECT_COLUMNS}, id FROM headlines
-            WHERE title LIKE ? ESCAPE '\\' OR COALESCE(summary, '') LIKE ? ESCAPE '\\'
+            SELECT {_SELECT_COLUMNS}, id FROM headlines h
+            WHERE (title LIKE ? ESCAPE '\\' OR COALESCE(summary, '') LIKE ? ESCAPE '\\')
+            {and_sources}
             {_ORDER_BY}
             LIMIT ?
             """,
-            (pattern, pattern, max(1, limit)),
+            (pattern, pattern, *in_params, max(1, limit)),
         )
     ) as cursor:
         return [_row_to_headline(row) for row in cursor.fetchall()]
@@ -885,6 +918,7 @@ def search_history(
     query: str,
     *,
     limit: int = 50,
+    sources: Sequence[str] | None = None,
 ) -> list[SearchHit]:
     """Search every title and summary an article has carried; one hit per article.
 
@@ -896,6 +930,8 @@ def search_history(
         return []
 
     columns = ", ".join(f"h.{c}" for c in _SELECT_COLUMNS.split(", "))
+    in_clause, in_params = _in_sources("h.source", sources)
+    and_sources = f"AND {in_clause}" if in_clause else ""
     # The version reported per article: the current one whenever it matches,
     # otherwise the best-ranked earlier one. Articles rank by their best score.
     best_per_article = """
@@ -925,11 +961,11 @@ def search_history(
                         )
                         SELECT {columns}, ranked.matched
                         FROM ranked JOIN headlines h ON h.id = ranked.headline_id
-                        WHERE ranked.rn = 1
+                        WHERE ranked.rn = 1 {and_sources}
                         ORDER BY ranked.best, COALESCE(h.published_at, h.fetched_at) DESC
                         LIMIT ?
                         """,
-                        (match, max(1, limit)),
+                        (match, *in_params, max(1, limit)),
                     )
                 ) as cursor:
                     return [_row_to_hit(row) for row in cursor.fetchall()]
@@ -952,11 +988,11 @@ def search_history(
             )
             SELECT {columns}, ranked.matched
             FROM ranked JOIN headlines h ON h.id = ranked.headline_id
-            WHERE ranked.rn = 1
+            WHERE ranked.rn = 1 {and_sources}
             ORDER BY COALESCE(h.published_at, h.fetched_at) DESC, h.id DESC
             LIMIT ?
             """,
-            (pattern, pattern, max(1, limit)),
+            (pattern, pattern, *in_params, max(1, limit)),
         )
     ) as cursor:
         return [_row_to_hit(row) for row in cursor.fetchall()]

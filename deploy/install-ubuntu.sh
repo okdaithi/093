@@ -1,6 +1,36 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+usage() {
+    cat <<'USAGE'
+Usage: sudo bash deploy/install-ubuntu.sh [--update-sources]
+
+Installs or updates headliner as a systemd service.
+
+  --update-sources  Replace /etc/headliner/sources.yaml with the shipped
+                    deploy/sources.yaml, keeping its user_agent line (your
+                    contact address). The previous file is kept as
+                    sources.yaml.bak-<timestamp> and the change is shown.
+                    Without this flag the live file is never modified.
+USAGE
+}
+
+update_sources=false
+for arg in "$@"; do
+    case "${arg}" in
+        --update-sources) update_sources=true ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: ${arg}" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
 if [[ "${EUID}" -ne 0 ]]; then
     echo "Run this installer with sudo or as root." >&2
     exit 1
@@ -59,9 +89,39 @@ else
     # be merged by hand; the live file is never overwritten.
     install -o root -g headliner -m 0640 \
         "${repo_dir}/deploy/sources.yaml" /etc/headliner/sources.yaml.dist
-    if ! cmp -s /etc/headliner/sources.yaml /etc/headliner/sources.yaml.dist; then
+    if [[ "${update_sources}" == true ]] \
+        && ! cmp -s /etc/headliner/sources.yaml /etc/headliner/sources.yaml.dist; then
+        backup="/etc/headliner/sources.yaml.bak-$(date +%Y%m%d-%H%M%S)"
+        install -o root -g headliner -m 0640 /etc/headliner/sources.yaml "${backup}"
+        live_ua="$(grep -m1 -E '^[[:space:]]*user_agent:' /etc/headliner/sources.yaml || true)"
+        merged="$(mktemp)"
+        # awk, not sed: the user_agent line is copied verbatim whatever it contains.
+        UA_LINE="${live_ua}" awk '
+            /^[[:space:]]*user_agent:/ && ENVIRON["UA_LINE"] != "" && !done {
+                print ENVIRON["UA_LINE"]; done = 1; next
+            }
+            { print }
+        ' /etc/headliner/sources.yaml.dist >"${merged}"
+        install -o root -g headliner -m 0640 "${merged}" /etc/headliner/sources.yaml
+        rm -f -- "${merged}"
+        check_config='import sys
+from headliner.config import ConfigError, load_config
+try:
+    load_config(sys.argv[1])
+except ConfigError as exc:
+    sys.exit(f"ERROR: {exc}")'
+        if ! /opt/headliner/venv/bin/python -c "${check_config}" /etc/headliner/sources.yaml; then
+            install -o root -g headliner -m 0640 "${backup}" /etc/headliner/sources.yaml
+            echo "ERROR: the updated sources.yaml did not load; restored ${backup}" >&2
+            exit 1
+        fi
+        echo "Updated /etc/headliner/sources.yaml from the shipped defaults (user_agent kept)."
+        echo "Previous version: ${backup}"
+        diff -u "${backup}" /etc/headliner/sources.yaml || true
+    elif ! cmp -s /etc/headliner/sources.yaml /etc/headliner/sources.yaml.dist; then
         echo "NOTE: /etc/headliner/sources.yaml differs from the shipped defaults." >&2
         echo "      Review with: diff -u /etc/headliner/sources.yaml /etc/headliner/sources.yaml.dist" >&2
+        echo "      To adopt them (keeping your user_agent): rerun with --update-sources" >&2
     fi
 fi
 

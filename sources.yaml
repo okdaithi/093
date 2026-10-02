@@ -23,57 +23,173 @@ settings:
   # How many sources to fetch at once. The per-domain rate limit still applies.
   concurrency: 5
 
+# Tags: a country code for where the outlet is based (AU, IE, UK, US, DE, FR,
+# QA), plus beats such as "business". Filter with --tag on fetch, list, search,
+# changes and sources. To add sites, see "Adding sources" in the README:
+#   headliner discover --tag AU https://example.com.au/ >> new-sources.yaml
 sources:
+  # --- Australia -----------------------------------------------------------
   - name: ABC News AU
     url: https://www.abc.net.au/news/feed/51120/rss.xml
     type: rss
+    tags: [AU]
 
   - name: The Guardian AU
     url: https://www.theguardian.com/au/rss
     type: rss
+    tags: [AU]
 
-  # Reuters has wound down public RSS and the old agency feed now returns 404.
-  # Replaced with the Deutsche Welle world feed to keep 1st-party coverage.
-  - name: Deutsche Welle
-    url: https://rss.dw.com/rdf/rss-en-world
+  - name: WAtoday
+    url: https://www.watoday.com.au/rss/feed.xml
     type: rss
+    tags: [AU]
 
-  - name: BBC News
-    url: https://feeds.bbci.co.uk/news/rss.xml
+  - name: The West Australian
+    url: https://thewest.com.au/feed/
     type: rss
+    tags: [AU]
 
+  - name: Sydney Morning Herald
+    url: https://www.smh.com.au/rss/feed.xml
+    type: rss
+    tags: [AU]
+
+  - name: The Age
+    url: https://www.theage.com.au/rss/feed.xml
+    type: rss
+    tags: [AU]
+
+  - name: Australian Financial Review
+    url: https://www.afr.com/rss/feed.xml
+    type: rss
+    tags: [AU, business]
+
+  - name: MacroBusiness
+    url: https://www.macrobusiness.com.au/feed/
+    type: rss
+    tags: [AU, business]
+
+  - name: Capital Brief
+    url: https://www.capitalbrief.com/feed/latest.xml
+    type: rss
+    tags: [AU, business]
+
+  - name: The Saturday Paper
+    url: https://www.thesaturdaypaper.com.au/feed.xml
+    type: rss
+    tags: [AU]
+
+  - name: Crikey
+    url: https://www.crikey.com.au/feed/
+    type: rss
+    tags: [AU]
+
+  # Not fetchable, checked 2026-10-02 with `headliner discover`:
+  #   The Australian, news.com.au, Herald Sun, Daily Telegraph, Courier Mail:
+  #     News Corp's robots.txt disallows all crawlers ("User-agent: *" / "Disallow: /").
+  #   The New Daily: Cloudflare bot challenge (HTTP 403).
+
+  # --- Ireland -------------------------------------------------------------
   - name: RTE News
     url: https://www.rte.ie/feeds/rss/?index=/news/
     type: rss
+    tags: [IE]
 
   - name: Irish Times
     url: https://www.irishtimes.com/arc/outboundfeeds/feed-irish-news/
     type: rss
+    tags: [IE]
 
-  # AP retired its public RSS feeds and the rsshub.app mirror now returns 403.
-  # Replaced with the France 24 world feed (1st-party, no mirror dependency).
-  - name: France 24
-    url: https://www.france24.com/en/rss
+  - name: Irish Independent
+    url: https://www.independent.ie/rss/
     type: rss
+    tags: [IE]
 
-  - name: Al Jazeera
-    url: https://www.aljazeera.com/xml/rss/all.xml
+  - name: Irish Examiner
+    url: https://www.irishexaminer.com/feed/35-top_news.xml
     type: rss
+    tags: [IE]
 
-  - name: NPR News
-    url: https://feeds.npr.org/1001/rss.xml
+  - name: TheJournal.ie
+    url: https://www.thejournal.ie/feed/
     type: rss
+    tags: [IE]
+
+  - name: Irish Mirror
+    url: https://www.irishmirror.ie/?service=rss
+    type: rss
+    tags: [IE]
+
+  - name: Dublin Live
+    url: https://www.dublinlive.ie/?service=rss
+    type: rss
+    tags: [IE]
+
+  - name: Crime World
+    url: https://www.crimeworld.com/rss/
+    type: rss
+    tags: [IE]
+
+  - name: Gript
+    url: https://gript.ie/feed/
+    type: rss
+    tags: [IE]
+
+  # Radio stations publish one site-wide feed; keep only the news section.
+  - name: Newstalk
+    url: https://www.newstalk.com/feed/
+    type: rss
+    tags: [IE]
+    include_url_pattern: "/news/"
+
+  - name: Today FM
+    url: https://www.todayfm.com/feed/
+    type: rss
+    tags: [IE]
+    include_url_pattern: "/news/"
+
+  # Not fetchable, checked 2026-10-02 with `headliner discover`:
+  #   The Irish Sun: robots.txt disallows all crawlers.
+  #   Business Post: its advertised feeds return the HTML homepage, not RSS.
+
+  # --- UK, Europe, Middle East, US -----------------------------------------
+  - name: BBC News
+    url: https://feeds.bbci.co.uk/news/rss.xml
+    type: rss
+    tags: [UK]
 
   - name: Sky News
     url: https://feeds.skynews.com/feeds/rss/world.xml
     type: rss
+    tags: [UK]
 
-  # An HTML source, so that code path is exercised by a real site. Text Media
-  # (the "lite" front page of a large newsroom) is stable, markup-light and
-  # explicitly published for low-bandwidth readers.
+  # Reuters has wound down public RSS; Deutsche Welle keeps 1st-party coverage.
+  - name: Deutsche Welle
+    url: https://rss.dw.com/rdf/rss-en-world
+    type: rss
+    tags: [DE]
+
+  # AP retired its public RSS; France 24 is a 1st-party replacement.
+  - name: France 24
+    url: https://www.france24.com/en/rss
+    type: rss
+    tags: [FR]
+
+  - name: Al Jazeera
+    url: https://www.aljazeera.com/xml/rss/all.xml
+    type: rss
+    tags: [QA]
+
+  - name: NPR News
+    url: https://feeds.npr.org/1001/rss.xml
+    type: rss
+    tags: [US]
+
+  # robots.txt currently disallows this page, so every run skips it.
   - name: NPR Text
     url: https://text.npr.org/
     type: html
+    tags: [US]
     article_selector: ".topic-container li"
     title_selector: "a"
     link_selector: "a"

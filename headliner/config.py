@@ -34,6 +34,8 @@ _KNOWN_SOURCE_KEYS: Final = frozenset(
         "date_selector",
         "summary_selector",
         "live_url_pattern",
+        "tags",
+        "include_url_pattern",
         *_HTML_REQUIRED,
     }
 )
@@ -81,6 +83,22 @@ class Source:
     date_selector: str | None = None
     summary_selector: str | None = None
     live_url_pattern: str | None = None
+    # Free-form labels such as a region ("AU", "IE") or a beat ("business").
+    # Matching is case-insensitive.
+    tags: tuple[str, ...] = ()
+    # Keep only items whose URL matches (case-insensitive search), e.g. "/news/"
+    # to drop competitions and show pages from a radio station's site-wide feed.
+    include_url_pattern: str | None = None
+
+    @property
+    def include_regex(self) -> re.Pattern[str] | None:
+        """`include_url_pattern` compiled (validated at load, so this cannot fail)."""
+        return _compile_cached(self.include_url_pattern) if self.include_url_pattern else None
+
+    def has_tag(self, tag: str) -> bool:
+        """True when `tag` is one of this source's tags, ignoring case."""
+        wanted = tag.casefold()
+        return any(own.casefold() == wanted for own in self.tags)
 
     @property
     def live_regex(self) -> re.Pattern[str] | None:
@@ -101,15 +119,21 @@ class Config:
     sources: list[Source] = field(default_factory=list)
     path: Path | None = None
 
-    def select(self, names: list[str] | None) -> list[Source]:
-        """Return enabled sources, optionally filtered by name (case-insensitive).
+    def select(self, names: list[str] | None, tags: list[str] | None = None) -> list[Source]:
+        """Sources to fetch: by name, by tag, or both (case-insensitive).
 
-        Raises `ConfigError` when a requested name matches nothing, listing the
-        names that are available.
+        With neither, every enabled source. Names pick sources even when they
+        are disabled; tags pick enabled sources carrying any of the tags; both
+        together keep the named sources that also carry a tag. Raises
+        `ConfigError` when a name or tag matches nothing, listing what exists.
         """
-        enabled = [source for source in self.sources if source.enabled]
+        tagged = self.tagged(tags) if tags else None
         if not names:
-            return enabled
+            return [
+                source
+                for source in self.sources
+                if source.enabled and (tagged is None or source in tagged)
+            ]
 
         by_key = {source.name.casefold(): source for source in self.sources}
         chosen: list[Source] = []
@@ -118,9 +142,30 @@ class Config:
             if source is None:
                 available = ", ".join(sorted(s.name for s in self.sources))
                 raise ConfigError(f"unknown source {name!r}; configured sources: {available}")
-            if source not in chosen:
+            if source not in chosen and (tagged is None or source in tagged):
                 chosen.append(source)
         return chosen
+
+    @property
+    def all_tags(self) -> list[str]:
+        """Every tag in use, de-duplicated case-insensitively, sorted."""
+        seen: dict[str, str] = {}
+        for source in self.sources:
+            for tag in source.tags:
+                seen.setdefault(tag.casefold(), tag)
+        return sorted(seen.values(), key=str.casefold)
+
+    def tagged(self, tags: list[str]) -> list[Source]:
+        """Sources (enabled or not) carrying any of `tags`.
+
+        Raises `ConfigError` for a tag no source uses, listing those in use.
+        """
+        known = {tag.casefold() for tag in self.all_tags}
+        for tag in tags:
+            if tag.casefold() not in known:
+                available = ", ".join(self.all_tags) or "none"
+                raise ConfigError(f"unknown tag {tag!r}; tags in use: {available}")
+        return [source for source in self.sources if any(source.has_tag(t) for t in tags)]
 
 
 def _require_mapping(value: Any, where: str) -> dict[str, Any]:
@@ -204,6 +249,39 @@ def _parse_settings(raw: Any, where: str) -> Settings:
     )
 
 
+def _optional_regex(mapping: dict[str, Any], key: str, where: str) -> str | None:
+    """An optional regular-expression string, checked to compile."""
+    value = _optional_str(mapping, key, where)
+    if value is not None:
+        try:
+            re.compile(value)
+        except re.error as exc:
+            raise ConfigError(f"{where}: {key!r} is not a valid regular expression: {exc}") from exc
+    return value
+
+
+_TAG_RE: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+
+def parse_tags(raw: Any, where: str) -> tuple[str, ...]:
+    """`tags: [AU, business]` (or a single string) -> ("AU", "business")."""
+    if raw is None:
+        return ()
+    values = [raw] if isinstance(raw, str) else raw
+    if not isinstance(values, list):
+        raise ConfigError(f"{where}: 'tags' must be a list of strings, got {raw!r}")
+    tags: list[str] = []
+    for value in values:
+        if not isinstance(value, str) or not _TAG_RE.match(value.strip()):
+            raise ConfigError(
+                f"{where}: tag {value!r} must be letters, digits, '-' or '_' (e.g. AU, business)"
+            )
+        tag = value.strip()
+        if tag.casefold() not in {t.casefold() for t in tags}:
+            tags.append(tag)
+    return tuple(tags)
+
+
 def _parse_source(raw: Any, index: int, file_label: str) -> Source:
     where = f"{file_label}: sources[{index}]"
     mapping = _require_mapping(raw, where)
@@ -228,14 +306,9 @@ def _parse_source(raw: Any, index: int, file_label: str) -> Source:
     if not isinstance(enabled, bool):
         raise ConfigError(f"{where}: 'enabled' must be true or false, got {enabled!r}")
 
-    live_url_pattern = _optional_str(mapping, "live_url_pattern", where)
-    if live_url_pattern is not None:
-        try:
-            re.compile(live_url_pattern)
-        except re.error as exc:
-            raise ConfigError(
-                f"{where}: 'live_url_pattern' is not a valid regular expression: {exc}"
-            ) from exc
+    tags = parse_tags(mapping.get("tags"), where)
+    live_url_pattern = _optional_regex(mapping, "live_url_pattern", where)
+    include_url_pattern = _optional_regex(mapping, "include_url_pattern", where)
 
     selectors: dict[str, str | None] = {}
     if source_type == "html":
@@ -263,6 +336,8 @@ def _parse_source(raw: Any, index: int, file_label: str) -> Source:
         if source_type == "html"
         else None,
         live_url_pattern=live_url_pattern,
+        tags=tags,
+        include_url_pattern=include_url_pattern,
     )
 
 

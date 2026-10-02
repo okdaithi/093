@@ -81,6 +81,19 @@ feeds:
 sudo diff -u /etc/headliner/sources.yaml /etc/headliner/sources.yaml.dist
 ```
 
+To adopt the shipped list wholesale, for example after new sources are added,
+rerun the installer with `--update-sources`:
+
+```bash
+sudo bash deploy/install-ubuntu.sh --update-sources
+```
+
+This replaces the live file with the shipped one but keeps its `user_agent`
+line, so your contact address survives. The previous file is saved as
+`sources.yaml.bak-<timestamp>` and the diff is printed. If the result doesn't
+load, the backup is put back and the installer stops. Other local edits are not
+merged, so check the diff if you have them.
+
 ## Quickstart
 
 ```bash
@@ -125,6 +138,7 @@ headliner list --since 6h --format json 2>/dev/null | jq '.[].title'
 | `headliner sources` | Show each configured source with its last successful fetch and item count |
 | `headliner changes` | List headlines that were rewritten after publication, newest first |
 | `headliner migrate` | Upgrade the database schema (runs automatically; `--dry-run` previews) |
+| `headliner discover URL...` | Find each site's RSS/Atom feed and print source entries to paste (see [Adding sources](#adding-sources)) |
 
 Shared flags: `--sources PATH` (default `sources.yaml`), `--db PATH` (default
 `headlines.db`), `--utc` for UTC times in tables, `--verbose` for DEBUG logging,
@@ -165,7 +179,14 @@ one result per article, showing its current headline:
   column, and JSON and CSV add `matched_title`. It is `null`/empty when the
   current version matched.
 
-**`sources`** takes `--format table|json`.
+**`sources`** takes `--format table|json`. The table and JSON include each
+source's tags.
+
+**`--tag TAG`** works on `fetch`, `list`, `search`, `changes` and `sources`. It
+selects the sources carrying that tag, ignoring case. Repeat it to match any of
+several tags (`--tag AU --tag IE`). An unknown tag is an error that lists the
+tags in use. `search` and `changes` otherwise need no config file, but read it
+when `--tag` is given.
 
 **`changes`** takes the same `--since`, `--source`, `--limit` and `--format` flags
 as `list`, and needs no config file. Each row is one rewrite: the previous title,
@@ -253,6 +274,8 @@ Every entry needs `name`, `url` and `type`.
 | `date_selector` | html | no | CSS selector for the timestamp. Reads `datetime`, then `content`, then the text. |
 | `summary_selector` | html | no | CSS selector for a short standfirst or teaser |
 | `live_url_pattern` | both | no | Regular expression (case-insensitive) searched in each article URL; a match marks it as a live blog, on top of the built-in rules |
+| `tags` | both | no | Labels for filtering with `--tag`: a list (`[AU, business]`) or one string. Letters, digits, `-` and `_`. |
+| `include_url_pattern` | both | no | Regular expression (case-insensitive); only items whose URL matches are kept, e.g. `"/news/"` to keep a radio station's news out of a site-wide feed. Applied before `max_items_per_source`. |
 
 Anything else is rejected with an error naming the file and the key, so a typo
 fails at startup rather than silently doing nothing.
@@ -261,19 +284,70 @@ Relative links are resolved against the source `url`.
 
 ### A note on the shipped sources
 
-The bundled `sources.yaml` carries ten RSS feeds and one HTML source. News sites
-change their feed URLs and their markup without warning. Run
-`headliner fetch --dry-run` after cloning to see which ones still work in your
-environment, and treat a source that fails consistently as needing its URL or
-selectors updated rather than as a bug.
+The bundled `sources.yaml` carries 28 RSS feeds and one HTML source, grouped and
+tagged by country: `AU` (11), `IE` (11), `UK`, `US`, `DE`, `FR` and `QA`, plus a
+`business` tag. News sites change their feed URLs and their markup without
+warning. Run `headliner fetch --dry-run` after cloning to see which ones still
+work in your environment, and treat a source that fails consistently as needing
+its URL or selectors updated rather than as a bug.
 
-Two entries are flagged in the file itself: the AP feed is a community mirror
-rather than a first-party feed, and Reuters has been winding down public RSS.
+Sites that were checked and can't be fetched are listed in the file with the
+reason, so they aren't re-tried by accident. News Corp titles (The Australian,
+news.com.au, Herald Sun, Daily Telegraph, Courier Mail) and The Irish Sun
+disallow all crawlers in robots.txt. The New Daily sits behind a bot challenge.
+Business Post's advertised feeds return its HTML homepage.
+
+## Adding sources
+
+`headliner discover` turns a list of site homepages into source entries.
+
+1. **Discover.** Give it the homepages (or section pages) and the tags to apply:
+
+   ```bash
+   headliner discover --tag AU https://www.smh.com.au/ https://www.crikey.com.au/ > new.yaml
+   ```
+
+   For each site it reads the feeds the homepage advertises
+   (`<link rel="alternate" type="application/rss+xml">`), then falls back to the
+   default feed paths of common news platforms: WordPress `/feed/`, Nine
+   `/rss/feed.xml`, Reach `?service=rss`, Arc XP and others. It checks
+   robots.txt before every request, using your configured `user_agent`, and
+   only recommends a feed it has fetched and parsed.
+
+2. **Review `new.yaml`.** It is indented to paste under `sources:`. Each entry
+   has a comment with the item count and the newest item's time. Tidy the
+   suggested `name`s, which come from the feed's title. Three kinds of comment
+   lines need a decision:
+   - `# CONFIGURED`: the site is already a source; add the tags to that entry
+     instead.
+   - `# FAILED`: no usable feed, with the reason. For example "robots.txt blocks
+     crawlers…", "HTTP 403, likely bot protection", or "advertised feed …: not
+     an RSS/Atom feed (got text/html)". Note these in the config so the site
+     isn't re-tried by accident.
+   - `include_url_pattern`: suggested when you gave a section URL (such as
+     `…/news`) and the feed covers the whole site. It keeps only that section's
+     items.
+
+3. **Check, then add.** Paste the entries into `sources.yaml` (and
+   `deploy/sources.yaml` for the server), then try them without writing:
+
+   ```bash
+   headliner fetch --dry-run --tag AU
+   ```
+
+4. **Deploy.** On the server, after `git pull`:
+
+   ```bash
+   sudo bash deploy/install-ubuntu.sh --update-sources
+   ```
+
+`discover` exits `1` when any site had no usable feed, so it can be scripted.
 
 ## Adding a new HTML source
+## Adding a new HTML source
 
-Use `type: html` only when the site publishes no feed. Check the obvious places
-first — `/rss`, `/feed`, `/rss.xml`, `/atom.xml` — and look in the page source
+Use `type: html` only when the site publishes no feed. Run `headliner discover`
+on it first (see [Adding sources](#adding-sources)), and look in the page source
 for `<link rel="alternate" type="application/rss+xml">`.
 
 ### 1. Find the repeating article element
@@ -454,6 +528,7 @@ headliner/
   fetcher.py    async http, robots.txt, retries, rate limiting
   parsers.py    rss/atom via feedparser, html via selectolax or beautifulsoup4
   store.py      sqlite schema, inserts, queries
+  discover.py   feed discovery for `headliner discover`
 tests/
   fixtures/     one RSS sample, one HTML sample
 sources.yaml
