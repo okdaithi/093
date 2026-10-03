@@ -109,6 +109,13 @@ BRIEFING_TOP: Final = 8
 BRIEFING_PER_COUNTRY: Final = 3
 # Days of history behind the Briefing's "typical day" line.
 BRIEFING_BASELINE_DAYS: Final = 7
+NAV_PRIMARY: Final = (
+    ("/", "Briefing"),
+    ("/latest", "Latest"),
+    ("/stories", "Stories"),
+    ("/trends", "Trends"),
+)
+NAV_MORE: Final = (("/rewrites", "Rewrites"), ("/search", "Search"), ("/sources", "Sources"))
 # Rewrites read at most for the kinds chart and the ?kind= filter.
 REWRITE_CHART_LIMIT: Final = 5000
 DELAY_BUCKETS: Final = (
@@ -671,23 +678,29 @@ class WebApp:
 
     def layout(self, request: Request, body: Markup, stats: Markup | None = None) -> str:
         clock = Clock(request.utc)
-        nav = join(
-            render(
-                '<a href="{href}" data-nav="{key}"{current}>{label}</a>',
+
+        def tab(path: str, label: str, css: str = "") -> Markup:
+            return render(
+                '<a href="{href}"{key}{cls}{current}>{label}</a>',
                 href=self.link(request, path),
-                key=path.strip("/") or "briefing",
-                current=Markup(' aria-current="page"') if request.path == path else Markup(""),
+                # Only the always-visible copy carries data-nav (app.js badges it).
+                key=EMPTY if css else render(' data-nav="{k}"', k=path.strip("/") or "briefing"),
+                cls=render(' class="{c}"', c=css) if css else EMPTY,
+                current=Markup(' aria-current="page"') if request.path == path else EMPTY,
                 label=label,
             )
-            for path, label in (
-                ("/", "Briefing"),
-                ("/latest", "Latest"),
-                ("/stories", "Stories"),
-                ("/rewrites", "Rewrites"),
-                ("/search", "Search"),
-                ("/trends", "Trends"),
-                ("/sources", "Sources"),
-            )
+
+        current_more = next((label for path, label in NAV_MORE if path == request.path), "")
+        # On phones the less-used pages fold under "More"; wide screens show every tab.
+        nav = render(
+            '{primary}{wide}<details class="more narrow"><summary{cur}>More</summary>'
+            '<div class="more-menu">{folded}</div></details>',
+            primary=join(tab(path, label) for path, label in NAV_PRIMARY),
+            wide=join(tab(path, label, "wide") for path, label in NAV_MORE),
+            cur=render(' class="current" title="Now on {c}"', c=current_more)
+            if current_more
+            else EMPTY,
+            folded=join(tab(path, label, "folded") for path, label in NAV_MORE),
         )
         other = Clock(False).zone if request.utc else "UTC"
         switch = self.link(
@@ -1515,7 +1528,7 @@ first rewrite that changed words; live blogs excluded.</p>{histogram}</div>
 <p class="summary-line">
   <span><strong>{healthy}</strong> of {enabled} enabled source(s) healthy.</span>
   <span class="tagbar">Tags: {tag_links}</span></p>
-<div class="scroll"><table>
+<div class="scroll"><table class="sortable">
 <thead><tr><th>Source</th><th>Tags</th><th class="num">Items</th>
 <th>Last success ({zone})</th><th>Last run</th><th>Feed</th></tr></thead>
 <tbody>{rows}</tbody></table></div>
@@ -1567,11 +1580,24 @@ first rewrite that changed words; live blogs excluded.</p>{histogram}</div>
                 )
             )
             previous = revision
+        story = by_url(self.stories(conn, STORY_LINK_WINDOW)).get(headline.url)
+        trail = [
+            ("Sources", self.link(request, "/sources", tag=None, source=None)),
+            (
+                headline.source,
+                self.link(request, "/source", name=headline.source, tag=None, source=None),
+            ),
+        ]
+        if story is not None and len(story.headlines) > 1:
+            trail.append(
+                ("Story", self.link(request, "/story", url=headline.url, tag=None, source=None))
+            )
         return render(
-            """<h1>{title}</h1>
+            """{crumbs}<h1>{title}</h1>
 <p class="meta">{source} {live} · published {published} · {open}</p>
 <h2>{n} title(s), oldest first</h2>
 <ol class="items timeline">{items}</ol>""",
+            crumbs=self.crumbs(trail, headline.title),
             title=headline.title,
             source=headline.source,
             live=Markup('<span class="badge live">LIVE</span>') if headline.is_live else Markup(""),
@@ -1830,7 +1856,7 @@ alone.</p>
             else EMPTY
         )
         return render(
-            """<h1>{title}</h1>
+            """{crumbs}<h1>{title}</h1>
 <p class="meta"><strong title="{note}">{n} outlet(s)</strong> {tags}</p>
 {lone}
 {timeline}
@@ -1843,9 +1869,24 @@ alone.</p>
             tags=self.tag_counts(story),
             lone=lone,
             timeline=self.story_timeline(request, story),
+            crumbs=self.crumbs(
+                [("Stories", self.link(request, "/stories", url=None, since=None))], story.title
+            ),
             framing=framing,
             count=len(story.headlines),
             members=self.story_members(request, conn, story),
+        )
+
+    @staticmethod
+    def crumbs(trail: Sequence[tuple[str, str]], here: str) -> Markup:
+        """Where this page sits: links back up, then the page itself."""
+        return render(
+            '<nav class="crumbs" aria-label="Breadcrumb"><ol>{links}'
+            '<li aria-current="page">{here}</li></ol></nav>',
+            links=join(
+                render('<li><a href="{h}">{t}</a></li>', h=href, t=text) for text, href in trail
+            ),
+            here=here,
         )
 
     def story_timeline(self, request: Request, story: Story) -> Markup:
@@ -2080,7 +2121,7 @@ alone.</p>
         status = source_status(conn, [source.name])[0]
         state, css = source_state(source.enabled, status, now)
         return render(
-            """<h1>{name}</h1>
+            """{crumbs}<h1>{name}</h1>
 <p class="meta"><span class="state {css}">{state}</span> · {tags}{group} ·
 <a href="{latest}">latest headlines</a> · {feed}</p>
 <p>{n} articles in the last {days} days; in {joined} multi-outlet stories this week.</p>
@@ -2097,6 +2138,10 @@ schedule as much as the outlet's own rhythm.</p>
 <h2>Its words</h2>
 <p class="muted">Headline words this outlet uses far more than the others do.</p>
 <p class="chips">{words}</p>""",
+            crumbs=self.crumbs(
+                [("Sources", self.link(request, "/sources", name=None, tag=None, source=None))],
+                source.name,
+            ),
             name=source.name,
             css=css,
             state=state,
@@ -2378,9 +2423,11 @@ schedule as much as the outlet's own rhythm.</p>
             render(
                 """<tr class="{css}"><td><a href="{h}">{source}</a></td>
 <td class="num">{articles}</td><td class="num">{rewritten}</td>
-<td><span class="barwrap">{bar}<span>{pct}</span></span></td>
-<td class="num">{delay}</td></tr>""",
+<td data-sort="{share}"><span class="barwrap">{bar}<span>{pct}</span></span></td>
+<td class="num" data-sort="{secs}">{delay}</td></tr>""",
                 css="lowsample" if stat.articles < MIN_REWRITE_SAMPLE else "",
+                share=f"{stat.share:.4f}",
+                secs=int(stat.median_delay.total_seconds()) if stat.median_delay else "",
                 h=self.link(request, "/rewrites", source=stat.source, tag=None),
                 source=stat.source,
                 articles=stat.articles,
@@ -2465,7 +2512,7 @@ between fetch runs show as empty hours.</p>
 were reworded later. Punctuation-only changes don't count. The delay is from when the article
 was first fetched to when the new wording was, so it can't be shorter than the time between
 fetch runs. Outlets with fewer than {min} articles are greyed and listed last.</p>
-<div class="scroll"><table>
+<div class="scroll"><table class="sortable">
 <thead><tr><th>Source</th><th class="num">Articles</th><th class="num">Rewritten</th>
 <th>Share</th><th class="num">Median delay</th></tr></thead>
 <tbody>{rewrite_rows}</tbody>{rewrite_total}</table></div>
@@ -2474,7 +2521,7 @@ fetch runs. Outlets with fewer than {min} articles are greyed and listed last.</
 after run (<span class="warn">highlighted</span> when it happens in half the runs or more) is
 probably dropping stories between runs, so fetching more often would catch more. Each
 source's first-ever run is left out.</p>
-<div class="scroll"><table>
+<div class="scroll"><table class="sortable">
 <thead><tr><th>Source</th><th class="num">OK</th><th class="num">Failed</th>
 <th class="num">Skipped</th><th class="num">Items/run</th><th>New per run</th>
 <th class="num">Runs all new</th></tr></thead>

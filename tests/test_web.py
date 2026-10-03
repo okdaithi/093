@@ -768,3 +768,26 @@ def test_trends_country_rows_and_relative_shading(get: Call) -> None:
     assert "tag=AU" in body and "tag=IE" in body
     _, _, relative = get("/trends?shade=row")
     assert "own busiest day" in relative
+
+
+def test_nav_folds_less_used_pages_under_more(get: Call) -> None:
+    _, _, body = get("/sources")
+    nav = body.split("<nav>", 1)[1].split("</nav>", 1)[0]
+    assert nav.count('data-nav="') == 4
+    assert '<summary class="current" title="Now on Sources">More</summary>' in nav
+    assert nav.count('href="/sources"') == 2
+
+
+def test_deep_pages_have_breadcrumbs(get: Call) -> None:
+    _, _, article = get("/article?url=" + quote("https://example.org/bridge", safe=""))
+    assert 'class="crumbs"' in article
+    assert "/source?name=Example+Wire" in article
+    _, _, source = get("/source?name=Example+Wire")
+    assert 'aria-label="Breadcrumb"' in source
+
+
+def test_stat_tables_are_sortable(get: Call) -> None:
+    _, _, sources = get("/sources")
+    assert 'table class="sortable"' in sources
+    _, _, trends = get("/trends")
+    assert trends.count('table class="sortable"') == 2

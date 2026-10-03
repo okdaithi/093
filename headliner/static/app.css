@@ -202,7 +202,7 @@ time { font-variant-numeric: tabular-nums; }
   main { padding: 0.65rem; }
   header.top { position: static; padding: 0.35rem 0.75rem 0.25rem; }
   .bar { flex-wrap: nowrap; gap: 0.6rem; }
-  nav { flex-wrap: nowrap; overflow-x: auto; gap: 0.7rem; scrollbar-width: none; flex: 1; min-width: 0; }
+  nav { flex-wrap: nowrap; gap: 0.6rem; flex: 1; min-width: 0; }
   nav a { white-space: nowrap; }
   .zone { display: none; }
   .stats { display: none; }
@@ -303,3 +303,46 @@ ul.key a[aria-current] { font-weight: 600; text-decoration: underline; }
 p.shade { font-size: 0.85rem; }
 p.shade a { margin-left: 0.5rem; }
 p.shade a[aria-current] { font-weight: 600; color: var(--text); text-decoration: none; }
+
+/* Navigation: on phones the less-used pages fold under "More" */
+nav .wide { display: none; }
+details.more { position: relative; }
+details.more > summary { cursor: pointer; list-style: none; white-space: nowrap; padding: 0.12rem 0; color: var(--text); }
+details.more > summary::-webkit-details-marker { display: none; }
+details.more > summary.current { font-weight: 600; border-bottom: 2px solid var(--accent); }
+details.more > summary::after { content: " ▾"; color: var(--muted); }
+details.more .more-menu { position: absolute; right: 0; z-index: 20; display: flex; flex-direction: column; gap: 0.3rem; min-width: 8rem; padding: 0.5rem 0.75rem; background: var(--card, var(--bg)); border: 1px solid var(--line, var(--chip)); border-radius: 6px; }
+@media (min-width: 40rem) {
+  nav .wide { display: inline; }
+  details.more.narrow { display: none; }
+}
+
+/* Breadcrumbs */
+nav.crumbs { display: block; font-size: 0.8rem; color: var(--muted); margin: 0 0 0.25rem; }
+nav.crumbs ol { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; min-width: 0; }
+nav.crumbs li { white-space: nowrap; }
+nav.crumbs li + li::before { content: "›"; margin: 0 0.4rem; }
+nav.crumbs li[aria-current] { overflow: hidden; text-overflow: ellipsis; max-width: 60vw; }
+nav.crumbs a { border: 0; padding: 0; }
+
+/* Sortable tables (app.js) */
+table.sortable th.sorter { cursor: pointer; user-select: none; }
+table.sortable th.sorter:hover { color: var(--accent); }
+table.sortable th[aria-sort="ascending"]::after { content: " ▲"; }
+table.sortable th[aria-sort="descending"]::after { content: " ▼"; }
+
+/* Keyboard focus (app.js: j/k) and the shortcuts help */
+.kbd-focus { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 4px; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+dialog.keys { border: 1px solid var(--chip); border-radius: 8px; background: var(--bg); color: var(--text); max-width: 22rem; }
+dialog.keys dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.3rem 1rem; margin: 0.5rem 0; }
+dialog.keys kbd { font-family: inherit; border: 1px solid var(--chip); border-radius: 3px; padding: 0 0.3rem; }
+@media (max-width: 24rem) {
+  .bar { gap: 0.45rem; }
+  nav { gap: 0.45rem; font-size: 0.88rem; }
+  .brand { font-size: 0.9rem; }
+}
+@media (max-width: 22.4rem) {
+  .bar { flex-wrap: wrap; }
+  nav { flex-basis: 100%; }
+}
