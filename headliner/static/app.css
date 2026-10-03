@@ -248,3 +248,39 @@ footer .warn, dl.build-info .warn { color: var(--warn, #b35c00); }
 dl.build-info { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; font-size: 0.9rem; }
 dl.build-info dt { color: var(--muted); }
 dl.build-info dd { margin: 0; overflow-wrap: anywhere; }
+
+/* Charts (headliner/charts.py): SVG coloured by class only */
+:root { --chart: #b5552e; --chart-soft: #e7c3b2; --chart-line: #3c3a37; --chart-grid: #e2ddd5; }
+@media (prefers-color-scheme: dark) {
+  :root { --chart: #e0794d; --chart-soft: #6b4636; --chart-line: #ece6dc; --chart-grid: #3b3732; }
+}
+figure.chart { margin: 0.5rem 0 1rem; }
+.chart svg { display: block; width: 100%; }
+.c-bar { fill: var(--chart-soft); }
+.c-bar.now { fill: var(--chart); }
+.c-bar.later { fill: var(--chart-grid); }
+.c-avg { fill: none; stroke: var(--chart-line); stroke-width: 1.5; stroke-dasharray: 4 3; }
+.c-grid { stroke: var(--chart-grid); stroke-width: 1; }
+.c-track { stroke: var(--chart-grid); stroke-width: 1; }
+.c-dot { stroke: var(--chart-soft); stroke-width: 11; stroke-linecap: round; }
+.c-dot.first { stroke: var(--chart); }
+a:hover > .c-dot, a:focus > .c-dot { stroke: var(--chart-line); }
+svg.bars { height: 6rem; }
+.axis { display: flex; font-size: 0.7rem; color: var(--muted); }
+.axis.even > span { flex: 1 1 0; text-align: center; min-width: 0; }
+.axis.spread { justify-content: space-between; }
+ol.hbars, ol.lanes { list-style: none; margin: 0; padding: 0; }
+ol.hbars li { display: grid; grid-template-columns: minmax(0, 14rem) 1fr 3rem; gap: 0.5rem; align-items: center; margin: 0.15rem 0; }
+.hb-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.85rem; }
+svg.hb-bar { height: 0.9rem; }
+.hb-value { text-align: right; font-size: 0.85rem; font-variant-numeric: tabular-nums; }
+ol.lanes li { display: grid; grid-template-columns: minmax(0, 9rem) 1fr; gap: 0.5rem; align-items: center; }
+.lane-label { font-size: 0.8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+svg.lane { height: 1.4rem; overflow: visible; }
+li.lane-axis .axis { display: flex; }
+.chart-data { font-size: 0.8rem; }
+.chart-data summary { color: var(--muted); cursor: pointer; }
+@media (max-width: 40rem) {
+  ol.lanes li { grid-template-columns: minmax(0, 5.5rem) 1fr; }
+  ol.hbars li { grid-template-columns: minmax(0, 8rem) 1fr 2.5rem; }
+}
