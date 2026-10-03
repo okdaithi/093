@@ -34,7 +34,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 from headliner import build as build_info
-from headliner import charts, local_timezone, rewrites, tz_abbrev
+from headliner import charts, local_timezone, network, rewrites, tz_abbrev
 from headliner.backup import default_dir, list_backups
 from headliner.config import Config, ConfigError, load_config
 from headliner.markup import EMPTY, Markup, esc, join, render
@@ -484,6 +484,7 @@ class WebApp:
         config = self.config
         sources: dict[str, Any] | None = None
         problems: list[dict[str, Any]] = []
+        network_down = False
         if config is not None:
             names = [source.name for source in config.sources]
             statuses = {status.name: status for status in source_status(conn, names)}
@@ -509,7 +510,13 @@ class WebApp:
                 "states": dict(sorted(states.items())),
             }
             attention = [p["name"] for p in problems if p["state"] != "skipped"]
-            if attention:
+            failed = [p for p in problems if p["state"] == "failed"]
+            # Nearly every source failing with DNS/routing errors is the machine's
+            # network (or VPN), not that many broken feeds.
+            network_down = len(failed) >= max(3, sources["enabled"] * 0.8) and all(
+                network.is_network_error(p["error"]) for p in failed
+            )
+            if attention and not network_down:
                 checks.append(f"{len(attention)} source(s) need attention")
         else:
             checks.append(f"sources file not loaded: {self._config_error}")
@@ -518,7 +525,13 @@ class WebApp:
         else:
             if now - runs[0].finished_at > RUN_LATE_AFTER:
                 checks.append(f"last run finished {runs[0].finished_at:%Y-%m-%d %H:%M}Z")
-            if runs[0].failed:
+            if network_down:
+                checks.append(
+                    f"network down: the {runs[0].started_at:%H:%M}Z run failed on "
+                    f"{runs[0].failed} source(s) with DNS or connection errors "
+                    "(check ProtonVPN/Tailscale DNS), not a feed problem"
+                )
+            elif runs[0].failed:
                 checks.append(f"last run: {runs[0].failed} source(s) failed")
         backups = list_backups(default_dir(self.db_path), self.db_path.stem)
         if not backups:
@@ -527,6 +540,7 @@ class WebApp:
             checks.append(f"latest backup is from {backups[0].taken_at:%Y-%m-%d}")
         return {
             "status": "attention" if checks else "ok",
+            "network_down": network_down,
             "checks": checks,
             "checked_at": now.isoformat(timespec="seconds"),
             "schema": version,
