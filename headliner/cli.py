@@ -11,6 +11,7 @@ import csv
 import json
 import logging
 import re
+import socket
 import sys
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
@@ -18,7 +19,7 @@ from pathlib import Path
 from typing import Final, TextIO
 from urllib.parse import urlsplit
 
-from headliner import __version__, local_timezone, network, tz_abbrev
+from headliner import __version__, build, local_timezone, network, notify, tz_abbrev
 from headliner.backup import DEFAULT_KEEP_DAILY, DEFAULT_KEEP_WEEKLY, BackupError, run_backup
 from headliner.config import (
     DEFAULT_CONFIG_PATH,
@@ -696,7 +697,21 @@ def cmd_watchdog(args: argparse.Namespace) -> int:
         logger.warning("%s", exc)
         urls = []
     ctx = watchdog.Context(db_path=args.db, hosts=watchdog.choose_hosts(urls))
-    checks, _events = watchdog.run_once(ctx, args.state, self_heal=not args.no_heal)
+    notifier = None
+    if not args.no_notify:
+        token = notify.load_token(args.github_token_file)
+        if token is None:
+            logger.info("no GitHub token at %s: alerts are logged only", args.github_token_file)
+        else:
+            installed = build.load()
+            notifier = notify.Notifier(
+                client=notify.GitHub(token, args.github_repo),
+                host=socket.gethostname(),
+                build=installed.label if installed else "development build",
+            )
+    checks, _events = watchdog.run_once(
+        ctx, args.state, self_heal=not args.no_heal, notifier=notifier
+    )
     for check in checks:
         print(f"{check.level.upper():4}  {check.name:9} {check.detail}")
     levels = {check.level for check in checks}
@@ -1016,6 +1031,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="do not flush DNS caches or restart systemd-resolved during a DNS outage",
     )
+    dog.add_argument(
+        "--github-repo",
+        default="okdaithi/093",
+        help="repository whose issues receive alerts and the heartbeat (default: %(default)s)",
+    )
+    dog.add_argument(
+        "--github-token-file",
+        type=Path,
+        default=Path("/etc/headliner/github-token"),
+        help="file holding a GitHub token with Issues read/write on that repository only; "
+        "without it nothing is sent (default: %(default)s)",
+    )
+    dog.add_argument("--no-notify", action="store_true", help="do not send anything to GitHub")
     dog.add_argument(
         "--exit-status",
         action="store_true",

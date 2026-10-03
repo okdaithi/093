@@ -230,8 +230,43 @@ A failure is announced after about 10 minutes, a warning after about an hour,
 reminders repeat every 6 hours, and a recovery is announced after any alert. When
 `dns` has failed for ten minutes the watchdog flushes the DNS caches and restarts
 `systemd-resolved` (at most once an hour, `--no-heal` to turn it off). It never
-touches the VPN. Events are kept in the state file's `pending` list until a
-notifier delivers them.
+touches the VPN.
+
+### Notifications (GitHub issues)
+
+With a token in `/etc/headliner/github-token` the watchdog tells you through
+GitHub issues on `okdaithi/093`, which GitHub emails to you (nothing else is
+contacted):
+
+- **One issue per problem**, titled `headliner health: DNS not resolving` and so
+  on, with the detail and a first thing to try. Reminders are comments; when the
+  check passes again it comments "Recovered after ..." and closes the issue.
+  While the network is down nothing can be sent, so events wait in the state
+  file's `pending` list and arrive, in order, once it is back.
+- **A heartbeat issue**, `headliner heartbeat (machine-written, do not close)`,
+  whose body is rewritten every 10 minutes with `last_ok:` (edits send no
+  email). The cloud routine "headliner dead-man's switch (hourly)" reads it and
+  opens `headliner: NUC silent (no heartbeat)` if `last_ok` is over 45 minutes
+  old, which covers a dead machine, network or watchdog; it closes that issue
+  when the heartbeat returns.
+- **A banner** on every viewer page while an announced problem lasts (or the
+  watchdog itself has been silent for 35 minutes), and `watchdog` in
+  `/api/status`.
+
+Create the token on GitHub (Settings, Developer settings, Fine-grained tokens):
+repository access **only `okdaithi/093`**, permission **Issues: Read and write**,
+expiry 90 days. Then install it without it appearing on a command line or in
+shell history:
+
+```bash
+read -rsp 'Paste token: ' T; echo
+printf '%s' "$T" | sudo install -m 0600 -o root -g root /dev/stdin /etc/headliner/github-token
+unset T
+```
+
+Without the file the watchdog still checks, logs and shows the banner; it just
+sends nothing. `--no-notify` turns sending off, `--github-repo` and
+`--github-token-file` change where it goes.
 
 ## Backups
 

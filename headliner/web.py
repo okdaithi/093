@@ -109,6 +109,8 @@ BRIEFING_TOP: Final = 8
 BRIEFING_PER_COUNTRY: Final = 3
 # Days of history behind the Briefing's "typical day" line.
 BRIEFING_BASELINE_DAYS: Final = 7
+# The watchdog runs every 10 minutes; this long without a report is itself a problem.
+WATCHDOG_STALE_AFTER: Final = timedelta(minutes=35)
 NAV_PRIMARY: Final = (
     ("/", "Briefing"),
     ("/latest", "Latest"),
@@ -369,6 +371,7 @@ class WebApp:
         self._story_cache: dict[tuple[object, ...], list[Story]] = {}
         self._story_lock = threading.Lock()
         self._publishers: tuple[Config | None, dict[str, str]] = (None, {})
+        self._watchdog: tuple[int, dict[str, Any]] = (0, {})
         self.build = build_info.load()
         self._totals: tuple[tuple[object, ...], Totals] | None = None
 
@@ -541,6 +544,7 @@ class WebApp:
         return {
             "status": "attention" if checks else "ok",
             "network_down": network_down,
+            "watchdog": self.watchdog_problems(),
             "checks": checks,
             "checked_at": now.isoformat(timespec="seconds"),
             "schema": version,
@@ -735,6 +739,7 @@ class WebApp:
             if self._config_error
             else Markup("")
         )
+        warning = join([warning, self.watchdog_banner(clock)])
         return render(
             """<!doctype html>
 <html lang="en">
@@ -776,6 +781,71 @@ or <a href="{switch}">show times in {other}</a>.
             other=other,
             build=self.build_line(request, clock),
         )
+
+    def watchdog_state(self) -> dict[str, Any]:
+        """The watchdog's saved state (next to the database), re-read only when it changes."""
+        path = self.db_path.parent / "watchdog.json"
+        try:
+            stamp = path.stat().st_mtime_ns
+        except OSError:
+            return {}
+        if self._watchdog[0] != stamp:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = {}
+            self._watchdog = (stamp, data if isinstance(data, dict) else {})
+        return self._watchdog[1]
+
+    def watchdog_problems(self) -> list[dict[str, str]]:
+        """Announced problems (still failing) and whether the watchdog itself has gone quiet."""
+        state = self.watchdog_state()
+        if not state:
+            return []
+        problems = [
+            {
+                "check": name,
+                "level": entry["level"],
+                "detail": entry.get("detail", ""),
+                "since": entry.get("since", ""),
+            }
+            for name, entry in sorted(state.get("checks", {}).items())
+            if isinstance(entry, dict)
+            and entry.get("level") in {"warn", "fail"}
+            and entry.get("notified_level", "ok") != "ok"
+        ]
+        try:
+            updated = datetime.fromisoformat(state["updated_at"])
+        except (KeyError, ValueError):
+            return problems
+        if utcnow() - updated > WATCHDOG_STALE_AFTER:
+            problems.append(
+                {
+                    "check": "watchdog",
+                    "level": "fail",
+                    "detail": "the health watchdog has not reported",
+                    "since": state["updated_at"],
+                }
+            )
+        return problems
+
+    def watchdog_banner(self, clock: Clock) -> Markup:
+        """A notice on every page while the watchdog has an announced problem."""
+        problems = self.watchdog_problems()
+        if not problems:
+            return EMPTY
+        items = join(
+            render(
+                "<li><strong>{check}</strong>: {detail} (since {since})</li>",
+                check=problem["check"],
+                detail=problem["detail"],
+                since=clock.time(datetime.fromisoformat(problem["since"]), "%a %H:%M")
+                if problem["since"]
+                else "unknown",
+            )
+            for problem in problems
+        )
+        return render('<div class="notice bad" role="alert"><ul>{i}</ul></div>', i=items)
 
     def build_line(self, request: Request, clock: Clock) -> Markup:
         """The footer's "which code is this" line."""
