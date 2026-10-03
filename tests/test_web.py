@@ -702,3 +702,69 @@ def test_footer_and_json_show_the_installed_build(db_path: Path, config_path: Pa
 def test_heatmaps_have_a_shading_key(get: Call) -> None:
     _, _, body = get("/trends")
     assert 'class="legend"' in body
+
+
+def test_story_page_has_a_timeline(db_path: Path, config_path: Path) -> None:
+    with connect(db_path) as conn:
+        store_headlines(
+            conn,
+            [
+                headline(
+                    "Harbour bridge closure extended for repairs",
+                    "https://other.example/bridge",
+                    source="Other Daily",
+                ),
+            ],
+        )
+        conn.commit()
+    get = make_client(WebApp(db_path, config_path))
+    _, _, body = get("/story?url=" + quote("https://example.org/bridge", safe=""))
+    assert "<h2>Timeline</h2>" in body
+    assert body.count('class="c-dot') == 2
+    assert 'class="c-dot first"' in body
+
+
+def test_briefing_shows_today_at_a_glance(get: Call) -> None:
+    _, _, body = get("/")
+    assert "Today at a glance" in body
+    assert body.count('class="c-bar') == 24
+    assert "style=" not in body
+
+
+def test_rewrites_page_charts_and_kind_filter(get: Call) -> None:
+    _, _, body = get("/rewrites")
+    assert "Kinds of rewrite" in body
+    assert 'class="c-arc' in body
+    assert 'class="badge kind"' in body
+    kind = re.search(r'class="badge kind">([^<]+)<', body)
+    assert kind is not None
+    _, _, only = get("/rewrites?kind=" + quote(kind.group(1)))
+    assert "No title changes match." not in only
+    _, _, none = get("/rewrites?kind=label")
+    assert "No title changes match." in none
+    assert "style=" not in body
+
+
+def test_stories_cards_show_spread_bars(db_path: Path, config_path: Path) -> None:
+    with connect(db_path) as conn:
+        store_headlines(
+            conn,
+            [
+                headline(
+                    "Harbour bridge closure extended for repairs",
+                    "https://other.example/bridge",
+                    source="Other Daily",
+                ),
+            ],
+        )
+        conn.commit()
+    _, _, body = make_client(WebApp(db_path, config_path))("/stories")
+    assert 'class="spread"' in body
+
+
+def test_trends_country_rows_and_relative_shading(get: Call) -> None:
+    _, _, body = get("/trends")
+    assert "<h3>By country</h3>" in body
+    assert "tag=AU" in body and "tag=IE" in body
+    _, _, relative = get("/trends?shade=row")
+    assert "own busiest day" in relative
