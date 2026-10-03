@@ -171,7 +171,7 @@ headliner web --db headlines.db --sources sources.yaml   # http://127.0.0.1:8090
 There is no login, so only listen on networks you trust.
 
 **On the server**, the installer adds `headliner-web.service`, which runs as the
-`headliner` user on port 8090, on all interfaces. Enable it once:
+`headliner` user on port 8090, on localhost only. Enable it once:
 
 ```bash
 sudo systemctl enable --now headliner-web.service
@@ -183,9 +183,11 @@ Redeploys restart it on the new code. To reach it over Tailscale with HTTPS:
 sudo tailscale serve --bg --https 8444 http://127.0.0.1:8090
 ```
 
-To keep it off the home network and serve it only through Tailscale, change
-`--host 0.0.0.0` to `--host 127.0.0.1` with `sudo systemctl edit --full
-headliner-web.service`. Logs: `journalctl -u headliner-web.service`.
+The service listens on `127.0.0.1` only, so Tailscale Serve is the way in. To serve
+the home network as well, override the command with `sudo systemctl edit
+headliner-web.service` (`ExecStart=` then the same line with `--host 0.0.0.0`; an
+override survives redeploys, and a VPN kill switch may still block inbound LAN
+traffic). Logs: `journalctl -u headliner-web.service`.
 
 **Keyboard shortcuts:** `j`/`k` move through items, `o` or Enter opens one,
 `/` searches, `g` then `b`/`l`/`s`/`t`/`r`/`o` goes to Briefing, Latest, Stories,

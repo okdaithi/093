@@ -136,7 +136,6 @@ def test_select_skips_disabled_sources() -> None:
 def test_shipped_sources_yaml_is_valid() -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "sources.yaml")
     assert len(config.sources) >= 8
-    assert any(source.type == "html" for source in config.sources)
     assert sum(1 for source in config.sources if source.type == "rss") >= 8
     assert "contact" in config.settings.user_agent
 

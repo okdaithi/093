@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import time
 from datetime import UTC, datetime
-from pathlib import Path
 
 import pytest
 from headliner.config import Source
@@ -180,24 +179,6 @@ def test_parse_datetime_treats_naive_iso_as_utc_regardless_of_host_tz(
     finally:
         monkeypatch.undo()
         time.tzset()
-
-
-def test_shipped_html_source_selectors_work_against_the_fixture(listing_bytes: bytes) -> None:
-    """The selectors in the committed sources.yaml must parse markup of this shape.
-
-    The live site cannot be reached from the test suite, so this pins the
-    selector strings against a fixture built to mirror that page's structure.
-    """
-    from headliner.config import load_config
-
-    config = load_config(Path(__file__).resolve().parents[1] / "sources.yaml")
-    html_sources = [source for source in config.sources if source.type == "html"]
-    assert html_sources, "sources.yaml should ship at least one html source"
-
-    for source in html_sources:
-        headlines = parse_html(listing_bytes, source)
-        assert headlines, f"{source.name}: selectors matched nothing"
-        assert all(headline.url.startswith("http") for headline in headlines)
 
 
 SECTIONED_FEED = b"""<?xml version="1.0"?><rss version="2.0"><channel><title>Radio</title>

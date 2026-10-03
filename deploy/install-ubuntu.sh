@@ -190,7 +190,7 @@ Inspect runs with: journalctl -u headliner.service
 Daily backups (enabled automatically once headliner.timer is enabled):
   systemctl enable --now headliner-backup.timer    # /var/lib/headliner/backups
 
-Optional read-only web viewer (port 8090, home network + localhost):
+Optional read-only web viewer (port 8090, localhost only; reach it through Tailscale):
   systemctl enable --now headliner-web.service
   Tailnet HTTPS: tailscale serve --bg --https 8444 http://127.0.0.1:8090
 INSTRUCTIONS

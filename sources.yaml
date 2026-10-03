@@ -196,15 +196,8 @@ sources:
     group: npr
     tags: [US]
 
-  # robots.txt currently disallows this page, so every run skips it.
-  - name: NPR Text
-    url: https://text.npr.org/
-    type: html
-    group: npr
-    tags: [US]
-    article_selector: ".topic-container li"
-    title_selector: "a"
-    link_selector: "a"
+  # Removed 2026-10-03: NPR Text (text.npr.org). Its robots.txt disallows the page, so every
+  # run skipped it; NPR News above already covers NPR.
 
   # --- Ireland: Galway (batches/2026-10-03-global.txt) -------------------------
   # RTE Galway has no feed of its own; its stories come through RTE News.
