@@ -651,3 +651,54 @@ def test_script_is_served_and_allowed_only_from_self(get: Call) -> None:
     assert "script-src 'self'" in headers["Content-Security-Policy"]
     assert '<script src="/static/app.js" defer></script>' in page
     assert "<script>" not in page
+
+
+BUILD_RECORD = {
+    "commit": "0123456789abcdef0123456789abcdef01234567",
+    "committed_at": "2026-10-03T05:06:04+08:00",
+    "branch": "main",
+    "dirty": False,
+    "repository": "owner/repo",
+    "built_at": "2026-10-03T00:00:00+00:00",
+    "merge": {
+        "commit": "0123456789abcdef0123456789abcdef01234567",
+        "date": "2026-10-03T05:06:04+08:00",
+        "subject": "Merge pull request #28 from owner/branch",
+        "pr": 28,
+        "title": "Show <deploy> details",
+    },
+    "pr": None,
+}
+
+
+def test_footer_shows_a_development_build_without_a_record(get: Call) -> None:
+    _, _, body = get("/latest")
+    assert "Development build" in body
+    _, _, sources = get("/sources")
+    assert 'id="build"' in sources
+    assert "Database schema" in sources
+
+
+def test_footer_and_json_show_the_installed_build(db_path: Path, config_path: Path) -> None:
+    from headliner import build
+
+    app = WebApp(db_path, config_path)
+    app.build = build.parse(BUILD_RECORD)
+    get = make_client(app)
+    _, _, body = get("/latest")
+    footer = body.split("<footer>", 1)[1]
+    assert "<code>0123456</code>" in footer
+    # The PR comes from the latest merge when GitHub was not reachable.
+    assert 'href="https://github.com/owner/repo/pull/28"' in footer
+    assert "Show &lt;deploy&gt; details" in footer
+    _, _, sources = get("/sources")
+    assert "Latest merge" in sources
+    _, _, health = get("/healthz")
+    assert json.loads(health)["build"]["merge"]["pr"] == 28
+    _, _, status = get("/api/status")
+    assert json.loads(status)["build"]["commit"] == BUILD_RECORD["commit"]
+
+
+def test_heatmaps_have_a_shading_key(get: Call) -> None:
+    _, _, body = get("/trends")
+    assert 'class="legend"' in body

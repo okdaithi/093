@@ -47,10 +47,12 @@ Repository = "https://github.com/okdaithi/093"
 packages = ["headliner"]
 
 [tool.setuptools.package-data]
-headliner = ["py.typed", "static/*.css", "static/*.js"]
+headliner = ["py.typed", "_build.json", "static/*.css", "static/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# tests import deploy/deployment_info.py as `deploy.deployment_info`.
+pythonpath = ["."]
 addopts = "-q"
 filterwarnings = ["error::DeprecationWarning:headliner.*"]
 

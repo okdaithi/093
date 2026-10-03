@@ -187,6 +187,15 @@ To keep it off the home network and serve it only through Tailscale, change
 `--host 0.0.0.0` to `--host 127.0.0.1` with `sudo systemctl edit --full
 headliner-web.service`. Logs: `journalctl -u headliner-web.service`.
 
+**Which version is running?** The installer records the deployed commit, the
+latest merged pull request and the install time in `headliner/_build.json`
+inside the installed package. The viewer shows it in every page's footer, in
+full under "About this build" on the Sources page, and as `build` in
+`/healthz` and `/api/status` (`curl -s http://127.0.0.1:8090/healthz | jq .build`).
+The pull request comes from GitHub when it can be reached, otherwise from the
+latest "Merge pull request #N" commit in local history. A checkout run in place
+shows "Development build".
+
 ## Backups
 
 Title history can't be fetched again, so back the database up.

@@ -21,3 +21,6 @@ headlines.db-shm
 *.db
 *.db-wal
 *.db-shm
+
+# Written by deploy/install-ubuntu.sh at install time
+headliner/_build.json

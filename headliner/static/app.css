@@ -236,3 +236,15 @@ mark.own { background: var(--mark); color: inherit; padding: 0 0.1em; border-rad
 a.source { color: inherit; font-weight: 600; }
 .heatmap.hours td, .heatmap.hours th { min-width: 1.6rem; padding: 0.3rem 0.15rem; }
 p.chips .chip { margin: 0 0.25rem 0.3rem 0; display: inline-block; }
+
+/* Heatmap keys */
+.legend { display: flex; flex-wrap: wrap; align-items: center; gap: 0.2rem; font-size: 0.75rem; color: var(--muted); margin: 0.3rem 0 0.8rem; }
+.legend .heat { display: inline-block; min-width: 2.2rem; padding: 0.1rem 0.3rem; text-align: center; border-radius: 2px; }
+
+/* Which code is running */
+footer .build { display: block; margin-top: 0.3rem; }
+footer .build code { font-size: 0.85em; }
+footer .warn, dl.build-info .warn { color: var(--warn, #b35c00); }
+dl.build-info { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; font-size: 0.9rem; }
+dl.build-info dt { color: var(--muted); }
+dl.build-info dd { margin: 0; overflow-wrap: anywhere; }

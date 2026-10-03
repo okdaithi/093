@@ -111,3 +111,33 @@ def test_github_failure_does_not_hide_commit(
     assert f"Commit: {COMMIT}" in output
     assert "GitHub PR: lookup unavailable" in output
     assert "network unavailable" in output
+
+
+def test_build_record_names_the_latest_merge(monkeypatch: pytest.MonkeyPatch) -> None:
+    def git_output(_repo: Path, *args: str) -> str | None:
+        answers = {
+            ("rev-parse", "HEAD"): COMMIT,
+            ("status", "--porcelain"): " M README.md",
+            ("config", "--get", "remote.origin.url"): "git@github.com:owner/repo.git",
+            ("show", "-s", "--format=%cI", "HEAD"): "2026-10-03T05:06:04+08:00",
+            ("rev-parse", "--abbrev-ref", "HEAD"): "main",
+        }
+        if args[:2] == ("log", "--merges"):
+            fields = (COMMIT, "2026-10-03T05:06:04+08:00", "Merge pull request #28 from o/b")
+            return "\x1f".join((*fields, "\nShow PR details\n"))
+        return answers[args]
+
+    def fail_lookup(*_args: str) -> None:
+        raise urllib.error.URLError("network unavailable")
+
+    monkeypatch.setattr(deployment_info, "_git_output", git_output)
+    monkeypatch.setattr(deployment_info, "_fetch_pull_request", fail_lookup)
+
+    record = deployment_info.build_record(Path())
+
+    assert record["commit"] == COMMIT
+    assert record["dirty"] is True
+    assert record["repository"] == "owner/repo"
+    assert record["pr"] is None
+    assert record["merge"]["pr"] == 28
+    assert record["merge"]["title"] == "Show PR details"

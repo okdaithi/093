@@ -11,6 +11,7 @@ import time
 from datetime import UTC, datetime, timedelta, tzinfo
 
 if not hasattr(time, "tzset"):
+
     def tzset() -> None:
         """Polyfill for Windows so tests and callers can set the TZ override in-process."""
 
@@ -39,22 +40,26 @@ class FixedTimezone(tzinfo):
         if dt is None:
             return False
         month = dt.month
-        if self.key in {"Australia/Sydney", "Australia/Adelaide", "Australia/Melbourne", "Australia/Hobart"}:
+        if self.key in {
+            "Australia/Sydney",
+            "Australia/Adelaide",
+            "Australia/Melbourne",
+            "Australia/Hobart",
+        }:
             return month in {10, 11, 12, 1, 2, 3}
         if self.key == "Europe/London":
             return month in {3, 4, 5, 6, 7, 8}
         return False
 
-    def utcoffset(self, dt):
-        offset = self._daylight_offset if self._is_daylight(dt) else self._standard_offset
-        return offset
+    def utcoffset(self, dt: datetime | None) -> timedelta:
+        return self._daylight_offset if self._is_daylight(dt) else self._standard_offset
 
-    def dst(self, dt):
+    def dst(self, dt: datetime | None) -> timedelta:
         if self._is_daylight(dt):
             return self._daylight_offset - self._standard_offset
         return timedelta(0)
 
-    def tzname(self, dt):
+    def tzname(self, dt: datetime | None) -> str:
         if self._is_daylight(dt):
             return self._daylight_name
         return self._standard_name
@@ -66,7 +71,7 @@ class FixedTimezone(tzinfo):
         return self.key
 
 
-def local_timezone():
+def local_timezone() -> tzinfo:
     """Return the active local timezone, honoring TZ when it is set."""
     tz_name = os.environ.get("TZ")
     if tz_name:
@@ -103,7 +108,7 @@ def local_timezone():
     return local or UTC
 
 
-def tz_abbrev(value) -> str:
+def tz_abbrev(value: datetime | tzinfo | None) -> str:
     """Use a compact zone abbreviation for a value or tzinfo, including DST changes."""
     tzinfo = value.tzinfo if isinstance(value, datetime) else value
     if tzinfo is None:
