@@ -346,3 +346,7 @@ dialog.keys kbd { font-family: inherit; border: 1px solid var(--chip); border-ra
   .bar { flex-wrap: wrap; }
   nav { flex-basis: 100%; }
 }
+
+/* Watchdog banner: a problem the health watchdog has announced */
+.notice.bad { border-left-color: var(--bad); }
+.notice.bad ul { margin: 0; padding-left: 1.1rem; }

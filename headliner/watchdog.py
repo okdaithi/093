@@ -28,7 +28,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Final
 
-from headliner import network
+from headliner import network, notify
 from headliner.backup import default_dir, list_backups
 from headliner.models import utcnow
 from headliner.store import connect_readonly, recent_runs
@@ -440,8 +440,31 @@ def choose_hosts(sources_urls: Sequence[str]) -> list[str]:
     return [*hosts, *(host for host in FALLBACK_HOSTS if host not in hosts)][:4]
 
 
+def send_notifications(
+    state: dict[str, Any], notifier: notify.Notifier, checks: Sequence[Check], now: datetime
+) -> None:
+    """Deliver pending events, then record the heartbeat. Failures leave the events pending."""
+    try:
+        sent = notify.deliver(state, notifier.client)
+        if sent:
+            logger.info("delivered %d watchdog event(s) to GitHub", sent)
+        failing = [check.name for check in checks if check.level != OK]
+        body = notify.heartbeat_body(now, notifier.host, notifier.build, failing)
+        notify.beat(state, notifier.client, body)
+    except notify.NotifyError as exc:
+        logger.error(
+            "cannot notify via GitHub: %s (%d event(s) pending)",
+            exc,
+            len(state.get("pending", [])),
+        )
+
+
 def run_once(
-    ctx: Context, state_path: Path, *, self_heal: bool = True
+    ctx: Context,
+    state_path: Path,
+    *,
+    self_heal: bool = True,
+    notifier: notify.Notifier | None = None,
 ) -> tuple[list[Check], list[Event]]:
     """One watchdog tick: check, maybe repair the resolver, update and save the state."""
     now = ctx.probes.now()
@@ -462,7 +485,14 @@ def run_once(
             for check in checks
         ]
     new_state, events = update_state(state, checks, now)
+    # Issues opened so far and the heartbeat issue live in the same file.
+    for key in ("issues", "heartbeat_issue"):
+        if key in state:
+            new_state[key] = state[key]
     save_state(state_path, new_state)
+    if notifier is not None:
+        send_notifications(new_state, notifier, checks, now)
+        save_state(state_path, new_state)
     for event in events:
         log = logger.error if event.kind != "recover" else logger.info
         log("watchdog %s: %s (%s) since %s", event.kind, event.check, event.detail, event.since)
