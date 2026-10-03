@@ -187,6 +187,11 @@ To keep it off the home network and serve it only through Tailscale, change
 `--host 0.0.0.0` to `--host 127.0.0.1` with `sudo systemctl edit --full
 headliner-web.service`. Logs: `journalctl -u headliner-web.service`.
 
+**Keyboard shortcuts:** `j`/`k` move through items, `o` or Enter opens one,
+`/` searches, `g` then `b`/`l`/`s`/`t`/`r`/`o` goes to Briefing, Latest, Stories,
+Trends, Rewrites or Sources, and `?` lists them. Tables with clickable column
+headers (Sources, Trends) sort by that column.
+
 **Which version is running?** The installer records the deployed commit, the
 latest merged pull request and the install time in `headliner/_build.json`
 inside the installed package. The viewer shows it in every page's footer, in
