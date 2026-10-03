@@ -829,6 +829,14 @@ or <a href="{switch}">show times in {other}</a>.
             )
         return problems
 
+    @staticmethod
+    def since_label(value: str, clock: Clock) -> Markup | str:
+        """A watchdog timestamp for the banner; a damaged state file must not break pages."""
+        try:
+            return clock.time(datetime.fromisoformat(value), "%a %H:%M")
+        except ValueError:
+            return "unknown"
+
     def watchdog_banner(self, clock: Clock) -> Markup:
         """A notice on every page while the watchdog has an announced problem."""
         problems = self.watchdog_problems()
@@ -839,9 +847,7 @@ or <a href="{switch}">show times in {other}</a>.
                 "<li><strong>{check}</strong>: {detail} (since {since})</li>",
                 check=problem["check"],
                 detail=problem["detail"],
-                since=clock.time(datetime.fromisoformat(problem["since"]), "%a %H:%M")
-                if problem["since"]
-                else "unknown",
+                since=self.since_label(problem["since"], clock),
             )
             for problem in problems
         )

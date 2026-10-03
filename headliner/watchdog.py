@@ -449,14 +449,21 @@ def choose_hosts(sources_urls: Sequence[str]) -> list[str]:
 def send_notifications(
     state: dict[str, Any], notifier: notify.Notifier, checks: Sequence[Check], now: datetime
 ) -> None:
-    """Deliver pending events, then record the heartbeat. Failures leave the events pending."""
+    """Record the heartbeat and deliver pending events, each on its own.
+
+    The heartbeat goes first and does not depend on delivery: GitHub refusing one
+    comment must not make a healthy machine look dead. Failures leave the events pending.
+    """
+    failing = [check.name for check in checks if check.level != OK]
+    body = notify.heartbeat_body(now, notifier.host, notifier.build, failing)
+    try:
+        notify.beat(state, notifier.client, body)
+    except notify.NotifyError as exc:
+        logger.error("cannot write the GitHub heartbeat: %s", exc)
     try:
         sent = notify.deliver(state, notifier.client)
         if sent:
             logger.info("delivered %d watchdog event(s) to GitHub", sent)
-        failing = [check.name for check in checks if check.level != OK]
-        body = notify.heartbeat_body(now, notifier.host, notifier.build, failing)
-        notify.beat(state, notifier.client, body)
     except notify.NotifyError as exc:
         logger.error(
             "cannot notify via GitHub: %s (%d event(s) pending)",
