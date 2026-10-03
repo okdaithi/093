@@ -774,7 +774,7 @@ def test_nav_folds_less_used_pages_under_more(get: Call) -> None:
     _, _, body = get("/sources")
     nav = body.split("<nav>", 1)[1].split("</nav>", 1)[0]
     assert nav.count('data-nav="') == 4
-    assert "<summary>More · Sources</summary>" in nav
+    assert '<summary class="current" title="Now on Sources">More</summary>' in nav
     assert nav.count('href="/sources"') == 2
 
 
