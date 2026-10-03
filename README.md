@@ -379,6 +379,18 @@ with `--dry-run`. See [Schema upgrades](#schema-upgrades).
 | `0` | Everything succeeded. A source skipped by `robots.txt` counts as success. |
 | `1` | At least one source failed. The rest still ran and were stored. |
 | `2` | Configuration error, bad arguments, or a fatal problem. |
+| `3` | Nothing could be fetched because DNS or the network is down (every source failed with a DNS or connection error). Retry later; see below. |
+
+When DNS or the VPN path is down, every feed fails the same way, and fetching
+through it only wastes a run. `fetch` therefore first checks that up to three of
+the sources' host names resolve. `--wait-network MINUTES` keeps checking (30 s,
+1 min, 2 min, then every 4 min) before giving up; the installed service uses 15.
+If the network never comes back, no feed is requested, each source gets a
+`network down` error in the fetch log, and the exit code is `3`. The Briefing and
+`/api/status` then say "network down" (and `"network_down": true`) instead of
+"66 source(s) need attention". An exit of `3` also starts
+`headliner-retry.service`, which schedules one catch-up fetch
+(`headliner-catchup.service`) 10 minutes later.
 
 ### Stories
 

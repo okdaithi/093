@@ -1,9 +1,7 @@
 [Unit]
-Description=Fetch news headlines
+Description=Fetch news headlines (catch-up after a network outage)
 Wants=network-online.target
 After=network-online.target
-# If the run could not start because DNS/the network was down (exit 3), try once more later.
-OnFailure=headliner-retry.service
 
 [Service]
 Type=oneshot

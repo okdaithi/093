@@ -1,0 +1,10 @@
+[Unit]
+Description=Schedule a catch-up fetch after a network outage
+# Started by headliner.service's OnFailure=. Only exit code 3 (network down) is retried;
+# a partial failure or a bad config is left alone. One retry only: the catch-up unit
+# has no OnFailure=.
+
+[Service]
+Type=oneshot
+ExecCondition=/bin/sh -c 'test "$(systemctl show -p ExecMainStatus --value headliner.service)" = 3'
+ExecStart=/usr/bin/systemd-run --quiet --collect --on-active=10min --unit=headliner-catchup-timer /usr/bin/systemctl start --no-block headliner-catchup.service

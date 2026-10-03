@@ -10,6 +10,12 @@ from headliner.config import Settings, Source
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+@pytest.fixture(autouse=True)
+def dns_works(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`fetch` checks DNS first; tests mock HTTP only, so every host name resolves."""
+    monkeypatch.setattr("headliner.network.resolves", lambda _host: True)
+
+
 @pytest.fixture
 def feed_bytes() -> bytes:
     return (FIXTURES / "sample_feed.xml").read_bytes()

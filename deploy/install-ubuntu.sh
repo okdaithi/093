@@ -39,7 +39,7 @@ fi
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd -- "${script_dir}/.." && pwd)"
 
-for required_file in requirements.txt pyproject.toml deploy/headliner.service deploy/headliner.timer deploy/headliner-web.service deploy/headliner-backup.service deploy/headliner-backup.timer deploy/sources.yaml deploy/deployment_info.py; do
+for required_file in requirements.txt pyproject.toml deploy/headliner.service deploy/headliner-catchup.service deploy/headliner-retry.service deploy/headliner.timer deploy/headliner-web.service deploy/headliner-backup.service deploy/headliner-backup.timer deploy/sources.yaml deploy/deployment_info.py; do
     if [[ ! -f "${repo_dir}/${required_file}" ]]; then
         echo "Missing ${required_file}; run this script from a complete repository checkout." >&2
         exit 1
@@ -137,6 +137,10 @@ fi
 
 install -o root -g root -m 0644 \
     "${repo_dir}/deploy/headliner.service" /etc/systemd/system/headliner.service
+install -o root -g root -m 0644 \
+    "${repo_dir}/deploy/headliner-catchup.service" /etc/systemd/system/headliner-catchup.service
+install -o root -g root -m 0644 \
+    "${repo_dir}/deploy/headliner-retry.service" /etc/systemd/system/headliner-retry.service
 install -o root -g root -m 0644 \
     "${repo_dir}/deploy/headliner.timer" /etc/systemd/system/headliner.timer
 install -o root -g root -m 0644 \

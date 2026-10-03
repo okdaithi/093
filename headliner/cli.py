@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Final, TextIO
 from urllib.parse import urlsplit
 
-from headliner import __version__, local_timezone, tz_abbrev
+from headliner import __version__, local_timezone, network, tz_abbrev
 from headliner.backup import DEFAULT_KEEP_DAILY, DEFAULT_KEEP_WEEKLY, BackupError, run_backup
 from headliner.config import (
     DEFAULT_CONFIG_PATH,
@@ -63,6 +63,8 @@ logger = logging.getLogger("headliner")
 EXIT_OK: Final = 0
 EXIT_PARTIAL_FAILURE: Final = 1
 EXIT_FATAL: Final = 2
+# Nothing could be fetched because DNS or the network is down (not the feeds' fault).
+EXIT_NETWORK: Final = 3
 
 _DURATION_RE: Final = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhdw])\s*$", re.IGNORECASE)
 _DURATION_UNITS: Final = {
@@ -256,7 +258,26 @@ def cmd_fetch(args: argparse.Namespace, config: Config) -> int:
     logger.info(
         "fetching %d source(s) with concurrency %d", len(sources), config.settings.concurrency
     )
-    results = asyncio.run(fetch_all(sources, config.settings, ignore_robots=args.ignore_robots))
+    hosts = network.probe_hosts(source.url for source in sources)
+    if network.wait_until_up(hosts, patience=args.wait_network * 60):
+        results = asyncio.run(fetch_all(sources, config.settings, ignore_robots=args.ignore_robots))
+    else:
+        logger.error(
+            "network down: could not resolve %s; not fetching %d source(s)",
+            ", ".join(hosts),
+            len(sources),
+        )
+        now = utcnow()
+        results = [
+            SourceResult(
+                source=source.name,
+                status="error",
+                started_at=now,
+                finished_at=now,
+                error=network.NETWORK_ERROR,
+            )
+            for source in sources
+        ]
 
     if args.dry_run:
         for result in results:
@@ -290,7 +311,16 @@ def cmd_fetch(args: argparse.Namespace, config: Config) -> int:
                 )
         _summarise(results, dry_run=False)
 
-    return EXIT_OK if all(result.ok for result in results) else EXIT_PARTIAL_FAILURE
+    failures = [result for result in results if not result.ok]
+    if not failures:
+        return EXIT_OK
+    # Every source failing the same DNS/routing way is one problem, not many.
+    if all(network.is_network_error(result.error) for result in failures) and not any(
+        result.status == "ok" for result in results
+    ):
+        logger.error("network down: every source failed with a DNS or connection error")
+        return EXIT_NETWORK
+    return EXIT_PARTIAL_FAILURE
 
 
 def cmd_list(args: argparse.Namespace, config: Config) -> int:
@@ -722,6 +752,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--ignore-robots",
         action="store_true",
         help="do not consult robots.txt (off by default)",
+    )
+    fetch.add_argument(
+        "--wait-network",
+        type=int,
+        default=0,
+        metavar="MINUTES",
+        help="if DNS is down, keep checking for up to this many minutes before fetching "
+        "(default 0: check once); exits 3 if the network never came back",
     )
     fetch.add_argument(
         "--dry-run",
