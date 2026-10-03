@@ -15,7 +15,6 @@ zone named, UTC on request (`?utc=1`), and the UTC ISO timestamp on every
 from __future__ import annotations
 
 import difflib
-import html
 import json
 import logging
 import math
@@ -35,9 +34,10 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 from headliner import build as build_info
-from headliner import local_timezone, tz_abbrev
+from headliner import charts, local_timezone, tz_abbrev
 from headliner.backup import default_dir, list_backups
 from headliner.config import Config, ConfigError, load_config
+from headliner.markup import EMPTY, Markup, esc, join, render
 from headliner.models import Headline, is_minor_change, utcnow
 from headliner.store import (
     SCHEMA_VERSION,
@@ -107,6 +107,10 @@ STORIES_PAGE_SIZE: Final = 30
 BRIEFING_WINDOW: Final = timedelta(hours=12)
 BRIEFING_TOP: Final = 8
 BRIEFING_PER_COUNTRY: Final = 3
+# Days of history behind the Briefing's "typical day" line.
+BRIEFING_BASELINE_DAYS: Final = 7
+STORY_TIMELINE_MIN_SPAN: Final = timedelta(hours=2)
+STORY_TIMELINE_TICKS: Final = 4
 TREND_WINDOWS: Final = {"7d": 7, "14d": 14, "30d": 30}
 HEAT_LEVELS: Final = 5
 # Trends: heatmap rows shown before "show all", rewrite sample size worth ranking,
@@ -143,29 +147,6 @@ _ICON: Final = (
 
 
 # --- HTML building -------------------------------------------------------------
-
-
-class Markup(str):
-    """Text that is already HTML; `esc` passes it through unchanged."""
-
-    __slots__ = ()
-
-
-def esc(value: object) -> Markup:
-    """HTML-escape `value` unless it is already `Markup`."""
-    if isinstance(value, Markup):
-        return value
-    return Markup(html.escape("" if value is None else str(value), quote=True))
-
-
-def render(template: str, **values: object) -> Markup:
-    """`template.format(**values)` with every value escaped (Markup passes through)."""
-    return Markup(template.format(**{key: esc(value) for key, value in values.items()}))
-
-
-def join(parts: Iterable[object], separator: str = "") -> Markup:
-    """Concatenate escaped `parts`."""
-    return Markup(separator.join(esc(part) for part in parts))
 
 
 def _safe_href(url: str) -> str | None:
@@ -256,7 +237,6 @@ class Response:
     headers: list[tuple[str, str]] = field(default_factory=list)
 
 
-EMPTY: Final = Markup("")
 MINOR_BADGE: Final = Markup(
     '<span class="badge minor" title="Only case, punctuation or spacing changed">minor</span>'
 )
@@ -1708,6 +1688,7 @@ alone.</p>
             """<h1>{title}</h1>
 <p class="meta"><strong title="{note}">{n} outlet(s)</strong> {tags}</p>
 {lone}
+{timeline}
 {framing}
 <details><summary>{count} headline(s) with times and sources</summary>
 <ol class="members wide">{members}</ol></details>""",
@@ -1716,9 +1697,63 @@ alone.</p>
             note=self.reach_note(story),
             tags=self.tag_counts(story),
             lone=lone,
+            timeline=self.story_timeline(request, story),
             framing=framing,
             count=len(story.headlines),
             members=self.story_members(request, conn, story),
+        )
+
+    def story_timeline(self, request: Request, story: Story) -> Markup:
+        """When each outlet reported the story: one lane per publisher, a dot per headline."""
+        if len(story.headlines) < 2:
+            return EMPTY
+        clock = Clock(request.utc)
+        publisher = self.publishers()
+        start = story.first_seen
+        span = max(story.last_seen - start, STORY_TIMELINE_MIN_SPAN)
+        # A margin either side keeps the first and last dots off the edges.
+        start -= span * 0.05
+        span *= 1.1
+        lanes: dict[str, list[charts.Dot]] = {}
+        first_url = min(story.headlines, key=lambda h: h.published_at or h.fetched_at).url
+        for item in story.headlines:
+            when = item.published_at or item.fetched_at
+            lanes.setdefault(publisher.get(item.source.casefold(), item.source), []).append(
+                charts.Dot(
+                    at=(when - start) / span,
+                    title=f"{clock.shown(when):%a %H:%M} · {item.source}: {item.title}",
+                    href=self.link(request, "/article", url=item.url, tag=None, source=None),
+                    css="first" if item.url == first_url else "",
+                )
+            )
+        ticks = [
+            f"{clock.shown(start + span * index / STORY_TIMELINE_TICKS):%a %H:%M}"
+            for index in range(STORY_TIMELINE_TICKS + 1)
+        ]
+        names: dict[str, list[str]] = {}
+        for item in story.headlines:
+            key = publisher.get(item.source.casefold(), item.source)
+            names.setdefault(key, [])
+            if item.source not in names[key]:
+                names[key].append(item.source)
+        rows: list[tuple[Markup | str, list[charts.Dot]]] = [
+            (
+                render(
+                    '<span title="{all}">{name} \N{MULTIPLICATION SIGN}{n}</span>',
+                    all=", ".join(names[key]),
+                    name=key,
+                    n=len(names[key]),
+                )
+                if len(names[key]) > 1
+                else names[key][0],
+                dots,
+            )
+            for key, dots in lanes.items()
+        ]
+        label = f"When each outlet reported this, {clock.zone}"
+        return render(
+            "<h2>Timeline</h2>{chart}",
+            chart=charts.swimlanes(rows, label=label, ticks=ticks),
         )
 
     def framing_rows(self, request: Request, conn: sqlite3.Connection, story: Story) -> Markup:
@@ -2014,6 +2049,7 @@ schedule as much as the outlet's own rhythm.</p>
 {health}
 <p class="muted">{fresh} new articles in the last {hours} hours.
 <span class="since-visit" hidden></span></p>
+{glance}
 <h2>Top stories · last {hours} h</h2>
 {top}
 <p><a class="more" href="{all_stories}">All stories →</a></p>
@@ -2022,6 +2058,7 @@ schedule as much as the outlet's own rhythm.</p>
 {changes}
 <p><a class="more" href="{all_rewrites}">All rewrites →</a></p>""",
             health=self.health_strip(request, conn, clock),
+            glance=self.today_glance(conn, clock, now),
             fresh=f"{fresh:,}",
             hours=hours,
             top=render(
@@ -2038,6 +2075,58 @@ schedule as much as the outlet's own rhythm.</p>
             else EMPTY,
             changes=self.change_items(request, changes),
             all_rewrites=self.link(request, "/rewrites", tag=None, source=None),
+        )
+
+    def today_glance(self, conn: sqlite3.Connection, clock: Clock, now: datetime) -> Markup:
+        """Articles first seen in each hour today, against a typical day's line."""
+        shown_now = clock.shown(now)
+        midnight = shown_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_start = midnight.astimezone(UTC)
+        baseline_start = (midnight - timedelta(days=BRIEFING_BASELINE_DAYS)).astimezone(UTC)
+        today = [0] * 24
+        typical = [0.0] * 24
+        for row in first_seen(conn, since=baseline_start):
+            hour = clock.shown(row.fetched_at).hour
+            if row.fetched_at >= today_start:
+                today[hour] += 1
+            else:
+                typical[hour] += 1 / BRIEFING_BASELINE_DAYS
+        if not any(today) and not any(typical):
+            return EMPTY
+        current = shown_now.hour
+        so_far = sum(today)
+        usual = sum(typical[: current + 1])
+        compare = (
+            f" · {round(100 * (so_far - usual) / usual):+d}% against a typical day by this hour"
+            if usual >= 1
+            else ""
+        )
+        return render(
+            '<h2>Today at a glance</h2><p class="muted">{n} articles since midnight{c}. '
+            "The line is the average of the previous {d} days.</p>{chart}{table}",
+            n=f"{so_far:,}",
+            c=compare,
+            d=BRIEFING_BASELINE_DAYS,
+            chart=charts.bars(
+                today,
+                label=f"Articles first seen each hour today ({clock.zone})",
+                ticks=[f"{hour:02d}" if hour % 3 == 0 else "" for hour in range(24)],
+                titles=[
+                    f"{hour:02d}:00 · {count} today · {typical[hour]:.0f} typical"
+                    for hour, count in enumerate(today)
+                ],
+                highlight=current,
+                average=typical,
+                muted_from=current + 1,
+            ),
+            table=charts.data_table(
+                f"Articles per hour ({clock.zone})",
+                ("Hour", "Today", "Typical"),
+                [
+                    (f"{hour:02d}:00", today[hour], f"{typical[hour]:.1f}")
+                    for hour in range(current + 1)
+                ],
+            ),
         )
 
     def health_strip(self, request: Request, conn: sqlite3.Connection, clock: Clock) -> Markup:
