@@ -7,6 +7,7 @@ installed and falls back to `beautifulsoup4` + `lxml` otherwise.
 from __future__ import annotations
 
 import calendar
+import importlib
 import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -29,19 +30,15 @@ _selectolax: Callable[[str], Any] | None = None
 _beautifulsoup: Callable[..., Any] | None = None
 HTML_BACKEND = "none"
 
-try:
-    from selectolax.lexbor import LexborHTMLParser as _lexbor_parser
-
-    _selectolax = _lexbor_parser
-except ImportError:  # pragma: no cover - exercised only without a recent selectolax
+for _module, _name in (
+    ("selectolax.lexbor", "LexborHTMLParser"),
+    ("selectolax.parser", "HTMLParser"),
+):
     try:
-        from selectolax.parser import (
-            HTMLParser as _modest_parser,  # type: ignore[attr-defined,unused-ignore]
-        )
-
-        _selectolax = _modest_parser
-    except ImportError:
-        pass
+        _selectolax = getattr(importlib.import_module(_module), _name)
+    except (ImportError, AttributeError):  # not installed, or a release without that backend
+        continue
+    break
 if _selectolax is not None:
     HTML_BACKEND = "selectolax"
 
