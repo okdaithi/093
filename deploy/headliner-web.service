@@ -9,10 +9,10 @@ Group=headliner
 StateDirectory=headliner
 StateDirectoryMode=0750
 WorkingDirectory=/var/lib/headliner
-# 0.0.0.0 serves the home network too (http://<nuc-ip>:8090/); use 127.0.0.1
-# to serve only through Tailscale Serve. Change it in an override:
-#   systemctl edit headliner-web   ->   [Service] / ExecStart= / ExecStart=...
-ExecStart=/opt/headliner/venv/bin/headliner web --host 0.0.0.0 --port 8090 --sources /etc/headliner/sources.yaml --db /var/lib/headliner/headlines.db
+# Listens on localhost only: Tailscale Serve (tailscale serve --bg --https 8444
+# http://127.0.0.1:8090) is the way in. To serve the home network too, override it:
+#   systemctl edit headliner-web   ->   [Service] / ExecStart= / ExecStart=... --host 0.0.0.0 ...
+ExecStart=/opt/headliner/venv/bin/headliner web --host 127.0.0.1 --port 8090 --sources /etc/headliner/sources.yaml --db /var/lib/headliner/headlines.db
 Restart=on-failure
 RestartSec=5
 UMask=0077
