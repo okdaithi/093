@@ -376,3 +376,20 @@ def test_watchdog_command_prints_checks_and_saves_state(
     assert "dns" in out and "internet" in out and "viewer" in out
     assert json.loads(state.read_text())["checks"]["dns"]["level"] == OK
     assert main([*args, "--exit-status"]) in {EXIT_OK, 1, EXIT_FATAL}
+
+
+def test_the_state_the_drills_seed_produces_an_alert() -> None:
+    """deploy/drill.sh seeds 'failing for 20 minutes' state in exactly this shape."""
+    since = (T0 - timedelta(minutes=20)).isoformat()
+    seeded = {
+        "checks": {
+            name: {"level": "fail", "detail": "drill", "since": since, "notified_level": "ok"}
+            for name in ("dns", "internet")
+        },
+        "pending": [],
+    }
+    state, events = watchdog.update_state(
+        seeded, [Check("dns", FAIL, "x"), Check("internet", FAIL, "y")], T0
+    )
+    assert [(e.kind, e.check) for e in events] == [("alert", "dns"), ("alert", "internet")]
+    assert [e["kind"] for e in state["pending"]] == ["alert", "alert"]

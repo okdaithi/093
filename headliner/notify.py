@@ -47,6 +47,7 @@ LABELS: Final = {
     "viewer": "web viewer not answering",
     "backups": "backups stale",
     "disk": "disk nearly full",
+    "drill": "DRILL: test alert (ignore)",
 }
 HINTS: Final = {
     "dns": "Check `resolvectl status` and ProtonVPN. Before reconnecting the VPN, run "
@@ -60,6 +61,7 @@ HINTS: Final = {
     "viewer": "`journalctl -u headliner-web.service -n 50`",
     "backups": "`systemctl status headliner-backup.service`",
     "disk": "`df -h /var/lib/headliner`",
+    "drill": "This is a test from `deploy/drill.sh notify`; it should close itself within seconds.",
 }
 
 

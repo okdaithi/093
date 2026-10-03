@@ -268,6 +268,37 @@ Without the file the watchdog still checks, logs and shows the banner; it just
 sends nothing. `--no-notify` turns sending off, `--github-repo` and
 `--github-token-file` change where it goes.
 
+### Failure modes and what to do
+
+| What happened | What you see | First steps |
+| --- | --- | --- |
+| DNS or the VPN path is down | `fetch` exits 3 and logs `network down`; Briefing/`/api/status` say "network down"; issue "DNS not resolving"; after 10 min the watchdog flushes DNS caches and restarts `systemd-resolved` | `resolvectl status`; before reconnecting ProtonVPN run `sudo wg show proton0 latest-handshakes` (a stale handshake means the tunnel stalled); a catch-up fetch runs 10 min after the failed one |
+| Raw routing is down | issue "no internet routing" (`dns` and `internet` both fail) | `ip route`, the ProtonVPN connection |
+| Some feeds fail | `sources` warning after about an hour (3 runs in a row), shown on the Sources page | open the feed URL; it has probably moved or is blocking us |
+| A run did not happen | issue "fetch runs failing or late" | `systemctl status headliner.timer`, `journalctl -u headliner.service -n 50` |
+| The viewer or a timer is down | issue "web viewer not answering" or "services not running" | `systemctl status headliner-web.service headliner.timer headliner-backup.timer` |
+| The NUC, its network or the watchdog is down | no heartbeat for 45 minutes: the cloud routine opens "headliner: NUC silent (no heartbeat)" (checked hourly, so allow up to about 2 hours) | power, `systemctl status headliner-watchdog.timer`, then the DNS steps above; if only the GitHub token is bad, `journalctl -u headliner-watchdog.service` says "cannot notify via GitHub" |
+
+### Drills
+
+`deploy/drill.sh` breaks one thing at a time, in a controlled and reversible way,
+and prints PASS or FAIL. It uses scratch copies under `/var/lib/headliner/drill`,
+never the real database or watchdog state, and deletes nothing.
+
+```bash
+sudo bash deploy/drill.sh fetch-dns      # fetch with no network: exit 3, 'network down' logged
+sudo bash deploy/drill.sh watchdog-dns   # watchdog with no network: dns/internet fail, alert queued
+sudo bash deploy/drill.sh viewer         # stops headliner-web for ~20 s; restarted on exit
+sudo bash deploy/drill.sh notify         # sends a real test issue (opened, closed) to GitHub
+sudo bash deploy/drill.sh all
+```
+
+The one chain the script cannot safely fake is the dead-man's switch. To test it
+end to end, stop the heartbeat and wait: `sudo systemctl stop
+headliner-watchdog.timer`; about 45 minutes later, at the next `:17`, the cloud
+routine opens "headliner: NUC silent (no heartbeat)". Then `sudo systemctl start
+headliner-watchdog.timer`; at the following `:17` the routine closes it.
+
 ## Backups
 
 Title history can't be fetched again, so back the database up.
