@@ -690,13 +690,16 @@ def cmd_watchdog(args: argparse.Namespace) -> int:
     """Run the health checks once, print them and update the alert state."""
     from headliner import watchdog
 
+    names: frozenset[str] | None = None
     try:
-        urls = [source.url for source in load_config(args.sources).sources]
+        sources = [source for source in load_config(args.sources).sources if source.enabled]
+        urls = [source.url for source in sources]
+        names = frozenset(source.name.casefold() for source in sources)
     except ConfigError as exc:
         # The checks that do not need the sources list still matter.
         logger.warning("%s", exc)
         urls = []
-    ctx = watchdog.Context(db_path=args.db, hosts=watchdog.choose_hosts(urls))
+    ctx = watchdog.Context(db_path=args.db, hosts=watchdog.choose_hosts(urls), source_names=names)
     notifier = None
     if not args.no_notify:
         token = notify.load_token(args.github_token_file)

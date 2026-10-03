@@ -92,6 +92,10 @@ class Context:
     vpn_interface: str = VPN_INTERFACE
     vpn_dns: str = VPN_DNS_SERVER
     data_dir: Path | None = None
+    # Casefolded names of the sources now configured and enabled. Sources that were
+    # removed keep their history in fetch_log but must not raise alarms; None means
+    # the list is unknown (no sources file), so every logged source counts.
+    source_names: frozenset[str] | None = None
 
 
 # -- Real probes ---------------------------------------------------------------
@@ -223,6 +227,8 @@ def check_sources(ctx: Context) -> Check:
         return Check("sources", WARN, f"cannot read the database: {exc}")
     recent: dict[str, list[str]] = {}
     for source, status in rows:
+        if ctx.source_names is not None and source.casefold() not in ctx.source_names:
+            continue
         statuses = recent.setdefault(source, [])
         if len(statuses) < SOURCE_STREAK:
             statuses.append(status)

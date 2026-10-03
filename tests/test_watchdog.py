@@ -147,6 +147,18 @@ def test_failing_sources_streak(tmp_path: Path) -> None:
     assert check.level == WARN and "Feed 0" in check.detail
 
 
+def test_removed_sources_do_not_raise_alarms(tmp_path: Path) -> None:
+    """Old failures of sources no longer in the config stay in fetch_log but are ignored."""
+    ctx = make_ctx(tmp_path)
+    for hours in (3, 2, 1):
+        log_run(ctx.db_path, T0 - timedelta(hours=hours), ["error"] + ["ok"] * 11)
+    assert watchdog.check_sources(ctx).level == WARN  # no list: every logged source counts
+    ctx.source_names = frozenset(f"feed {n}" for n in range(1, 12))  # Feed 0 was removed
+    assert watchdog.check_sources(ctx).level == OK
+    ctx.source_names = frozenset({"feed 0"})  # still configured: still reported
+    assert "Feed 0" in watchdog.check_sources(ctx).detail
+
+
 def test_everything_failing_is_not_a_source_streak(tmp_path: Path) -> None:
     ctx = make_ctx(tmp_path)
     for hours in (3, 2, 1):
