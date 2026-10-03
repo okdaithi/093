@@ -36,6 +36,8 @@ DEFAULT_TOKEN_FILE: Final = Path("/etc/headliner/github-token")
 HEARTBEAT_TITLE: Final = "headliner heartbeat (machine-written, do not close)"
 TITLE_PREFIX: Final = "headliner health: "
 TIMEOUT: Final = 15.0
+# GitHub answers these for an issue that was deleted or moved away.
+GONE: Final = frozenset({404, 410})
 
 LABELS: Final = {
     "dns": "DNS not resolving",
@@ -206,11 +208,23 @@ def comment_body(event: dict[str, str], zone: tzinfo) -> str:
 # -- Delivery --------------------------------------------------------------------
 
 
+def _comment(client: GitHub, number: int, body: str) -> bool:
+    """Comment on an issue; False when it no longer exists (deleted or transferred)."""
+    try:
+        client.comment(number, body)
+    except NotifyError as exc:
+        if exc.status in GONE:
+            return False
+        raise
+    return True
+
+
 def deliver(state: dict[str, Any], client: GitHub, zone: tzinfo | None = None) -> int:
     """Send `state["pending"]` in order; keep what could not be sent. Returns how many went.
 
     `state["issues"]` maps each check to its open issue number, so reminders and
-    the recovery land on the issue the alert opened.
+    the recovery land on the issue the alert opened. If that issue has been
+    deleted, an alert or reminder opens a fresh one and a recovery just forgets it.
     """
     zone = zone or local_timezone()
     issues: dict[str, int] = state.setdefault("issues", {})
@@ -225,14 +239,15 @@ def deliver(state: dict[str, Any], client: GitHub, zone: tzinfo | None = None) -
                 # The alert never got out (or its issue is gone): record the whole story.
                 number = client.create_issue(_title(check), issue_body(event, zone))
                 issues[check] = number
-            client.comment(number, comment_body(event, zone))
-            client.close(number)
+            if _comment(client, number, comment_body(event, zone)):
+                try:
+                    client.close(number)
+                except NotifyError as exc:
+                    if exc.status not in GONE:
+                        raise
             issues.pop(check, None)
-        elif number is None:
-            number = client.create_issue(_title(check), issue_body(event, zone))
-            issues[check] = number
-        else:
-            client.comment(number, comment_body(event, zone))
+        elif number is None or not _comment(client, number, comment_body(event, zone)):
+            issues[check] = client.create_issue(_title(check), issue_body(event, zone))
         pending.pop(0)
         state["pending"] = pending
         sent += 1
@@ -262,7 +277,7 @@ def beat(state: dict[str, Any], client: GitHub, body: str) -> None:
             client.set_body(int(number), body)
             return
         except NotifyError as exc:
-            if exc.status != 404:  # the issue was deleted: make a new one
+            if exc.status not in GONE:  # the issue was deleted: make a new one
                 raise
     found = client.find_open(HEARTBEAT_TITLE)
     if found is None:

@@ -303,3 +303,68 @@ def test_banner_notices_a_silent_watchdog(tmp_path: Path) -> None:
     )
     body = make_client(WebApp(db, sources))("/latest")[2]
     assert "the health watchdog has not reported" in body
+
+
+def refusing(fake: FakeGitHub, suffix: str, status: int):  # type: ignore[no-untyped-def]
+    """A transport that answers `status` to calls whose path ends with `suffix`."""
+
+    def transport(
+        method: str, url: str, token: str, payload: dict[str, Any] | None
+    ) -> tuple[int, Any]:
+        if url.endswith(suffix):
+            return status, None
+        return fake(method, url, token, payload)
+
+    return notify.GitHub("secret-token", "okdaithi/093", transport=transport)
+
+
+def test_a_comment_on_a_deleted_issue_opens_a_new_one(github: FakeGitHub) -> None:
+    state: dict[str, Any] = {"issues": {"dns": 999}, "pending": [event("remind")]}
+    notify.deliver(state, refusing(github, "/issues/999/comments", 404), PERTH)
+    assert state["pending"] == []
+    assert state["issues"]["dns"] != 999
+    assert github.issues[state["issues"]["dns"]]["title"].endswith("DNS not resolving")
+
+
+def test_a_recovery_for_a_deleted_issue_is_simply_forgotten(github: FakeGitHub) -> None:
+    state: dict[str, Any] = {"issues": {"dns": 999}, "pending": [event("recover", level=OK)]}
+    notify.deliver(state, refusing(github, "/issues/999/comments", 410), PERTH)
+    assert state["pending"] == [] and state["issues"] == {}
+    assert github.issues == {}  # nothing new was opened for an already-resolved problem
+
+
+def test_a_refused_comment_does_not_stop_the_heartbeat(tmp_path: Path, github: FakeGitHub) -> None:
+    """A healthy NUC must not look dead because GitHub rejects one comment."""
+    state_path = tmp_path / "watchdog.json"
+    issue = client(github).create_issue("headliner health: DNS not resolving", "x")
+    state_path.write_text(
+        json.dumps(
+            {
+                "issues": {"dns": issue},
+                "pending": [event("remind")],
+                "heartbeat_issue": None,
+            }
+        )
+    )
+    notifier = notify.Notifier(refusing(github, f"/issues/{issue}/comments", 500), "nuc", "test")
+    watchdog.run_once(make_ctx(tmp_path, now=T0), state_path, self_heal=False, notifier=notifier)
+    heartbeat = [i for i in github.issues.values() if i["title"] == notify.HEARTBEAT_TITLE]
+    assert heartbeat and "last_ok: 2026-10-03T05:24:00+00:00" in heartbeat[0]["body"]
+    assert json.loads(state_path.read_text())["pending"][0]["kind"] == "remind"  # still queued
+
+
+def test_banner_survives_a_damaged_state_file(tmp_path: Path) -> None:
+    from tests.test_web import CONFIG, WebApp, make_client
+
+    sources = tmp_path / "sources.yaml"
+    sources.write_text(CONFIG, encoding="utf-8")
+    db = tmp_path / "headlines.db"
+    from headliner.store import connect
+
+    connect(db).close()
+    write_state(
+        tmp_path / "watchdog.json",
+        dns={"level": "fail", "detail": "no host", "notified_level": "fail", "since": "garbage"},
+    )
+    status, _, body = make_client(WebApp(db, sources))("/latest")
+    assert status.startswith("200") and "no host" in body
