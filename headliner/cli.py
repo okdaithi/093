@@ -685,6 +685,28 @@ def cmd_backup(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_watchdog(args: argparse.Namespace) -> int:
+    """Run the health checks once, print them and update the alert state."""
+    from headliner import watchdog
+
+    try:
+        urls = [source.url for source in load_config(args.sources).sources]
+    except ConfigError as exc:
+        # The checks that do not need the sources list still matter.
+        logger.warning("%s", exc)
+        urls = []
+    ctx = watchdog.Context(db_path=args.db, hosts=watchdog.choose_hosts(urls))
+    checks, _events = watchdog.run_once(ctx, args.state, self_heal=not args.no_heal)
+    for check in checks:
+        print(f"{check.level.upper():4}  {check.name:9} {check.detail}")
+    levels = {check.level for check in checks}
+    if not args.exit_status:
+        return EXIT_OK
+    if watchdog.FAIL in levels:
+        return EXIT_FATAL
+    return EXIT_PARTIAL_FAILURE if watchdog.WARN in levels else EXIT_OK
+
+
 def cmd_web(args: argparse.Namespace) -> int:
     """Serve the read-only web viewer until interrupted."""
     from headliner.web import serve  # the CLI's other commands never need it
@@ -978,6 +1000,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--port", type=int, default=8090, help="port to listen on (default: %(default)s)"
     )
 
+    dog = subparsers.add_parser(
+        "watchdog",
+        parents=[common],
+        help="check DNS, the VPN, fetch runs, services and backups; keep alert state",
+    )
+    dog.add_argument(
+        "--state",
+        type=Path,
+        default=Path("/var/lib/headliner/watchdog.json"),
+        help="where to keep what has already been reported (default: %(default)s)",
+    )
+    dog.add_argument(
+        "--no-heal",
+        action="store_true",
+        help="do not flush DNS caches or restart systemd-resolved during a DNS outage",
+    )
+    dog.add_argument(
+        "--exit-status",
+        action="store_true",
+        help="exit 1 if any check warns and 2 if any fails (default: always 0)",
+    )
+
     return parser
 
 
@@ -1004,6 +1048,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_discover(args)
         if args.command == "web":
             return cmd_web(args)
+        if args.command == "watchdog":
+            return cmd_watchdog(args)
         if args.command == "stories":
             return cmd_stories(args)
         if args.command == "backup":

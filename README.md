@@ -201,6 +201,38 @@ The pull request comes from GitHub when it can be reached, otherwise from the
 latest "Merge pull request #N" commit in local history. A checkout run in place
 shows "Development build".
 
+## Health watchdog
+
+`headliner watchdog` checks the machine headliner runs on and keeps a small state
+file, so a lasting problem is reported once, repeated rarely, and cleared when it
+ends. The installer enables `headliner-watchdog.timer` (every 10 minutes, as root)
+when `headliner.timer` is enabled. Try it by hand:
+
+```bash
+sudo /opt/headliner/venv/bin/headliner watchdog --no-heal --exit-status \
+    --sources /etc/headliner/sources.yaml --db /var/lib/headliner/headlines.db
+sudo cat /var/lib/headliner/watchdog.json        # last results, and events not yet delivered
+journalctl -u headliner-watchdog.service -p err  # alerts and repairs
+```
+
+| Check | Fails or warns when |
+| --- | --- |
+| `dns` | none of a few test hosts resolves (and says whether ProtonVPN's own resolver answers) |
+| `internet` | TCP to 1.1.1.1 and 9.9.9.9 on 443 fails: no routing at all |
+| `vpn` | the WireGuard handshake on `proton0` is over 3 minutes old |
+| `fetch` | the last run finished over 7 hours ago, or over half its sources failed |
+| `sources` | a source failed its last 3 runs while most others worked (warning) |
+| `units` | the fetch/backup timers or the viewer service are not active, or a headliner unit failed |
+| `viewer` | `http://127.0.0.1:8090/healthz` does not answer ok |
+| `backups`, `disk` | no backup for 36 hours or the data disk is 90% full (warnings) |
+
+A failure is announced after about 10 minutes, a warning after about an hour,
+reminders repeat every 6 hours, and a recovery is announced after any alert. When
+`dns` has failed for ten minutes the watchdog flushes the DNS caches and restarts
+`systemd-resolved` (at most once an hour, `--no-heal` to turn it off). It never
+touches the VPN. Events are kept in the state file's `pending` list until a
+notifier delivers them.
+
 ## Backups
 
 Title history can't be fetched again, so back the database up.

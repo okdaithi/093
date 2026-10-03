@@ -1,0 +1,20 @@
+[Unit]
+Description=Check headliner's machine health (DNS, VPN, runs, services, backups)
+After=network.target
+
+[Service]
+Type=oneshot
+# Root, because it reads the WireGuard handshake and may restart systemd-resolved
+# when DNS has been down for ~10 minutes. It changes nothing else: the VPN is left alone.
+ExecStart=/opt/headliner/venv/bin/headliner watchdog --sources /etc/headliner/sources.yaml --db /var/lib/headliner/headlines.db --state /var/lib/headliner/watchdog.json
+TimeoutStartSec=3min
+UMask=0022
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/headliner
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
