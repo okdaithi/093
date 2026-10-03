@@ -102,6 +102,61 @@ def normalise_url(url: str, *, drop_query: bool = False) -> str:
     return urlunsplit((scheme, netloc, path, query, ""))
 
 
+_SLASHES_RE = re.compile(r"/{2,}")
+# Host prefixes that serve the same article in another layout.
+_ALT_HOST_PREFIXES = ("www.", "amp.", "m.", "mobile.")
+# Query switches that ask for an AMP rendering of the same article.
+_AMP_PARAMS = frozenset({"amp", "outputtype", "output", "amp_js_v", "usqp"})
+
+
+def match_key(url: str) -> str:
+    """A looser key than `normalise_url`, for spotting one article under two URLs.
+
+    Ignores http vs https, `www.`/`m.`/`amp.` hosts, repeated slashes, AMP
+    path segments (`/amp`, `.amp`) and AMP query switches. Only used to merge
+    a front-page link with a stored article; stored URLs keep `normalise_url`.
+    """
+    parts = urlsplit(normalise_url(url))
+    host = parts.netloc
+    for prefix in _ALT_HOST_PREFIXES:
+        if host.startswith(prefix) and host.count(".") > 1:
+            host = host[len(prefix) :]
+            break
+    segments = [
+        segment for segment in _SLASHES_RE.sub("/", parts.path).split("/") if segment != "amp"
+    ]
+    path = "/".join(segments).removesuffix(".amp").rstrip("/")
+    query = urlencode(
+        [
+            (key, value)
+            for key, value in parse_qsl(parts.query, keep_blank_values=True)
+            if key.lower() not in _AMP_PARAMS
+        ]
+    )
+    return f"{host}/{path.lstrip('/')}" + (f"?{query}" if query else "")
+
+
+# Second-level labels under which a country's names are registered (bbc.co.uk).
+_REGISTRY_LABELS = frozenset({"com", "co", "net", "org", "gov", "ac", "edu", "ne", "or"})
+
+
+def site_of(host: str) -> str:
+    """The registrable part of a host name, near enough: `abc.net.au`, `bbc.co.uk`."""
+    labels = host.lower().removeprefix("www.").split(".")
+    if len(labels) >= 3 and len(labels[-1]) == 2 and labels[-2] in _REGISTRY_LABELS:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def brand_path_key(url: str) -> str:
+    """`match_key` with the host reduced to its brand: bbc.com and bbc.co.uk agree.
+
+    Only safe within one source (one publisher), where it is used.
+    """
+    host, _, rest = match_key(url).partition("/")
+    return f"{site_of(host.split(':')[0]).split('.')[0]}/{rest}"
+
+
 # Live blogs re-headline on every update. Only a whole `live`/`liveblog` path
 # segment or a "… live:" style title counts, so a story about how to "live in
 # harmony" is not a live blog.
@@ -181,6 +236,15 @@ class Headline:
     summary: str | None
     content_hash: str
     is_live: bool = False
+    # How the article was found: "rss" (the feed, RSS or Atom), "html" (a
+    # listing page) and/or "front_page" (the live front page), sorted.
+    acquisition: tuple[str, ...] = ("rss",)
+    # Where it last appeared on the front page, 1 = the lead story, and when.
+    front_page_position: int | None = None
+    front_page_seen_at: datetime | None = None
+    # Only what the page itself says (see `frontpage.SECTIONS`); None otherwise.
+    section: str | None = None
+    image_url: str | None = None
 
     @classmethod
     def create(
@@ -193,6 +257,10 @@ class Headline:
         fetched_at: datetime | None = None,
         summary: str | None = None,
         live_url_pattern: re.Pattern[str] | None = None,
+        acquisition: tuple[str, ...] = ("rss",),
+        front_page_position: int | None = None,
+        section: str | None = None,
+        image_url: str | None = None,
     ) -> Headline:
         """Normalise raw parser output into a `Headline`.
 
@@ -226,6 +294,10 @@ class Headline:
             summary=clean_summary,
             content_hash=compute_hash(clean_url, clean_title),
             is_live=looks_live(canonical_url, clean_title, live_url_pattern),
+            acquisition=acquisition,
+            front_page_position=front_page_position,
+            section=section,
+            image_url=image_url,
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -239,4 +311,11 @@ class Headline:
             "summary": self.summary,
             "content_hash": self.content_hash,
             "is_live": self.is_live,
+            "acquisition": list(self.acquisition),
+            "front_page_position": self.front_page_position,
+            "front_page_seen_at": self.front_page_seen_at.isoformat()
+            if self.front_page_seen_at
+            else None,
+            "section": self.section,
+            "image_url": self.image_url,
         }

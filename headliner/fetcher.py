@@ -6,6 +6,8 @@ import asyncio
 import logging
 import random
 import urllib.robotparser
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -14,6 +16,7 @@ from urllib.parse import urljoin, urlsplit
 
 import httpx
 
+from headliner import frontpage
 from headliner.config import Settings, Source
 from headliner.models import Headline, utcnow
 from headliner.parsers import ParseError, parse
@@ -50,6 +53,11 @@ class SourceResult:
     items_changed_minor: int = 0
     error: str | None = None
     headlines: list[Headline] = field(default_factory=list)
+    # The source's front page this run, when it has one and it was read.
+    front_page: frontpage.FrontPageResult | None = None
+    # False when this run did not read the feed (`--front-pages-only`): then
+    # nothing goes to fetch_log for it.
+    feed_ran: bool = True
 
     @property
     def ok(self) -> bool:
@@ -92,7 +100,14 @@ class RateLimiter:
     def __init__(self, delay_seconds: float) -> None:
         self._delay = max(0.0, delay_seconds)
         self._locks: dict[str, asyncio.Lock] = {}
+        self._holds: dict[str, asyncio.Lock] = {}
         self._last_request: dict[str, float] = {}
+
+    @asynccontextmanager
+    async def hold(self, domain: str) -> AsyncIterator[None]:
+        """One request to `domain` at a time: hold this around the whole request."""
+        async with self._holds.setdefault(domain, asyncio.Lock()):
+            yield
 
     async def acquire(self, domain: str, *, min_gap: float | None = None) -> None:
         """Sleep, if needed, until this domain may be hit again.
@@ -239,17 +254,16 @@ async def fetch_url(
     raise FetchError(f"{url}: giving up after {attempts} attempts ({last_error})")
 
 
-async def fetch_source(
+async def _fetch_feed(
     client: httpx.AsyncClient,
     source: Source,
     settings: Settings,
     *,
     limiter: RateLimiter,
     robots: RobotsCache | None,
-    semaphore: asyncio.Semaphore,
+    started_at: datetime,
 ) -> SourceResult:
-    """Fetch and parse one source. Failures become a `SourceResult`, not an exception."""
-    started_at = utcnow()
+    """Fetch and parse one source's feed (or listing page)."""
 
     def result(
         status: str, *, error: str | None = None, items: list[Headline] | None = None
@@ -264,41 +278,127 @@ async def fetch_source(
             headlines=items or [],
         )
 
-    async with semaphore:
-        try:
-            if robots is not None:
-                if not await robots.can_fetch(source.url):
-                    message = f"robots.txt disallows {source.url}"
-                    logger.info("%s: skipped - %s", source.name, message)
-                    return result("skipped", error=message)
-                crawl_delay = await robots.crawl_delay(source.url)
-                if crawl_delay is not None and crawl_delay > settings.rate_limit_seconds:
-                    logger.debug(
-                        "%s: honouring robots Crawl-delay of %.1fs", source.name, crawl_delay
-                    )
-            else:
-                crawl_delay = None
+    try:
+        if robots is not None:
+            if not await robots.can_fetch(source.url):
+                message = f"robots.txt disallows {source.url}"
+                logger.info("%s: skipped - %s", source.name, message)
+                return result("skipped", error=message)
+            crawl_delay = await robots.crawl_delay(source.url)
+            if crawl_delay is not None and crawl_delay > settings.rate_limit_seconds:
+                logger.debug("%s: honouring robots Crawl-delay of %.1fs", source.name, crawl_delay)
+        else:
+            crawl_delay = None
 
-            # The Crawl-delay is the gap between requests to the domain, so it
-            # goes through the limiter rather than being slept up front.
+        # The Crawl-delay is the gap between requests to the domain, so it
+        # goes through the limiter rather than being slept up front. The hold
+        # keeps this from overlapping a front-page read on the same domain.
+        async with limiter.hold(source.domain):
             await limiter.acquire(source.domain, min_gap=crawl_delay)
             logger.debug("%s: fetching %s", source.name, source.url)
             response = await fetch_url(client, source.url, timeout=settings.request_timeout)
-            headlines = parse(
-                response.content,
-                source,
-                fetched_at=utcnow(),
-                limit=settings.max_items_per_source,
-            )
-        except (FetchError, ParseError) as exc:
-            logger.warning("%s: %s", source.name, exc)
-            return result("error", error=str(exc))
-        except Exception as exc:  # noqa: BLE001 - one bad source must not abort the run
-            logger.warning("%s: unexpected %s: %s", source.name, type(exc).__name__, exc)
-            return result("error", error=f"{type(exc).__name__}: {exc}")
+        headlines = parse(
+            response.content,
+            source,
+            fetched_at=utcnow(),
+            limit=settings.max_items_per_source,
+        )
+    except (FetchError, ParseError) as exc:
+        logger.warning("%s: %s", source.name, exc)
+        return result("error", error=str(exc))
+    except Exception as exc:  # noqa: BLE001 - one bad source must not abort the run
+        logger.warning("%s: unexpected %s: %s", source.name, type(exc).__name__, exc)
+        return result("error", error=f"{type(exc).__name__}: {exc}")
 
     logger.info("%s: %d headline(s)", source.name, len(headlines))
     return result("ok", items=headlines)
+
+
+def _from_front_page(
+    source: Source, page: frontpage.FrontPageResult | None, started_at: datetime
+) -> SourceResult:
+    """The run's record for a source with no feed, from its front-page read."""
+    if page is None:
+        return SourceResult(
+            source=source.name,
+            status="skipped",
+            started_at=started_at,
+            finished_at=utcnow(),
+            feed_ran=False,
+        )
+    if page.ok:
+        status, error = "ok", None
+    elif page.status == frontpage.ROBOTS_DENIED:
+        status, error = "skipped", page.error
+    else:
+        status, error = "error", f"front page {page.status}: {page.error or 'no detail'}"
+    return SourceResult(
+        source=source.name,
+        status=status,
+        started_at=started_at,
+        finished_at=page.finished_at,
+        items_found=len(page.headlines),
+        error=error,
+        front_page=page,
+    )
+
+
+async def fetch_source(
+    client: httpx.AsyncClient,
+    source: Source,
+    settings: Settings,
+    *,
+    limiter: RateLimiter,
+    robots: RobotsCache | None,
+    semaphore: asyncio.Semaphore,
+    feeds: bool = True,
+    front_pages: bool = True,
+    front_page_cache: frontpage.CacheEntry | None = None,
+) -> SourceResult:
+    """Fetch and parse one source. Failures become a `SourceResult`, not an exception.
+
+    The feed comes first and is unaffected by the front page: when the source
+    has a front page too, it is read afterwards and its outcome, good or bad,
+    is attached as `front_page`.
+    """
+    started_at = utcnow()
+    async with semaphore:
+        feed: SourceResult | None = None
+        if feeds and source.has_feed:
+            feed = await _fetch_feed(
+                client, source, settings, limiter=limiter, robots=robots, started_at=started_at
+            )
+        page: frontpage.FrontPageResult | None = None
+        if front_pages and source.front_page_url:
+            try:
+                page = await frontpage.fetch_front_page(
+                    client,
+                    source,
+                    settings,
+                    limiter=limiter,
+                    robots=robots,
+                    cache=front_page_cache,
+                )
+            except Exception as exc:  # noqa: BLE001 - never let the front page sink the feed
+                logger.warning(
+                    'source="%s" method="front_page" status="error" error="%s: %s"',
+                    source.name,
+                    type(exc).__name__,
+                    exc,
+                )
+    if feed is None:
+        if source.has_feed:  # feeds were switched off for this run
+            return SourceResult(
+                source=source.name,
+                status="skipped",
+                started_at=started_at,
+                finished_at=utcnow(),
+                front_page=page,
+                feed_ran=False,
+            )
+        return _from_front_page(source, page, started_at)
+    feed.front_page = page
+    return feed
 
 
 def build_client(settings: Settings) -> httpx.AsyncClient:
@@ -323,8 +423,15 @@ async def fetch_all(
     *,
     ignore_robots: bool = False,
     client: httpx.AsyncClient | None = None,
+    feeds: bool = True,
+    front_pages: bool = True,
+    front_page_cache: dict[str, frontpage.CacheEntry] | None = None,
 ) -> list[SourceResult]:
-    """Fetch every source concurrently, bounded by `settings.concurrency`."""
+    """Fetch every source concurrently, bounded by `settings.concurrency`.
+
+    `feeds`/`front_pages` switch either acquisition path off for the run;
+    `front_page_cache` holds the previous run's validators per source name.
+    """
     if not sources:
         return []
 
@@ -348,6 +455,9 @@ async def fetch_all(
                         limiter=limiter,
                         robots=robots,
                         semaphore=semaphore,
+                        feeds=feeds,
+                        front_pages=front_pages,
+                        front_page_cache=(front_page_cache or {}).get(source.name),
                     )
                     for source in sources
                 )

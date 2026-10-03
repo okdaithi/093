@@ -435,7 +435,7 @@ def test_migrate_dry_run_reports_and_changes_nothing(
     make_legacy_db(path)
     assert main(["migrate", "--dry-run", "--db", str(path), "--quiet"]) == EXIT_OK
     out = capsys.readouterr().out
-    assert "schema version 0 -> 4" in out
+    assert "schema version 0 -> 5" in out
     assert "would merge 1 row(s) across 1 URL(s)" in out
     assert "would flag 0 live blog(s)" in out
     assert "nothing changed" in out

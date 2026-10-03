@@ -1081,7 +1081,7 @@ def test_upgrade_from_v3_fills_links_and_freshness_column(tmp_path: Path) -> Non
         assert (plan.from_version, plan.revisions_linked) == (3, 3)
 
     with closing(connect(path)) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 5
         assert_links_match_reference(conn)
         assert [c.is_minor for c in list_title_changes(conn, oldest_first=True)] == [True, False]
         assert conn.execute("SELECT newest_item FROM fetch_log").fetchone()[0] is None

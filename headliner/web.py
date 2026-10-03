@@ -34,7 +34,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 from headliner import build as build_info
-from headliner import charts, local_timezone, network, rewrites, tz_abbrev
+from headliner import charts, frontpage, local_timezone, network, rewrites, tz_abbrev
 from headliner.backup import default_dir, list_backups
 from headliner.config import Config, ConfigError, load_config
 from headliner.markup import EMPTY, Markup, esc, join, render
@@ -42,6 +42,7 @@ from headliner.models import Headline, is_minor_change, utcnow
 from headliner.store import (
     SCHEMA_VERSION,
     FirstSeen,
+    FrontPageStatus,
     LiveFilter,
     Revision,
     RewriteStat,
@@ -54,6 +55,7 @@ from headliner.store import (
     counts_by_source,
     feed_turnover,
     first_seen,
+    front_page_status,
     hidden_changes,
     list_headlines,
     list_title_changes,
@@ -486,6 +488,7 @@ class WebApp:
         runs = recent_runs(conn, limit=8)
         config = self.config
         sources: dict[str, Any] | None = None
+        front_pages: dict[str, Any] | None = None
         problems: list[dict[str, Any]] = []
         network_down = False
         if config is not None:
@@ -512,6 +515,7 @@ class WebApp:
                 "enabled": sum(1 for source in config.sources if source.enabled),
                 "states": dict(sorted(states.items())),
             }
+            front_pages = self.front_page_report(conn, config, now)
             attention = [p["name"] for p in problems if p["state"] != "skipped"]
             failed = [p for p in problems if p["state"] == "failed"]
             # Nearly every source failing with DNS/routing errors is the machine's
@@ -572,12 +576,51 @@ class WebApp:
             ],
             "sources": sources,
             "problems": problems,
+            # Front pages complement the feeds: their problems are reported
+            # here but never put the status at "attention".
+            "front_pages": front_pages,
             "backups": {
                 "count": len(backups),
                 "latest": backups[0].path.name if backups else None,
                 "latest_at": backups[0].taken_at.isoformat() if backups else None,
                 "latest_bytes": backups[0].size if backups else None,
             },
+        }
+
+    @staticmethod
+    def front_page_report(
+        conn: sqlite3.Connection, config: Config, now: datetime
+    ) -> dict[str, Any]:
+        """Front-page health for /api/status: counts by state and every page not healthy."""
+        configured = [source for source in config.sources if source.front_page is not None]
+        pages = front_page_status(conn, [source.name for source in configured])
+        states: Counter[str] = Counter()
+        problems = []
+        for source in configured:
+            page = pages.get(source.name)
+            state = frontpage.health(
+                source.front_page,
+                page.status if page else None,
+                page.last_success if page else None,
+                now,
+            )
+            assert state is not None
+            states[state] += 1
+            if state not in {frontpage.HEALTHY, frontpage.DISABLED}:
+                problems.append(
+                    {
+                        "name": source.name,
+                        "state": state,
+                        "error": page.error if page else None,
+                        "http_status": page.http_status if page else None,
+                        "last_success": _iso_or_none(page.last_success) if page else None,
+                    }
+                )
+        return {
+            "configured": len(configured),
+            "states": dict(sorted(states.items())),
+            "headlines": sum(page.headlines for page in pages.values()),
+            "problems": problems,
         }
 
     def api_new(self, request: Request) -> Response:
@@ -1144,6 +1187,13 @@ or <a href="{switch}">show times in {other}</a>.
         parts = []
         if headline.is_live:
             parts.append(Markup('<span class="badge live">LIVE</span>'))
+        if "front_page" in headline.acquisition:
+            parts.append(
+                render(
+                    '<span class="badge fp" title="{t}">front page</span>',
+                    t=provenance(headline, Clock(request.utc)),
+                )
+            )
         if story is not None and self.reach(story) > 1:
             parts.append(
                 render(
@@ -1531,11 +1581,19 @@ first rewrite that changed words; live blogs excluded.</p>{histogram}</div>
         ]
         shown = config.tagged(tags) if tags else config.sources
         statuses = {status.name: status for status in source_status(conn, [s.name for s in shown])}
+        pages = front_page_status(conn, [s.name for s in shown if s.front_page])
         now = utcnow()
         rows = []
         healthy = 0
         for source in shown:
             status = statuses[source.name]
+            page = pages.get(source.name)
+            page_state = frontpage.health(
+                source.front_page,
+                page.status if page else None,
+                page.last_success if page else None,
+                now,
+            )
             state, css = source_state(source.enabled, status, now)
             healthy += state == "ok"
             if state == "content stale" and status.newest_item is not None:
@@ -1550,6 +1608,7 @@ first rewrite that changed words; live blogs excluded.</p>{histogram}</div>
   <td class="num">{items}</td>
   <td>{success} <span class="muted small">{ago}</span></td>
   <td><span class="state {css}" title="{error}">{state}</span>{detail}</td>
+  <td>{front}</td>
   <td>{feed}</td>
 </tr>""",
                     profile=self.link(request, "/source", name=source.name, tag=None),
@@ -1577,7 +1636,10 @@ first rewrite that changed words; live blogs excluded.</p>{histogram}</div>
                     )
                     if status.last_error and state in {"failed", "skipped", "content stale"}
                     else Markup(""),
-                    feed=external_link(source.url, "feed ↗", "small"),
+                    feed=external_link(source.url, "feed ↗", "small")
+                    if source.has_feed
+                    else Markup('<span class="muted small">no feed</span>'),
+                    front=front_page_cell(page_state, page, clock),
                 )
             )
         enabled = sum(1 for source in shown if source.enabled)
@@ -1620,7 +1682,7 @@ first rewrite that changed words; live blogs excluded.</p>{histogram}</div>
   <span class="tagbar">Tags: {tag_links}</span></p>
 <div class="scroll"><table class="sortable">
 <thead><tr><th>Source</th><th>Tags</th><th class="num">Items</th>
-<th>Last success ({zone})</th><th>Last run</th><th>Feed</th></tr></thead>
+<th>Last success ({zone})</th><th>Last run</th><th>Front page</th><th>Feed</th></tr></thead>
 <tbody>{rows}</tbody></table></div>
 <h2>Recent runs</h2>
 <div class="scroll"><table>
@@ -1685,6 +1747,7 @@ first rewrite that changed words; live blogs excluded.</p>{histogram}</div>
         return render(
             """{crumbs}<h1>{title}</h1>
 <p class="meta">{source} {live} · published {published} · {open}</p>
+<p class="meta small">{found}</p>
 <h2>{n} title(s), oldest first</h2>
 <ol class="items timeline">{items}</ol>""",
             crumbs=self.crumbs(trail, headline.title),
@@ -1693,6 +1756,7 @@ first rewrite that changed words; live blogs excluded.</p>{histogram}</div>
             live=Markup('<span class="badge live">LIVE</span>') if headline.is_live else Markup(""),
             published=clock.time(headline.published_at),
             open=external_link(headline.url, "open article ↗"),
+            found=provenance(headline, clock),
             n=len(revisions),
             items=join(items),
         )
@@ -2976,6 +3040,61 @@ def source_state(enabled: bool, status: SourceStatus, now: datetime) -> tuple[st
     if status.newest_item is not None and now - status.newest_item > CONTENT_STALE_AFTER:
         return "content stale", "warn"
     return "ok", "good"
+
+
+METHOD_NAMES: Final = {
+    "rss": "the feed",
+    "html": "the listing page",
+    "front_page": "the front page",
+}
+
+
+def provenance(headline: Headline, clock: Clock) -> str:
+    """How an article was found, in words: "Found on the feed and the front page (#3 at …)"."""
+    # The feed first: it is the primary way in.
+    order = list(METHOD_NAMES)
+    methods = sorted(
+        headline.acquisition, key=lambda m: order.index(m) if m in order else len(order)
+    )
+    ways = [METHOD_NAMES.get(method, method) for method in methods]
+    text = "Found on " + " and ".join(ways)
+    if headline.front_page_position is not None and headline.front_page_seen_at is not None:
+        seen = clock.shown(headline.front_page_seen_at)
+        text += (
+            f" (#{headline.front_page_position} on the front page at "
+            f"{seen:%Y-%m-%d %H:%M} {tz_abbrev(seen)})"
+        )
+    return text + "."
+
+
+_FRONT_PAGE_CSS: Final = {
+    frontpage.HEALTHY: "good",
+    frontpage.DISABLED: "muted",
+    frontpage.STALE: "warn",
+    "never read": "warn",
+    frontpage.ROBOTS_DENIED: "warn",
+    frontpage.RENDERING_REQUIRED: "warn",
+}
+
+
+def front_page_cell(state: str | None, page: FrontPageStatus | None, clock: Clock) -> Markup:
+    """The Sources page's front-page column: state, and headline count or error."""
+    if state is None:
+        return Markup('<span class="muted small">—</span>')
+    detail = ""
+    if page is not None and state == frontpage.HEALTHY:
+        detail = f"{page.headlines} headlines" + (
+            f", {page.response_ms} ms" if page.response_ms is not None else ""
+        )
+    elif page is not None and page.error:
+        detail = _shorten(page.error, 80)
+    return render(
+        '<span class="state {css}" title="{tip}">{state}</span>{detail}',
+        css=_FRONT_PAGE_CSS.get(state, "bad"),
+        tip=f"checked {clock.ago(page.checked_at)}" if page and page.checked_at else "",
+        state=state.replace("_", " "),
+        detail=render('<div class="small muted">{d}</div>', d=detail) if detail else EMPTY,
+    )
 
 
 def _iso_or_none(value: datetime | None) -> str | None:

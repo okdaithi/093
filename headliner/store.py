@@ -13,10 +13,13 @@ from typing import Any, Final, Literal
 
 from headliner.models import (
     Headline,
+    brand_path_key,
     compute_hash,
     is_minor_change,
     looks_live,
+    match_key,
     normalise_url,
+    title_key,
     to_utc,
     utcnow,
 )
@@ -30,8 +33,10 @@ DEFAULT_DB_PATH: Final = Path("headlines.db")
 # 2 adds `headlines.is_live` for live blogs; 3 re-normalises stored URLs (BBC
 # `at_*` tracking parameters) and indexes `headline_revisions` for search; 4
 # stores each revision's previous title and whether the change was minor, so
-# rewrite queries are plain filters, and each fetch's newest item date.
-SCHEMA_VERSION: Final = 4
+# rewrite queries are plain filters, and each fetch's newest item date; 5
+# records how each article was found (feed and/or live front page), its
+# front-page position, and every front-page read in `front_page_log`.
+SCHEMA_VERSION: Final = 5
 
 _SCHEMA: Final = """
 CREATE TABLE IF NOT EXISTS headlines (
@@ -44,7 +49,15 @@ CREATE TABLE IF NOT EXISTS headlines (
     summary       TEXT,
     content_hash  TEXT    NOT NULL UNIQUE,
     -- 1 once any version of the article looked like a live blog; never reset.
-    is_live       INTEGER NOT NULL DEFAULT 0
+    is_live       INTEGER NOT NULL DEFAULT 0,
+    -- How it was found, comma-separated and sorted: rss, html, front_page.
+    acquisition   TEXT    NOT NULL DEFAULT 'rss',
+    -- Its place on the front page (1 = lead) when last seen there, and when.
+    front_page_position INTEGER,
+    front_page_seen_at  TEXT,
+    -- Only what the front page said (see frontpage.SECTIONS).
+    section       TEXT,
+    image_url     TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_headlines_source       ON headlines(source);
@@ -84,6 +97,34 @@ CREATE TABLE IF NOT EXISTS headline_revisions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_revisions_seen_at ON headline_revisions(seen_at DESC);
+
+-- One row per front-page read (see headliner/frontpage.py).
+CREATE TABLE IF NOT EXISTS front_page_log (
+    id            INTEGER PRIMARY KEY,
+    source        TEXT    NOT NULL,
+    url           TEXT    NOT NULL,
+    started_at    TEXT    NOT NULL,
+    finished_at   TEXT    NOT NULL,
+    -- healthy, not_modified, blocked, robots_denied, timeout, parse_error,
+    -- no_headlines, rendering_required, http_error, network_error, unsafe_url
+    status        TEXT    NOT NULL,
+    http_status   INTEGER,
+    final_url     TEXT,
+    response_ms   INTEGER,
+    headlines     INTEGER NOT NULL DEFAULT 0,
+    duplicates    INTEGER NOT NULL DEFAULT 0,
+    items_new     INTEGER NOT NULL DEFAULT 0,
+    -- Front-page headlines already stored, and of those, ones a feed had found.
+    items_merged  INTEGER NOT NULL DEFAULT 0,
+    items_merged_feed INTEGER NOT NULL DEFAULT 0,
+    method        TEXT,
+    rendering_required INTEGER NOT NULL DEFAULT 0,
+    etag          TEXT,
+    last_modified TEXT,
+    error         TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_front_page_log_source ON front_page_log(source, finished_at DESC);
 """
 
 # The schema-1 upgrade: fold rows that share a URL into the earliest one,
@@ -506,6 +547,33 @@ def _upgrade_to_v4(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _upgrade_to_v5(conn: sqlite3.Connection) -> None:
+    """Add provenance and front-page columns to `headlines` (`front_page_log` is new).
+
+    Every stored article was found by its source's feed, so all start as
+    `rss` (including the few from the retired HTML listing source). Additive,
+    so no backup is taken.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        _add_missing_columns(
+            conn,
+            "headlines",
+            {
+                "acquisition": "TEXT NOT NULL DEFAULT 'rss'",
+                "front_page_position": "INTEGER",
+                "front_page_seen_at": "TEXT",
+                "section": "TEXT",
+                "image_url": "TEXT",
+            },
+        )
+        conn.execute("PRAGMA user_version = 5")
+    except BaseException:
+        conn.rollback()
+        raise
+    conn.commit()
+
+
 def _link_revisions(conn: sqlite3.Connection, headline_id: int) -> None:
     """Set `prev_title` and `is_minor` on every revision of one article."""
     previous: str | None = None
@@ -615,6 +683,8 @@ def migrate(conn: sqlite3.Connection) -> None:
         _upgrade_to_v3(conn)
     if int(conn.execute("PRAGMA user_version").fetchone()[0]) < 4:
         _upgrade_to_v4(conn)
+    if int(conn.execute("PRAGMA user_version").fetchone()[0]) < 5:
+        _upgrade_to_v5(conn)
 
 
 def _prepare(conn: sqlite3.Connection) -> None:
@@ -692,46 +762,165 @@ def _add_revision(
     return added
 
 
+FRONT_PAGE: Final = "front_page"
+# How far back a front-page link is compared, by URL variant or headline
+# words, with what is already stored for the same source.
+MATCH_WINDOW: Final = timedelta(days=7)
+
+
+def _methods(stored: str | None) -> set[str]:
+    return {method for method in (stored or "rss").split(",") if method}
+
+
+def _joined(methods: Iterable[str]) -> str:
+    return ",".join(sorted(set(methods)))
+
+
+def _insert_article(conn: sqlite3.Connection, headline: Headline) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO headlines
+            (source, title, url, published_at, fetched_at, summary, content_hash, is_live,
+             acquisition, front_page_position, front_page_seen_at, section, image_url)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            headline.source,
+            headline.title,
+            headline.url,
+            _iso(headline.published_at),
+            _iso(headline.fetched_at),
+            headline.summary,
+            headline.content_hash,
+            int(headline.is_live),
+            _joined(headline.acquisition),
+            headline.front_page_position,
+            _iso(headline.fetched_at) if headline.front_page_position is not None else None,
+            headline.section,
+            headline.image_url,
+        ),
+    )
+    headline_id = cursor.lastrowid
+    assert headline_id is not None
+    _add_revision(conn, headline_id, headline, first=True)
+    return headline_id
+
+
+class _Twins:
+    """Recently stored articles of one source, by URL variant and by headline words."""
+
+    def __init__(
+        self, conn: sqlite3.Connection, source: str, since: datetime, only_front_page: bool
+    ) -> None:
+        self.by_url: dict[str, int] = {}
+        self.by_path: dict[str, int] = {}
+        self.by_title: dict[str, int] = {}
+        sql = (
+            "SELECT id, url, title FROM headlines WHERE source = ? COLLATE NOCASE"
+            " AND fetched_at >= ?"
+        )
+        if only_front_page:
+            sql += " AND acquisition = 'front_page'"
+        for row in conn.execute(sql + " ORDER BY fetched_at DESC, id DESC", (source, _iso(since))):
+            self.add(row["id"], row["url"], row["title"])
+
+    def add(self, headline_id: int, url: str, title: str) -> None:
+        self.by_url.setdefault(match_key(url), headline_id)
+        self.by_path.setdefault(brand_path_key(url), headline_id)
+        self.by_title.setdefault(title_key(title), headline_id)
+
+    def find(self, headline: Headline) -> int | None:
+        """The same article by URL variant, the publisher's other domain, or headline words."""
+        return (
+            self.by_url.get(match_key(headline.url))
+            or self.by_path.get(brand_path_key(headline.url))
+            or self.by_title.get(title_key(headline.title))
+        )
+
+
+def _adopt_feed_title(conn: sqlite3.Connection, headline_id: int, headline: Headline) -> None:
+    """A feed has found an article first stored from the front page: the feed's wording wins.
+
+    Front pages often show a shortened display headline. That is not a rewrite,
+    so the article's title history restarts from the feed's title.
+    """
+    conn.execute("DELETE FROM headline_revisions WHERE headline_id = ?", (headline_id,))
+    conn.execute(
+        "UPDATE headlines SET title = ?, summary = ?, content_hash = ? WHERE id = ?",
+        (headline.title, headline.summary, headline.content_hash, headline_id),
+    )
+    _add_revision(conn, headline_id, headline, first=True)
+
+
 def store_headlines(conn: sqlite3.Connection, headlines: Iterable[Headline]) -> InsertResult:
-    """Store headlines, one row per article URL, keeping every distinct title.
+    """Store a feed's headlines, one row per article URL, keeping every distinct title.
 
     A URL not seen before is a new row. A known URL under a different title
     becomes the row's current title and, the first time that title is seen
     for the article, a new revision. Titles that only differ in case or
     whitespace are the same title (see `compute_hash`). An article stays a
     live blog once any version of it looked like one.
+
+    An article first found on the front page (see `store_front_page`) is the
+    same article when the feed links it under a variant of the URL or with the
+    same headline words: the row takes the feed's URL and title and records
+    both ways it was found, rather than becoming a second row.
     """
     new = retitled = retitled_live = retitled_minor = 0
+    twins: dict[str, _Twins] = {}
+    since = utcnow() - MATCH_WINDOW
     with conn:
         for headline in headlines:
             existing = conn.execute(
-                "SELECT id, title, content_hash, is_live FROM headlines WHERE url = ?",
+                "SELECT id, title, content_hash, is_live, acquisition FROM headlines WHERE url = ?",
                 (headline.url,),
             ).fetchone()
             if existing is None:
-                cursor = conn.execute(
+                key = headline.source.casefold()
+                if key not in twins:
+                    twins[key] = _Twins(conn, headline.source, since, only_front_page=True)
+                twin = twins[key].find(headline)
+                if twin is None:
+                    _insert_article(conn, headline)
+                    new += 1
+                    continue
+                # The front page linked this article under another URL.
+                row = conn.execute(
+                    "SELECT acquisition, is_live, published_at FROM headlines WHERE id = ?",
+                    (twin,),
+                ).fetchone()
+                conn.execute(
                     """
-                    INSERT INTO headlines
-                        (source, title, url, published_at, fetched_at, summary, content_hash,
-                         is_live)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    UPDATE headlines SET url = ?, acquisition = ?, is_live = ?,
+                        published_at = COALESCE(?, published_at)
+                    WHERE id = ?
                     """,
                     (
-                        headline.source,
-                        headline.title,
                         headline.url,
+                        _joined(_methods(row["acquisition"]) | set(headline.acquisition)),
+                        int(bool(row["is_live"]) or headline.is_live),
                         _iso(headline.published_at),
-                        _iso(headline.fetched_at),
-                        headline.summary,
-                        headline.content_hash,
-                        int(headline.is_live),
+                        twin,
                     ),
                 )
-                headline_id = cursor.lastrowid
-                assert headline_id is not None
-                _add_revision(conn, headline_id, headline, first=True)
-                new += 1
+                _adopt_feed_title(conn, twin, headline)
+                twins[key] = _Twins(conn, headline.source, since, only_front_page=True)
                 continue
+
+            methods = _methods(existing["acquisition"])
+            if not methods & set(headline.acquisition):
+                conn.execute(
+                    "UPDATE headlines SET acquisition = ? WHERE id = ?",
+                    (_joined(methods | set(headline.acquisition)), existing["id"]),
+                )
+                if methods == {FRONT_PAGE}:
+                    if existing["content_hash"] != headline.content_hash:
+                        _adopt_feed_title(conn, existing["id"], headline)
+                    if headline.is_live and not existing["is_live"]:
+                        conn.execute(
+                            "UPDATE headlines SET is_live = 1 WHERE id = ?", (existing["id"],)
+                        )
+                    continue
 
             is_live = bool(existing["is_live"]) or headline.is_live
             if existing["content_hash"] == headline.content_hash:
@@ -761,6 +950,92 @@ def store_headlines(conn: sqlite3.Connection, headlines: Iterable[Headline]) -> 
     return InsertResult(
         new=new, retitled=retitled, retitled_live=retitled_live, retitled_minor=retitled_minor
     )
+
+
+@dataclass(frozen=True, slots=True)
+class FrontPageStored:
+    """What one `store_front_page` call changed."""
+
+    new: int
+    # Front-page headlines that were already stored ...
+    merged: int
+    # ... and of those, how many a feed (RSS/Atom or listing page) had found.
+    merged_feed: int
+    retitled: int = 0
+
+
+def store_front_page(conn: sqlite3.Connection, headlines: Sequence[Headline]) -> FrontPageStored:
+    """Store one front page's headlines, merging each with the article it already is.
+
+    A headline is an article already stored when its URL matches, or a variant
+    of it does (tracking parameters, AMP, mobile host; see `match_key`), or it
+    has the same headline words as one of the source's articles from the last
+    week (see `title_key`). A match only records that the front page found it,
+    and where: the stored title is the feed's and is never replaced by the
+    front page's display headline, so front pages add no rewrites. Anything
+    else is a new article, found only on the front page.
+    """
+    new = merged = merged_feed = retitled = 0
+    twins: dict[str, _Twins] = {}
+    since = utcnow() - MATCH_WINDOW
+    with conn:
+        for headline in headlines:
+            key = headline.source.casefold()
+            if key not in twins:
+                twins[key] = _Twins(conn, headline.source, since, only_front_page=False)
+            row = conn.execute(
+                "SELECT id, url, title, content_hash, is_live, acquisition FROM headlines"
+                " WHERE url = ?",
+                (headline.url,),
+            ).fetchone()
+            if row is None:
+                twin = twins[key].find(headline)
+                if twin is not None:
+                    row = conn.execute(
+                        "SELECT id, url, title, content_hash, is_live, acquisition FROM headlines"
+                        " WHERE id = ?",
+                        (twin,),
+                    ).fetchone()
+            if row is None:
+                headline_id = _insert_article(conn, headline)
+                twins[key].add(headline_id, headline.url, headline.title)
+                new += 1
+                continue
+            methods = _methods(row["acquisition"])
+            merged += 1
+            merged_feed += int(bool(methods - {FRONT_PAGE}))
+            if (
+                methods == {FRONT_PAGE}
+                and row["url"] == headline.url
+                and row["content_hash"] != headline.content_hash
+            ):
+                # Only the front page knows this article: its rewrites are real ones.
+                if _add_revision(conn, row["id"], headline):
+                    retitled += 1
+                conn.execute(
+                    "UPDATE headlines SET title = ?, summary = ?, content_hash = ? WHERE id = ?",
+                    (headline.title, headline.summary, headline.content_hash, row["id"]),
+                )
+            conn.execute(
+                """
+                UPDATE headlines SET acquisition = ?, front_page_position = ?,
+                    front_page_seen_at = ?, section = COALESCE(section, ?),
+                    image_url = COALESCE(image_url, ?),
+                    published_at = COALESCE(published_at, ?), is_live = MAX(is_live, ?)
+                WHERE id = ?
+                """,
+                (
+                    _joined(methods | {FRONT_PAGE}),
+                    headline.front_page_position,
+                    _iso(headline.fetched_at),
+                    headline.section,
+                    headline.image_url,
+                    _iso(headline.published_at),
+                    int(headline.is_live),
+                    row["id"],
+                ),
+            )
+    return FrontPageStored(new=new, merged=merged, merged_feed=merged_feed, retitled=retitled)
 
 
 def insert_headlines(conn: sqlite3.Connection, headlines: Iterable[Headline]) -> int:
@@ -804,6 +1079,119 @@ def record_fetch(
         )
 
 
+def record_front_page(conn: sqlite3.Connection, result: Any) -> None:
+    """Append one `frontpage.FrontPageResult` to `front_page_log`."""
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO front_page_log
+                (source, url, started_at, finished_at, status, http_status, final_url,
+                 response_ms, headlines, duplicates, items_new, items_merged,
+                 items_merged_feed, method, rendering_required, etag, last_modified, error)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                result.source,
+                result.url,
+                _iso(result.started_at),
+                _iso(result.finished_at),
+                result.status,
+                result.http_status,
+                result.final_url,
+                result.response_ms,
+                len(result.headlines),
+                result.duplicates,
+                result.items_new,
+                result.items_merged,
+                result.items_merged_feed,
+                result.method,
+                int(result.rendering_required),
+                result.etag,
+                result.last_modified,
+                result.error,
+            ),
+        )
+
+
+# Front-page reads that count as working.
+FRONT_PAGE_OK: Final = ("healthy", "not_modified")
+
+
+@dataclass(frozen=True, slots=True)
+class FrontPageStatus:
+    """A source's latest front-page read and its last good one."""
+
+    name: str
+    status: str
+    checked_at: datetime | None
+    last_success: datetime | None
+    headlines: int
+    response_ms: int | None
+    http_status: int | None
+    error: str | None
+    rendering_required: bool = False
+    method: str | None = None
+    items_new: int = 0
+    items_merged_feed: int = 0
+
+
+def front_page_status(conn: sqlite3.Connection, names: Iterable[str]) -> dict[str, FrontPageStatus]:
+    """The latest front-page read per named source (sources never read are left out)."""
+    found: dict[str, FrontPageStatus] = {}
+    for name in names:
+        last = conn.execute(
+            """
+            SELECT * FROM front_page_log WHERE source = ? COLLATE NOCASE
+            ORDER BY finished_at DESC, id DESC LIMIT 1
+            """,
+            (name,),
+        ).fetchone()
+        if last is None:
+            continue
+        good = conn.execute(
+            f"""
+            SELECT finished_at FROM front_page_log
+            WHERE source = ? COLLATE NOCASE AND status IN {FRONT_PAGE_OK}
+            ORDER BY finished_at DESC, id DESC LIMIT 1
+            """,
+            (name,),
+        ).fetchone()
+        found[name] = FrontPageStatus(
+            name=name,
+            status=last["status"],
+            checked_at=_parse_iso(last["finished_at"]),
+            last_success=_parse_iso(good["finished_at"]) if good else None,
+            headlines=int(last["headlines"]),
+            response_ms=last["response_ms"],
+            http_status=last["http_status"],
+            error=last["error"],
+            rendering_required=bool(last["rendering_required"]),
+            method=last["method"],
+            items_new=int(last["items_new"]),
+            items_merged_feed=int(last["items_merged_feed"]),
+        )
+    return found
+
+
+def front_page_validators(
+    conn: sqlite3.Connection, names: Iterable[str]
+) -> dict[str, tuple[str, str | None, str | None]]:
+    """(url, ETag, Last-Modified) from each source's last good read, for conditional GETs."""
+    found: dict[str, tuple[str, str | None, str | None]] = {}
+    for name in names:
+        row = conn.execute(
+            f"""
+            SELECT url, etag, last_modified FROM front_page_log
+            WHERE source = ? COLLATE NOCASE AND status IN {FRONT_PAGE_OK}
+            ORDER BY finished_at DESC, id DESC LIMIT 1
+            """,
+            (name,),
+        ).fetchone()
+        if row is not None and (row["etag"] or row["last_modified"]):
+            found[name] = (row["url"], row["etag"], row["last_modified"])
+    return found
+
+
 def _row_to_headline(row: sqlite3.Row) -> Headline:
     return Headline(
         source=row["source"],
@@ -814,11 +1202,17 @@ def _row_to_headline(row: sqlite3.Row) -> Headline:
         summary=row["summary"],
         content_hash=row["content_hash"],
         is_live=bool(row["is_live"]),
+        acquisition=tuple(sorted(_methods(row["acquisition"]))),
+        front_page_position=row["front_page_position"],
+        front_page_seen_at=_parse_iso(row["front_page_seen_at"]),
+        section=row["section"],
+        image_url=row["image_url"],
     )
 
 
 _SELECT_COLUMNS: Final = (
-    "source, title, url, published_at, fetched_at, summary, content_hash, is_live"
+    "source, title, url, published_at, fetched_at, summary, content_hash, is_live,"
+    " acquisition, front_page_position, front_page_seen_at, section, image_url"
 )
 # COALESCE so items without a publication date still sort by when we saw them.
 _ORDER_BY: Final = "ORDER BY COALESCE(published_at, fetched_at) DESC, id DESC"

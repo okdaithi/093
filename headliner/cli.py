@@ -12,20 +12,24 @@ import json
 import logging
 import re
 import socket
+import sqlite3
 import sys
+from collections import Counter
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Final, TextIO
 from urllib.parse import urlsplit
 
-from headliner import __version__, build, local_timezone, network, notify, tz_abbrev
+from headliner import __version__, build, frontpage, local_timezone, network, notify, tz_abbrev
 from headliner.backup import DEFAULT_KEEP_DAILY, DEFAULT_KEEP_WEEKLY, BackupError, run_backup
 from headliner.config import (
     DEFAULT_CONFIG_PATH,
     Config,
     ConfigError,
+    FrontPage,
     Settings,
+    Source,
     load_config,
     parse_tags,
 )
@@ -38,22 +42,27 @@ from headliner.discover import (
     render_report,
     render_yaml,
 )
-from headliner.fetcher import SourceResult, fetch_all
+from headliner.fetcher import RateLimiter, RobotsCache, SourceResult, build_client, fetch_all
 from headliner.models import Headline, utcnow
 from headliner.store import (
     DEFAULT_DB_PATH,
+    FrontPageStatus,
     LiveFilter,
     SourceStatus,
     TitleChange,
+    front_page_status,
+    front_page_validators,
     hidden_changes,
     list_headlines,
     list_title_changes,
     migrate,
     open_db,
     record_fetch,
+    record_front_page,
     search_headlines,
     search_history,
     source_status,
+    store_front_page,
     store_headlines,
     upgrade_plan,
 )
@@ -223,14 +232,15 @@ def output_headlines(
 
 
 def _summarise(results: list[SourceResult], *, dry_run: bool) -> None:
-    ok = sum(1 for result in results if result.status == "ok")
-    skipped = sum(1 for result in results if result.status == "skipped")
-    failed = sum(1 for result in results if result.status == "error")
-    found = sum(result.items_found for result in results)
-    new = sum(result.items_new for result in results)
-    changed = sum(result.items_changed for result in results)
-    changed_live = sum(result.items_changed_live for result in results)
-    changed_minor = sum(result.items_changed_minor for result in results)
+    ran = [result for result in results if result.feed_ran]
+    ok = sum(1 for result in ran if result.status == "ok")
+    skipped = sum(1 for result in ran if result.status == "skipped")
+    failed = sum(1 for result in ran if result.status == "error")
+    found = sum(result.items_found for result in ran)
+    new = sum(result.items_new for result in ran)
+    changed = sum(result.items_changed for result in ran)
+    changed_live = sum(result.items_changed_live for result in ran)
+    changed_minor = sum(result.items_changed_minor for result in ran)
     details = [f"{changed_live} live"] if changed_live else []
     if changed_minor:
         details.append(f"{changed_minor} minor")
@@ -247,13 +257,82 @@ def _summarise(results: list[SourceResult], *, dry_run: bool) -> None:
         live_note,
         suffix,
     )
+    pages = [result.front_page for result in results if result.front_page is not None]
+    if pages:
+        states = Counter(page.status for page in pages)
+        logger.info(
+            "front pages: %d attempted, %s; %d headline(s), %d new, %d merged with feed articles%s",
+            len(pages),
+            ", ".join(f"{count} {state}" for state, count in sorted(states.items())),
+            sum(len(page.headlines) for page in pages),
+            sum(page.items_new for page in pages),
+            sum(page.items_merged_feed for page in pages),
+            suffix,
+        )
+
+
+def _store_results(conn: sqlite3.Connection, results: list[SourceResult]) -> None:
+    """Write each source's feed items, then its front-page items, and log both reads."""
+    for result in results:
+        if result.headlines:
+            stored = store_headlines(conn, result.headlines)
+            result.items_new = stored.new
+            result.items_changed = stored.retitled
+            result.items_changed_live = stored.retitled_live
+            result.items_changed_minor = stored.retitled_minor
+        page = result.front_page
+        if page is not None:
+            if page.headlines:
+                merged = store_front_page(conn, page.headlines)
+                page.items_new = merged.new
+                page.items_merged = merged.merged
+                page.items_merged_feed = merged.merged_feed
+                if result.status == "ok" and not result.headlines:
+                    # A source with no feed: its front page is its whole intake.
+                    result.items_new = merged.new
+                    result.items_changed = merged.retitled
+            record_front_page(conn, page)
+            if page.headlines:
+                logger.info(
+                    'source="%s" rss=%d front_page=%d overlap=%d new_from_front_page=%d',
+                    result.source,
+                    len(result.headlines),
+                    len(page.headlines),
+                    page.items_merged_feed,
+                    page.items_new,
+                )
+        if not result.feed_ran:
+            continue
+        newest = [h.published_at for h in result.headlines if h.published_at]
+        if not result.headlines and page is not None:
+            newest = [h.published_at for h in page.headlines if h.published_at]
+        record_fetch(
+            conn,
+            source=result.source,
+            started_at=result.started_at,
+            finished_at=result.finished_at,
+            status=result.status,
+            items_found=result.items_found,
+            items_new=result.items_new,
+            items_changed=result.items_changed,
+            error=result.error,
+            newest_item=max(newest, default=None),
+        )
 
 
 def cmd_fetch(args: argparse.Namespace, config: Config) -> int:
     """Fetch every selected source, store new headlines and log the run."""
     sources = config.select(args.only, args.tag)
+    feeds = not args.front_pages_only
+    front_pages = not args.no_front_pages
+    if not feeds:
+        sources = [source for source in sources if source.front_page_url]
     if not sources:
-        logger.error("no enabled sources to fetch")
+        logger.error(
+            "no enabled sources with a front page to read"
+            if not feeds
+            else "no enabled sources to fetch"
+        )
         return EXIT_FATAL
 
     logger.info(
@@ -261,7 +340,23 @@ def cmd_fetch(args: argparse.Namespace, config: Config) -> int:
     )
     hosts = network.probe_hosts(source.url for source in sources)
     if network.wait_until_up(hosts, patience=args.wait_network * 60):
-        results = asyncio.run(fetch_all(sources, config.settings, ignore_robots=args.ignore_robots))
+        cache: dict[str, frontpage.CacheEntry] = {}
+        if front_pages and not args.dry_run and args.db.exists():
+            with open_db(args.db) as conn:
+                for name, (url, etag, modified) in front_page_validators(
+                    conn, [source.name for source in sources if source.front_page_url]
+                ).items():
+                    cache[name] = frontpage.CacheEntry(url, etag, modified)
+        results = asyncio.run(
+            fetch_all(
+                sources,
+                config.settings,
+                ignore_robots=args.ignore_robots,
+                feeds=feeds,
+                front_pages=front_pages,
+                front_page_cache=cache,
+            )
+        )
     else:
         logger.error(
             "network down: could not resolve %s; not fetching %d source(s)",
@@ -276,52 +371,168 @@ def cmd_fetch(args: argparse.Namespace, config: Config) -> int:
                 started_at=now,
                 finished_at=now,
                 error=network.NETWORK_ERROR,
+                feed_ran=feeds or not source.has_feed,
             )
             for source in sources
         ]
 
     if args.dry_run:
         for result in results:
-            if result.headlines:
-                output_headlines(result.headlines, "table", sys.stdout, utc=args.utc)
+            shown = list(result.headlines)
+            if result.front_page is not None:
+                shown += result.front_page.headlines
+            if shown:
+                output_headlines(shown, "table", sys.stdout, utc=args.utc)
                 print(file=sys.stdout)
         _summarise(results, dry_run=True)
     else:
         with open_db(args.db) as conn:
-            for result in results:
-                if result.headlines:
-                    stored = store_headlines(conn, result.headlines)
-                    result.items_new = stored.new
-                    result.items_changed = stored.retitled
-                    result.items_changed_live = stored.retitled_live
-                    result.items_changed_minor = stored.retitled_minor
-                record_fetch(
-                    conn,
-                    source=result.source,
-                    started_at=result.started_at,
-                    finished_at=result.finished_at,
-                    status=result.status,
-                    items_found=result.items_found,
-                    items_new=result.items_new,
-                    items_changed=result.items_changed,
-                    error=result.error,
-                    newest_item=max(
-                        (h.published_at for h in result.headlines if h.published_at),
-                        default=None,
-                    ),
-                )
+            _store_results(conn, results)
         _summarise(results, dry_run=False)
 
-    failures = [result for result in results if not result.ok]
+    ran = [result for result in results if result.feed_ran]
+    failures = [result for result in ran if not result.ok]
     if not failures:
         return EXIT_OK
     # Every source failing the same DNS/routing way is one problem, not many.
     if all(network.is_network_error(result.error) for result in failures) and not any(
-        result.status == "ok" for result in results
+        result.status == "ok" for result in ran
     ):
         logger.error("network down: every source failed with a DNS or connection error")
         return EXIT_NETWORK
     return EXIT_PARTIAL_FAILURE
+
+
+# The validator also opens articles on the same sites, so it waits at least
+# this long between two requests to a domain.
+VALIDATE_MIN_GAP: Final = 2.0
+
+
+async def _validate_pages(
+    sources: list[Source], settings: Settings, *, follow: int
+) -> list[frontpage.Validation]:
+    client = build_client(settings)
+    limiter = RateLimiter(max(settings.rate_limit_seconds, VALIDATE_MIN_GAP))
+    robots = RobotsCache(client, settings.user_agent)
+    semaphore = asyncio.Semaphore(settings.concurrency)
+
+    async def one(source: Source) -> frontpage.Validation:
+        async with semaphore:
+            result = await frontpage.fetch_front_page(
+                client, source, settings, limiter=limiter, robots=robots
+            )
+            validation = frontpage.Validation(result)
+            if result.ok and follow:
+                await frontpage.follow_articles(
+                    client,
+                    result.headlines,
+                    settings,
+                    limiter=limiter,
+                    robots=robots,
+                    count=follow,
+                    validation=validation,
+                )
+            frontpage.judge(validation, follow=follow)
+            return validation
+
+    try:
+        return list(await asyncio.gather(*(one(source) for source in sources)))
+    finally:
+        await client.aclose()
+
+
+def _adhoc_source(url: str) -> Source:
+    host = (urlsplit(url).hostname or url).removeprefix("www.")
+    return Source(name=host, url=url, type="front_page", front_page=FrontPage(url=url))
+
+
+def cmd_frontpages(args: argparse.Namespace) -> int:
+    """Read front pages without storing anything, and say whether each is worth enabling."""
+    try:
+        config: Config | None = load_config(args.sources)
+    except ConfigError as exc:
+        if not args.url:
+            raise
+        logger.warning("%s; using default settings", exc)
+        config = None
+    settings = config.settings if config else Settings()
+    sources: list[Source] = []
+    for url in args.url or []:
+        if urlsplit(url).scheme not in {"http", "https"} or not urlsplit(url).hostname:
+            logger.error("not an http(s) URL: %r", url)
+            return EXIT_FATAL
+        sources.append(_adhoc_source(url))
+    if config is not None and (args.only or args.tag or not args.url):
+        chosen = config.select(args.only, args.tag)
+        missing = [source.name for source in chosen if source.front_page is None]
+        if args.only and missing:
+            logger.error(
+                "no front page configured for %s; add a front_page block, or try --url",
+                ", ".join(missing),
+            )
+            return EXIT_FATAL
+        sources += [source for source in chosen if source.front_page_url]
+    if not sources:
+        logger.error("no front pages to check; configure front_page on a source or pass --url")
+        return EXIT_FATAL
+
+    checks = asyncio.run(_validate_pages(sources, settings, follow=args.follow))
+    if args.format == "json":
+        json.dump([check.as_dict() for check in checks], sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    else:
+        rows = [
+            [
+                _truncate(check.result.source, 24),
+                check.result.status,
+                str(check.result.http_status or "-"),
+                str(check.result.response_ms if check.result.response_ms is not None else "-"),
+                f"{check.unique_headline_count}/{check.headline_count}",
+                str(check.valid_article_url_count),
+                f"{check.accessible}/{check.followed}",
+                f"{check.mean_headline_length:.0f}",
+                f"{check.duplicate_rate:.0%}",
+                check.result.method or "-",
+                "valid" if check.valid else "INVALID",
+            ]
+            for check in checks
+        ]
+        render_table(
+            rows,
+            [
+                "SOURCE",
+                "STATUS",
+                "HTTP",
+                "MS",
+                "HEADLINES",
+                "ARTICLE URLS",
+                "FOLLOWED",
+                "MEAN LEN",
+                "DUPES",
+                "METHOD",
+                "VERDICT",
+            ],
+            sys.stdout,
+        )
+        for check in checks:
+            if check.reasons:
+                print(f"\n{check.result.source}: " + "; ".join(check.reasons))
+            if args.show and check.result.headlines:
+                print(f"\n{check.result.source} ({check.result.final_url}):")
+                for headline in check.result.headlines[: args.show]:
+                    section = f" [{headline.section}]" if headline.section else ""
+                    print(f"  {headline.front_page_position:>3}. {headline.title}{section}")
+                    print(f"       {headline.url}")
+    valid = sum(1 for check in checks if check.valid)
+    states = Counter(check.result.status for check in checks)
+    logger.info(
+        "front pages: %d checked, %d valid; %s; %d headline(s)",
+        len(checks),
+        valid,
+        ", ".join(f"{count} {state}" for state, count in sorted(states.items())),
+        sum(check.unique_headline_count for check in checks),
+    )
+    return EXIT_OK if valid == len(checks) else EXIT_PARTIAL_FAILURE
 
 
 def cmd_list(args: argparse.Namespace, config: Config) -> int:
@@ -493,6 +704,9 @@ def cmd_migrate(args: argparse.Namespace) -> int:
             f"{verb} previous titles for {plan.revisions_linked} revision(s); "
             "adding the feed freshness column"
         )
+    if plan.from_version < 5:
+        verb = "would add" if args.dry_run else "adding"
+        steps.append(f"{verb} front-page provenance columns and the front-page log")
     print(
         f"{args.db}: schema version {plan.from_version} -> {plan.to_version}; "
         f"{plan.headlines} headline row(s); {'; '.join(steps)}."
@@ -506,26 +720,74 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _iso(value: datetime | None) -> str | None:
+    return value.isoformat() if value else None
+
+
+def _front_page_json(
+    source: Source, page: FrontPageStatus | None, now: datetime
+) -> dict[str, object] | None:
+    if source.front_page is None:
+        return None
+    return {
+        "url": source.front_page.url,
+        "status": frontpage.health(
+            source.front_page,
+            page.status if page else None,
+            page.last_success if page else None,
+            now,
+        ),
+        "last_read_status": page.status if page else None,
+        "checked_at": _iso(page.checked_at) if page else None,
+        "last_success": _iso(page.last_success) if page else None,
+        "headlines": page.headlines if page else 0,
+        "new": page.items_new if page else 0,
+        "merged_with_feed": page.items_merged_feed if page else 0,
+        "response_ms": page.response_ms if page else None,
+        "http_status": page.http_status if page else None,
+        "rendering_required": page.rendering_required if page else False,
+        "method": page.method if page else None,
+        "error": page.error if page else None,
+    }
+
+
 def _render_sources(
-    statuses: list[SourceStatus], config: Config, fmt: str, *, utc: bool = False
+    statuses: list[SourceStatus],
+    config: Config,
+    fmt: str,
+    *,
+    utc: bool = False,
+    pages: dict[str, FrontPageStatus] | None = None,
 ) -> None:
     by_name = {source.name: source for source in config.sources}
+    pages = pages or {}
+    now = utcnow()
     if fmt == "json":
-        payload = [
-            {
-                "name": status.name,
-                "url": by_name[status.name].url,
-                "type": by_name[status.name].type,
-                "enabled": by_name[status.name].enabled,
-                "tags": list(by_name[status.name].tags),
-                "items": status.total_items,
-                "last_success": status.last_success.isoformat() if status.last_success else None,
-                "last_status": status.last_status,
-                "last_error": status.last_error,
-                "newest_item": status.newest_item.isoformat() if status.newest_item else None,
-            }
-            for status in statuses
-        ]
+        payload = []
+        for status in statuses:
+            source = by_name[status.name]
+            payload.append(
+                {
+                    "name": status.name,
+                    "url": source.url,
+                    "type": source.type,
+                    "enabled": source.enabled,
+                    "tags": list(source.tags),
+                    "items": status.total_items,
+                    "last_success": _iso(status.last_success),
+                    "last_status": status.last_status,
+                    "last_error": status.last_error,
+                    "newest_item": _iso(status.newest_item),
+                    "rss": {
+                        "status": status.last_status,
+                        "last_success": _iso(status.last_success),
+                        "newest": _iso(status.newest_item),
+                    }
+                    if source.has_feed
+                    else None,
+                    "front_page": _front_page_json(source, pages.get(status.name), now),
+                }
+            )
         json.dump(payload, sys.stdout, indent=2)
         sys.stdout.write("\n")
         return
@@ -543,13 +805,37 @@ def _render_sources(
                 str(status.total_items),
                 when,
                 status.last_status or "never fetched",
+                _front_page_cell(source, pages.get(status.name), now),
             ]
         )
     render_table(
         rows,
-        ["NAME", "TYPE", "ENABLED", "TAGS", "ITEMS", f"LAST SUCCESS ({zone})", "LAST STATUS"],
+        [
+            "NAME",
+            "TYPE",
+            "ENABLED",
+            "TAGS",
+            "ITEMS",
+            f"LAST SUCCESS ({zone})",
+            "LAST STATUS",
+            "FRONT PAGE",
+        ],
         sys.stdout,
     )
+
+
+def _front_page_cell(source: Source, page: FrontPageStatus | None, now: datetime) -> str:
+    state = frontpage.health(
+        source.front_page,
+        page.status if page else None,
+        page.last_success if page else None,
+        now,
+    )
+    if state is None:
+        return "-"
+    if page is not None and state == frontpage.HEALTHY:
+        return f"{state} ({page.headlines})"
+    return state
 
 
 def cmd_sources(args: argparse.Namespace, config: Config) -> int:
@@ -557,7 +843,8 @@ def cmd_sources(args: argparse.Namespace, config: Config) -> int:
     shown = config.tagged(args.tag) if args.tag else config.sources
     with open_db(args.db) as conn:
         statuses = source_status(conn, [source.name for source in shown])
-    _render_sources(statuses, config, args.format, utc=args.utc)
+        pages = front_page_status(conn, [source.name for source in shown if source.front_page])
+    _render_sources(statuses, config, args.format, utc=args.utc, pages=pages)
     return EXIT_OK
 
 
@@ -806,6 +1093,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="fetch and parse but write nothing to the database",
     )
+    paths = fetch.add_mutually_exclusive_group()
+    paths.add_argument(
+        "--no-front-pages",
+        action="store_true",
+        help="read feeds only; skip every configured front page this run",
+    )
+    paths.add_argument(
+        "--front-pages-only",
+        action="store_true",
+        help="read only the front pages of sources that have one; skip feeds",
+    )
 
     listing = subparsers.add_parser("list", parents=[common], help="list stored headlines")
     listing.add_argument(
@@ -918,6 +1216,47 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sources_cmd.add_argument(
         "--tag", action="append", metavar="TAG", help="only sources with this tag (repeatable)"
+    )
+
+    pages_cmd = subparsers.add_parser(
+        "frontpages",
+        parents=[common],
+        help="check front pages: read and extract them, store nothing, judge each",
+        description="Read each configured front page (or --url pages), extract its "
+        "headlines and follow a few articles, without storing anything. Exits 1 "
+        "when any page fails validation.",
+    )
+    pages_cmd.add_argument(
+        "--only", nargs="+", metavar="NAME", help="only these configured sources"
+    )
+    pages_cmd.add_argument(
+        "--tag", action="append", metavar="TAG", help="only sources with this tag (repeatable)"
+    )
+    pages_cmd.add_argument(
+        "--url",
+        action="append",
+        metavar="URL",
+        help="check this page with generic extraction, configured or not (repeatable)",
+    )
+    pages_cmd.add_argument(
+        "--follow",
+        type=int,
+        default=2,
+        metavar="N",
+        help="open the first N articles to check they load (default %(default)s; 0 for none)",
+    )
+    pages_cmd.add_argument(
+        "--show",
+        type=int,
+        default=0,
+        metavar="N",
+        help="print the first N headlines of each page",
+    )
+    pages_cmd.add_argument(
+        "--format",
+        choices=("table", "json"),
+        default="table",
+        help="output format (default: %(default)s)",
     )
 
     discover_cmd = subparsers.add_parser(
@@ -1085,6 +1424,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_stories(args)
         if args.command == "backup":
             return cmd_backup(args)
+        if args.command == "frontpages":
+            return cmd_frontpages(args)
         config = load_config(args.sources)
         if args.command == "fetch":
             return cmd_fetch(args, config)

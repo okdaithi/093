@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Example Daily - News, sport and opinion</title>
+  <link rel="canonical" href="https://news.example.com/">
+  <meta property="og:url" content="https://news.example.com/">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {"@type": "WebSite", "name": "Example Daily", "url": "https://news.example.com/"},
+      {
+        "@type": "ItemList",
+        "itemListElement": [
+          {
+            "@type": "ListItem",
+            "position": 1,
+            "item": {
+              "@type": "NewsArticle",
+              "headline": "Harbour bridge reopens after week-long repair closure",
+              "url": "https://news.example.com/news/2026/10/04/harbour-bridge-reopens",
+              "datePublished": "2026-10-04T06:30:00+08:00",
+              "articleSection": "News"
+            }
+          },
+          {
+            "@type": "ListItem",
+            "position": 2,
+            "item": {
+              "@type": "AnalysisNewsArticle",
+              "headline": "Why the budget surplus is smaller than it looks this year",
+              "url": "/business/2026/10/04/budget-surplus-smaller-than-it-looks"
+            }
+          }
+        ]
+      }
+    ]
+  }
+  </script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to main content</a>
+  <div class="cookie-banner">
+    <p>We use cookies. <a href="/privacy-policy">Privacy policy</a>
+      <a href="/cookie-settings/manage-your-cookie-preferences-here">Manage your cookie preferences here</a></p>
+  </div>
+  <header class="site-header">
+    <a href="/" class="logo">Example Daily</a>
+    <nav aria-label="Main">
+      <ul>
+        <li><a href="/news">News</a></li>
+        <li><a href="/world">World</a></li>
+        <li><a href="/sport">Sport</a></li>
+        <li><a href="/opinion">Opinion</a></li>
+        <li><a href="/podcasts">Podcasts</a></li>
+        <li><a href="/news/2026/10/01/this-is-a-menu-promo-article-link">This is a menu promo article link</a></li>
+      </ul>
+    </nav>
+    <a href="/subscribe">Subscribe</a>
+    <a href="/login">Log in</a>
+    <a href="/search">Search</a>
+  </header>
+
+  <main id="main">
+    <section class="lead">
+      <article class="story-card">
+        <header><span class="kicker">EXCLUSIVE</span>
+          <h2><a href="/news/2026/10/04/harbour-bridge-reopens?utm_source=homepage&amp;utm_medium=web">Harbour bridge reopens after week-long repair closure</a></h2>
+        </header>
+        <p class="teaser">Commuters return to the main crossing after crews finished early.</p>
+        <time datetime="2026-10-04T06:30:00+08:00">6:30am</time>
+        <img src="//img.example.com/bridge.jpg" alt="">
+      </article>
+
+      <article class="story-card">
+        <h3><a href="https://news.example.com/world/2026/10/04/storm-hits-coast-thousands-without-power">Storm hits coast, leaving thousands without power</a></h3>
+        <a href="/world/2026/10/04/storm-hits-coast-thousands-without-power#comments">12 comments</a>
+      </article>
+
+      <!-- The same story again, linked from a second place on the page. -->
+      <div class="promo-strip">
+        <a class="promo" href="/world/2026/10/04/storm-hits-coast-thousands-without-power">
+          <span class="label">World</span>
+          <span>Storm hits coast, leaving thousands without power</span>
+        </a>
+      </div>
+    </section>
+
+    <section class="grid">
+      <div class="card">
+        <a class="overlay" href="/business/2026/10/04/budget-surplus-smaller-than-it-looks"></a>
+        <div class="card-title">Why the budget surplus is smaller than it looks this year</div>
+        <span class="byline">By A. Writer</span>
+      </div>
+
+      <div class="teaser">
+        <a href="/sport/2026/10/03/dockers-claim-flag-in-thriller">
+          <span class="tag">Sport</span>
+          <span class="premium-label">Premium</span>
+          <span>Dockers claim flag in a thriller at the MCG</span>
+          <p class="summary">A last-quarter comeback sealed a famous win in front of a record crowd that stayed late.</p>
+        </a>
+      </div>
+
+      <!-- Similar wording, different story: both must be kept. -->
+      <div class="teaser">
+        <h3><a href="/news/2026/10/04/fire-in-perth-kills-two">Fire in Perth suburb kills two</a></h3>
+      </div>
+      <div class="teaser">
+        <h3><a href="/news/2026/10/04/fire-in-perth-kills-three">Fire in Perth suburb kills three</a></h3>
+      </div>
+
+      <!-- An AMP link to an article already linked above: the same story. -->
+      <div class="teaser">
+        <h3><a href="https://amp.news.example.com/news/2026/10/04/harbour-bridge-reopens/amp">Harbour bridge reopens after week-long repair closure</a></h3>
+      </div>
+
+      <div class="teaser">
+        <h3><a href="/news/live/2026/10/04/election-count-live-updates">Live: election count updates from every electorate</a></h3>
+        <a href="/news/live/2026/10/04/election-count-live-updates?update=123">Latest: counting resumes in the north of the state</a>
+      </div>
+
+      <div class="teaser">
+        <h3><a href="/topic/climate-change">Climate change</a></h3>
+        <h3><a href="/news/topic/air-incidents">Topic: Air incidents and safety</a></h3>
+        <a href="/life-style/health-and-families">Health &amp; Families</a>
+        <a href="/audio/2026/10/04/morning-bulletin.mp3">Listen · 3:34</a>
+        <a href="/newsletters/sign-up-for-the-morning-briefing-newsletter">Sign up for the morning briefing</a>
+        <a href="https://twitter.com/exampledaily/status/1234567890">Follow us on X for breaking news alerts</a>
+        <a href="javascript:void(0)">Load more stories from today</a>
+      </div>
+
+      <div itemscope itemtype="https://schema.org/NewsArticle" class="teaser">
+        <a itemprop="url" href="/science/2026/10/04/new-species-of-frog-found">
+          <span itemprop="headline">New species of frog found in the Kimberley</span>
+        </a>
+        <meta itemprop="datePublished" content="2026-10-03T22:00:00Z">
+        <meta itemprop="articleSection" content="Science">
+      </div>
+    </section>
+
+    <aside class="most-read">
+      <h2>Most read</h2>
+      <ol>
+        <li><a href="/news/2026/10/02/council-approves-new-cycleway-plan"><span class="rank">1</span> Council approves new cycleway plan for city</a></li>
+      </ol>
+    </aside>
+    <aside class="social-share">
+      <a href="/news/2026/10/04/share-this-story-on-facebook-now">Share this story on Facebook now</a>
+    </aside>
+  </main>
+
+  <footer>
+    <a href="/about-us">About us</a>
+    <a href="/contact">Contact</a>
+    <a href="/news/2026/09/30/footer-link-to-an-old-article-here">Footer link to an old article here</a>
+    <a href="/terms">Terms of use</a>
+  </footer>
+</body>
+</html>

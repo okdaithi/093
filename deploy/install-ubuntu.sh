@@ -171,6 +171,16 @@ if systemctl is-enabled --quiet headliner.timer \
     systemctl enable --now headliner-watchdog.timer
     echo "Enabled the health watchdog (headliner-watchdog.timer, every 10 minutes)."
 fi
+# The read-only viewer refuses an older database schema, so upgrade it now
+# rather than at the next fetch. Runs as the service user, which owns the file.
+if [[ -f /var/lib/headliner/headlines.db ]]; then
+    if runuser -u headliner -- /opt/headliner/venv/bin/headliner migrate \
+        --db /var/lib/headliner/headlines.db --quiet; then
+        echo "Database schema is current."
+    else
+        echo "WARNING: database migration failed; the viewer may answer 503 until the next fetch." >&2
+    fi
+fi
 # A running viewer keeps serving the old code until restarted.
 if systemctl is-active --quiet headliner-web.service; then
     systemctl restart headliner-web.service
