@@ -195,6 +195,14 @@ class _Node(Protocol):
 
     def attr(self, name: str) -> str | None: ...
 
+    def tag(self) -> str: ...
+
+    def parent(self) -> _Node | None: ...
+
+    def own_text(self) -> str: ...
+
+    def is_same(self, other: _Node) -> bool: ...
+
 
 class _LexborNode:
     """selectolax adapter."""
@@ -217,6 +225,19 @@ class _LexborNode:
     def attr(self, name: str) -> str | None:
         value = self._node.attributes.get(name)
         return str(value) if isinstance(value, str) else None
+
+    def tag(self) -> str:
+        return str(self._node.tag or "").lower()
+
+    def parent(self) -> _Node | None:
+        found = self._node.parent
+        return _LexborNode(found) if found is not None else None
+
+    def own_text(self) -> str:
+        return str(self._node.text(deep=False, separator=" ", strip=False))
+
+    def is_same(self, other: _Node) -> bool:
+        return isinstance(other, _LexborNode) and self._node.mem_id == other._node.mem_id
 
 
 class _SoupNode:
@@ -243,6 +264,19 @@ class _SoupNode:
             value = " ".join(str(item) for item in value)
         return str(value) if value is not None else None
 
+    def tag(self) -> str:
+        return str(getattr(self._node, "name", "") or "").lower()
+
+    def parent(self) -> _Node | None:
+        found = getattr(self._node, "parent", None)
+        return _SoupNode(found) if found is not None else None
+
+    def own_text(self) -> str:
+        return " ".join(str(text) for text in self._node.find_all(string=True, recursive=False))
+
+    def is_same(self, other: _Node) -> bool:
+        return isinstance(other, _SoupNode) and self._node is other._node
+
 
 def _build_tree(body: bytes | str) -> _Node:
     """Parse a document with whichever HTML backend is installed."""
@@ -257,6 +291,31 @@ def _build_tree(body: bytes | str) -> _Node:
     raise ParseError(
         "no HTML backend available; install 'selectolax' or 'beautifulsoup4' and 'lxml'"
     )
+
+
+# Public names for the front-page extractor, which shares these backends.
+Node = _Node
+build_tree = _build_tree
+
+
+def descendants(node: _Node, selector: str) -> list[_Node]:
+    """Elements under `node` matching `selector`, never `node` itself.
+
+    selectolax's `css()` also matches the element it is called on and
+    beautifulsoup's `select()` does not; this behaves the same on both.
+    """
+    return [found for found in node.select_all(selector) if not found.is_same(node)]
+
+
+def selector_error(selector: str) -> str | None:
+    """Why `selector` is not a usable CSS selector, or None when it is."""
+    try:
+        _build_tree("<p></p>").select_all(selector)
+    except ParseError:
+        return None  # no HTML backend: cannot check here; parsing will say so later
+    except Exception as exc:  # noqa: BLE001 - each backend raises its own error type
+        return str(exc) or type(exc).__name__
+    return None
 
 
 def _node_text(node: _Node | None) -> str:
@@ -322,6 +381,7 @@ def parse_html(
                 summary=_node_text(article.select_one(source.summary_selector))
                 if source.summary_selector
                 else None,
+                acquisition=("html",),
             )
         except InvalidHeadlineError as exc:
             logger.debug("%s: skipping article node: %s", source.name, exc)

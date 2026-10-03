@@ -17,22 +17,30 @@ sources:
   - name: ABC News AU
     url: https://www.abc.net.au/news/feed/51120/rss.xml
     type: rss
+    front_page:
+      url: https://www.abc.net.au/news
     tags: [AU]
 
   - name: The Guardian AU
     url: https://www.theguardian.com/au/rss
     type: rss
+    front_page:
+      url: https://www.theguardian.com/au
     tags: [AU]
 
   - name: WAtoday
     url: https://www.watoday.com.au/rss/feed.xml
     type: rss
+    front_page:
+      url: https://www.watoday.com.au/
     group: nine
     tags: [AU]
 
   - name: The West Australian
     url: https://thewest.com.au/feed/
     type: rss
+    front_page:
+      url: https://thewest.com.au/
     tags: [AU]
 
   - name: Sydney Morning Herald
@@ -82,11 +90,15 @@ sources:
   - name: RTE News
     url: https://www.rte.ie/feeds/rss/?index=/news/
     type: rss
+    front_page:
+      url: https://www.rte.ie/news/
     tags: [IE]
 
   - name: Irish Times
     url: https://www.irishtimes.com/arc/outboundfeeds/feed-irish-news/
     type: rss
+    front_page:
+      url: https://www.irishtimes.com/
     tags: [IE]
 
   - name: Irish Independent
@@ -102,6 +114,8 @@ sources:
   - name: TheJournal.ie
     url: https://www.thejournal.ie/feed/
     type: rss
+    front_page:
+      url: https://www.thejournal.ie/
     tags: [IE]
 
   - name: Irish Mirror
@@ -150,6 +164,8 @@ sources:
   - name: BBC News
     url: https://feeds.bbci.co.uk/news/rss.xml
     type: rss
+    front_page:
+      url: https://www.bbc.com/news
     tags: [UK]
 
   - name: Sky News
@@ -172,11 +188,15 @@ sources:
   - name: Al Jazeera
     url: https://www.aljazeera.com/xml/rss/all.xml
     type: rss
+    front_page:
+      url: https://www.aljazeera.com/
     tags: [QA]
 
   - name: NPR News
     url: https://feeds.npr.org/1001/rss.xml
     type: rss
+    front_page:
+      url: https://www.npr.org/
     group: npr
     tags: [US]
 

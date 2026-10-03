@@ -23,8 +23,18 @@ DEFAULT_USER_AGENT: Final = (
     "headliner/0.1 (+https://github.com/okdaithi/093; contact: you@example.com)"
 )
 
-_SOURCE_TYPES: Final = frozenset({"rss", "html"})
+# `front_page` sources have no feed: only their live front page is read.
+_SOURCE_TYPES: Final = frozenset({"rss", "html", "front_page"})
 _HTML_REQUIRED: Final = ("article_selector", "title_selector", "link_selector")
+_FRONT_PAGE_SELECTORS: Final = (
+    "article_selector",
+    "title_selector",
+    "link_selector",
+    "section_selector",
+    "published_selector",
+    "image_selector",
+)
+_KNOWN_FRONT_PAGE_KEYS: Final = frozenset({"enabled", "url", *_FRONT_PAGE_SELECTORS})
 _KNOWN_SOURCE_KEYS: Final = frozenset(
     {
         "name",
@@ -37,6 +47,7 @@ _KNOWN_SOURCE_KEYS: Final = frozenset(
         "tags",
         "include_url_pattern",
         "group",
+        "front_page",
         *_HTML_REQUIRED,
     }
 )
@@ -71,8 +82,30 @@ class Settings:
 
 
 @dataclass(frozen=True, slots=True)
+class FrontPage:
+    """Where and how to read a source's live front page (see the README).
+
+    Every selector is optional: without `article_selector` the generic
+    extractor finds headlines on its own. The other selectors are looked up
+    inside each element `article_selector` matches.
+    """
+
+    url: str | None
+    enabled: bool = True
+    article_selector: str | None = None
+    title_selector: str | None = None
+    link_selector: str | None = None
+    section_selector: str | None = None
+    published_selector: str | None = None
+    image_selector: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class Source:
-    """One configured site. HTML selector fields are unused for `rss`."""
+    """One configured site. HTML selector fields are unused for `rss`.
+
+    For `type: front_page`, `url` is the front page and there is no feed.
+    """
 
     name: str
     url: str
@@ -93,6 +126,21 @@ class Source:
     # Mastheads sharing a newsroom or syndicated copy (e.g. "nine" for The Age,
     # SMH and WAtoday) count once when counting outlets on a story.
     group: str | None = None
+    # Optional second acquisition path: the publisher's live front page.
+    front_page: FrontPage | None = None
+
+    @property
+    def has_feed(self) -> bool:
+        """False for `front_page` sources, which have only a front page."""
+        return self.type != "front_page"
+
+    @property
+    def front_page_url(self) -> str | None:
+        """The front page to read this run, or None when front-page reading is off."""
+        page = self.front_page
+        if page is None or not page.enabled:
+            return None
+        return page.url
 
     @property
     def publisher(self) -> str:
@@ -291,6 +339,55 @@ def parse_tags(raw: Any, where: str) -> tuple[str, ...]:
     return tuple(tags)
 
 
+def _check_selector(selector: str, key: str, where: str) -> None:
+    # Imported here: parsers imports this module.
+    from headliner.parsers import selector_error
+
+    problem = selector_error(selector)
+    if problem is not None:
+        raise ConfigError(f"{where}: {key!r} is not a valid CSS selector ({selector!r}): {problem}")
+
+
+def _http_url(value: str, key: str, where: str) -> str:
+    parts = urlsplit(value)
+    if parts.scheme.lower() not in {"http", "https"}:
+        raise ConfigError(f"{where}: {key!r} must be http(s), got {value!r}")
+    if not parts.hostname:
+        raise ConfigError(f"{where}: {key!r} has no hostname, got {value!r}")
+    return value
+
+
+def _parse_front_page(raw: Any, default_url: str | None, where: str) -> FrontPage:
+    where = f"{where}: front_page"
+    if raw is True:
+        raw = {}
+    mapping = _require_mapping(raw, where)
+    _warn_unknown(mapping, _KNOWN_FRONT_PAGE_KEYS, where)
+    enabled = mapping.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ConfigError(f"{where}: 'enabled' must be true or false, got {enabled!r}")
+    url = _optional_str(mapping, "url", where)
+    if url is not None:
+        _http_url(url, "url", where)
+    url = url or default_url
+    if enabled and url is None:
+        raise ConfigError(f"{where}: 'url' is required when the front page is enabled")
+    selectors: dict[str, str | None] = {}
+    for key in _FRONT_PAGE_SELECTORS:
+        value = _optional_str(mapping, key, where)
+        if value is not None:
+            _check_selector(value, key, where)
+        selectors[key] = value
+    if selectors["article_selector"] is None:
+        inner = [key for key in _FRONT_PAGE_SELECTORS[1:] if selectors[key] is not None]
+        if inner:
+            raise ConfigError(
+                f"{where}: {', '.join(repr(key) for key in inner)} apply inside each "
+                "'article_selector' match; add one (or drop them to use generic extraction)"
+            )
+    return FrontPage(url=url, enabled=enabled, **selectors)
+
+
 def _parse_source(raw: Any, index: int, file_label: str) -> Source:
     where = f"{file_label}: sources[{index}]"
     mapping = _require_mapping(raw, where)
@@ -299,17 +396,36 @@ def _parse_source(raw: Any, index: int, file_label: str) -> Source:
     where = f"{file_label}: source {name!r}"
     _warn_unknown(mapping, _KNOWN_SOURCE_KEYS, where)
 
-    url = _require_str(mapping, "url", where)
-    scheme = urlsplit(url).scheme.lower()
-    if scheme not in {"http", "https"}:
-        raise ConfigError(f"{where}: 'url' must be http(s), got {url!r}")
-    if not urlsplit(url).hostname:
-        raise ConfigError(f"{where}: 'url' has no hostname, got {url!r}")
-
     source_type = _require_str(mapping, "type", where).lower()
     if source_type not in _SOURCE_TYPES:
         allowed = ", ".join(sorted(_SOURCE_TYPES))
         raise ConfigError(f"{where}: 'type' must be one of {allowed}; got {source_type!r}")
+
+    front_page: FrontPage | None = None
+    raw_front_page = mapping.get("front_page")
+    if source_type == "front_page":
+        # The front page is the source: `url` may be given at either level.
+        top_url = _optional_str(mapping, "url", where)
+        if top_url is not None:
+            _http_url(top_url, "url", where)
+        front_page = _parse_front_page(
+            raw_front_page if raw_front_page is not None else {}, top_url, where
+        )
+        if not front_page.enabled:
+            raise ConfigError(
+                f"{where}: a 'front_page' source cannot disable its front page; "
+                "use 'enabled: false' on the source instead"
+            )
+        if top_url is not None and front_page.url != top_url:
+            raise ConfigError(
+                f"{where}: 'url' and 'front_page.url' differ; give the front page once"
+            )
+        assert front_page.url is not None
+        url = front_page.url
+    else:
+        url = _http_url(_require_str(mapping, "url", where), "url", where)
+        if raw_front_page is not None and raw_front_page is not False:
+            front_page = _parse_front_page(raw_front_page, None, where)
 
     enabled = mapping.get("enabled", True)
     if not isinstance(enabled, bool):
@@ -348,6 +464,7 @@ def _parse_source(raw: Any, index: int, file_label: str) -> Source:
         tags=tags,
         include_url_pattern=include_url_pattern,
         group=_optional_str(mapping, "group", where),
+        front_page=front_page,
     )
 
 

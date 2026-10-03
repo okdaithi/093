@@ -2,7 +2,10 @@
 
 A small CLI that collects news headlines from a configurable list of sites,
 normalises them, and stores them in SQLite. It reads RSS/Atom feeds and, where
-no feed exists, scrapes a listing page with CSS selectors you supply.
+no feed exists, scrapes a listing page with CSS selectors you supply. It can
+also read a publisher's live front page next to its feed, to catch the stories
+the feed leaves out and record where each one sits on the page (see
+[Front pages](#front-pages)).
 
 It fetches **headlines, links, timestamps and feed summaries only**. It does not
 download article bodies and is not a way around a paywall.
@@ -16,6 +19,8 @@ download article bodies and is not a way around a paywall.
 - Live blogs are recognised, kept out of the rewrite list by default, and
   available as a running timeline
 - One failing source never aborts the run
+- Optional front-page reading per source: headlines in page order, merged with
+  the feed's articles rather than duplicated, with how each article was found
 - An optional read-only web viewer (`headliner web`) for browsing, rewrites,
   search and source health in a browser
 
@@ -364,6 +369,7 @@ headliner list --since 6h --format json 2>/dev/null | jq '.[].title'
 | `headliner list` | Print stored headlines, newest first |
 | `headliner search QUERY` | Search stored titles and summaries |
 | `headliner sources` | Show each configured source with its last successful fetch and item count |
+| `headliner frontpages` | Read front pages without storing anything and judge whether each is worth enabling (see [Front pages](#front-pages)) |
 | `headliner changes` | List headlines that were rewritten after publication, newest first |
 | `headliner migrate` | Upgrade the database schema (runs automatically; `--dry-run` previews) |
 | `headliner discover URL...` | Find each site's RSS/Atom feed and print source entries to paste (see [Adding sources](#adding-sources)) |
@@ -390,6 +396,8 @@ always use UTC ISO-8601 timestamps (`…+00:00`), whatever the display settings.
 | `--only NAME [NAME ...]` | Fetch just these sources, by configured name (case-insensitive). Reaches sources marked `enabled: false`. |
 | `--ignore-robots` | Skip the `robots.txt` check. Off by default. |
 | `--dry-run` | Fetch and parse, print the results, write nothing. |
+| `--no-front-pages` | Read feeds only; skip every configured front page this run. |
+| `--front-pages-only` | Read only the front pages of sources that have one; skip feeds. |
 
 **`list`**
 
@@ -411,7 +419,19 @@ one result per article, showing its current headline:
   current version matched.
 
 **`sources`** takes `--format table|json`. The table and JSON include each
-source's tags.
+source's tags, and a front-page state for sources that have one. JSON keeps its
+existing fields and adds an `rss` object (feed state) and a `front_page` object
+(`null` when none is configured):
+
+```json
+{
+  "name": "Irish Times",
+  "rss": {"status": "ok", "last_success": "…", "newest": "…"},
+  "front_page": {"url": "https://www.irishtimes.com/", "status": "healthy",
+                 "headlines": 50, "new": 43, "merged_with_feed": 7,
+                 "response_ms": 226, "http_status": 200, "error": null, "…": "…"}
+}
+```
 
 **`--tag TAG`** works on `fetch`, `list`, `search`, `changes` and `sources`. It
 selects the sources carrying that tag, ignoring case. Repeat it to match any of
@@ -541,7 +561,7 @@ Every entry needs `name`, `url` and `type`.
 | --- | --- | --- | --- |
 | `name` | both | yes | Unique label. Used by `--only`, `--source`, and stored on each row. |
 | `url` | both | yes | Feed URL, or the listing page to scrape. Must be `http` or `https`. |
-| `type` | both | yes | `rss` (covers RSS **and** Atom) or `html` |
+| `type` | both | yes | `rss` (covers RSS **and** Atom), `html`, or `front_page` (no feed: only the front page is read; see [Front pages](#front-pages)) |
 | `enabled` | both | no | `false` skips the source unless named in `--only`. Default `true`. |
 | `article_selector` | html | yes | CSS selector for the element wrapping one story |
 | `title_selector` | html | yes | CSS selector for the title, relative to the article element |
@@ -552,6 +572,7 @@ Every entry needs `name`, `url` and `type`.
 | `tags` | both | no | Labels for filtering with `--tag`: a list (`[AU, business]`) or one string. Letters, digits, `-` and `_`. |
 | `group` | both | no | Publisher group, such as `nine` for The Age, SMH and WAtoday. Mastheads in one group share a newsroom or copy, so a story they all carry counts as one outlet in story counts, rankings and badges. |
 | `include_url_pattern` | both | no | Regular expression (case-insensitive); only items whose URL matches are kept, e.g. `"/news/"` to keep a radio station's news out of a site-wide feed. Applied before `max_items_per_source`. |
+| `front_page` | all | no | Also read the publisher's live front page: a mapping, see [Front pages](#front-pages) |
 
 Anything else is rejected with an error naming the file and the key, so a typo
 fails at startup rather than silently doing nothing.
@@ -729,6 +750,245 @@ headliner fetch --only "Your New Source" --dry-run --verbose
 characters and rows without a usable link are discarded on purpose; that is what
 filters out "More", "Video" and similar navigation chrome.
 
+## Front pages
+
+**The feed stays the primary way in.** A front page is an optional second
+acquisition path, for sources whose feed is incomplete, late, or missing the
+stories the publisher is leading with. Enabling it never changes how the feed
+is fetched or stored, and a front page that cannot be read only costs its own
+headlines: the feed's items are stored, the run's exit code is the feed's, and
+the source stays configured.
+
+```
+                ┌──────────────┐
+                │ News source  │
+                └──────┬───────┘
+          ┌────────────┴────────────┐
+   RSS/Atom feed               live front page
+   (fetch_log)                (front_page_log)
+          └────────────┬────────────┘
+           normalise (models.Headline)
+                       │
+     store: one article per URL; a front-page link merges
+     into the article it already is (URL variant, the
+     publisher's other domain, or the same headline words)
+                       │
+         list / search / stories / web viewer
+```
+
+### Configuring
+
+Add a `front_page` block to any source:
+
+```yaml
+# RSS plus the front page, generic extraction (no selectors needed)
+- name: Irish Times
+  url: https://www.irishtimes.com/arc/outboundfeeds/feed-irish-news/
+  type: rss
+  front_page:
+    url: https://www.irishtimes.com/
+
+# With selectors, for a page the generic extractor reads badly
+- name: Example News
+  url: https://example.com/feed.xml
+  type: rss
+  front_page:
+    enabled: true
+    url: https://example.com/
+    article_selector: "article.story"
+    title_selector: "h2 a"
+    link_selector: "h2 a"
+    section_selector: ".kicker"       # optional
+    published_selector: "time"        # optional; reads datetime, content, then text
+    image_selector: "img"             # optional
+
+# RSS only: the same as leaving the block out
+- name: RSS Only Source
+  url: https://example.com/feed.xml
+  type: rss
+  front_page:
+    enabled: false
+
+# No feed at all: the front page is the source
+- name: Front Page Source
+  type: front_page
+  url: https://example.com/
+```
+
+| Key | Required | Meaning |
+| --- | --- | --- |
+| `url` | when enabled | The front page. `http` or `https`. For `type: front_page`, give it here or as the source's `url`. |
+| `enabled` | no | `false` keeps the block but does not read the page. Default `true`. |
+| `article_selector` | no | CSS selector for one story's element. Without it, generic extraction is used. |
+| `title_selector`, `link_selector`, `section_selector`, `published_selector`, `image_selector` | no | Looked up inside each `article_selector` match, so they need one. Without `title_selector` the story's heading is used; without `link_selector` its first link. |
+
+Selectors are checked when the file loads: an invalid one is an error naming
+the source and key, as is any unknown key. `live_url_pattern`,
+`include_url_pattern`, `tags` and `group` apply to front-page headlines too.
+The shipped sources enable front pages on ten sources that passed validation:
+ABC News AU, The Guardian AU, WAtoday, The West Australian, RTÉ News, Irish
+Times, TheJournal.ie, BBC News, Al Jazeera and NPR News.
+
+### How headlines are found
+
+In layers, keeping the order of the page (position 1 is the first story):
+
+1. **Configured selectors**, when given and when they match anything. If they
+   match nothing, the run says so and falls back to the generic layers.
+2. **Every link on the page, scored** on where it sits and what it looks like:
+   inside `<article>` or schema.org `Article` markup, inside a heading, or in a
+   story/card/teaser/promo container; an article-like URL (a date, an id, a
+   long hyphenated slug); and enough words to be a headline.
+3. **JSON-LD** (`NewsArticle`, `Article`, `ItemList`, …) and **microdata** add
+   publication dates, sections and images to those links, and stand in for
+   them when a page lists its stories only as metadata.
+
+Never taken as headlines: links inside `<nav>`, `<footer>`, `<menu>`, the
+page's own `<header>`, `role="navigation"` and similar, or containers whose
+class or id says menu, breadcrumb, social, share, subscribe, login, account,
+cookie, consent, pagination, newsletter or advert; navigation words ("Home",
+"Subscribe", "Log in", "Podcasts", "Weather", "Sport", "Read more", …); tag,
+topic, author and section index pages; links to other sites; comment jump
+links; audio, video and image files. Kickers, labels, bylines and teasers are
+taken off a card's headline, and an empty "overlay" link takes its card's
+heading.
+
+Each link's URL is resolved (relative, protocol-relative, `<base href>`) and
+normalised as feed links are: tracking parameters (`utm_*`, `fbclid`,
+`gclid`, …) and fragments are dropped, other query parameters kept. A story
+linked several times on the page (picture, heading, "12 comments", an AMP copy,
+live-blog `?update=` links) is kept once, at its highest position, preferring
+the link in its heading for the title. Two different headlines are never
+merged just for being similar ("kills two" and "kills three" stay apart).
+
+A section is recorded only when the page states one (JSON-LD `articleSection`,
+a `section_selector`, or a leading URL segment such as `/world/`), mapped onto
+news, world, politics, business, markets, technology, science, sport, culture,
+opinion, analysis, or `other` for a stated section outside that list.
+
+### One article, two ways of finding it
+
+A front-page headline is the article already stored when its URL matches, a
+variant of it does (http/https, `www.`/`m.`/`amp.` hosts, `/amp` paths, AMP
+query switches, doubled slashes, tracking parameters), the publisher's other
+domain has the same path (bbc.com and bbc.co.uk), or it has the same headline
+words as one of that source's articles from the last week. Matching never
+crosses sources.
+
+A match records that the front page found it, at which position and when; the
+feed's URL and title stand. Front pages often show a shorter display headline,
+which is **not** counted as a rewrite. An article found only on the front page
+is stored with the front page's headline (and its later rewrites there are
+tracked); if the feed later carries it, the feed's URL and title take over and
+its title history restarts from the feed's wording.
+
+Each article records how it was found (`acquisition`): `rss`, `html`,
+`front_page`, or several. `list --format json` and the viewer show it; the
+viewer marks front-page articles with a small "front page" badge whose tooltip
+gives the position, and the article page says "Found on the feed and the front
+page (#3 …)". Articles stored before schema 5 are recorded as `rss`.
+
+### Fetching politely and safely
+
+- `robots.txt` is obeyed for the front page and for any redirect to another
+  site; a disallowed page is `robots_denied` and never requested.
+- The shared per-domain rate limit (`rate_limit_seconds`, or a longer
+  `Crawl-delay`) applies, and only one page or feed request per domain is in
+  flight at a time. Connections are reused across the run, and `concurrency`
+  bounds how many sources are worked on at once.
+- `If-None-Match`/`If-Modified-Since` from the last good read are sent; a `304`
+  is recorded as `not_modified` and costs no parsing.
+- Redirects are followed one hop at a time (at most 5): only `http(s)`, and
+  never to a loopback, private, link-local or otherwise non-public address
+  (the same check covers the first request). Pages over 5 MB are abandoned.
+- Bot protection is never worked around. 401, 403, 429 and 451, and challenge
+  pages (Cloudflare, Akamai, PerimeterX, DataDome, Imperva), are `blocked`. A
+  500, 502 or 504 is retried once; a `429` or a block never is.
+- Pages are only parsed: no script runs, nothing from the page is written to
+  disk, and no browser is used. A page that builds its stories with JavaScript is
+  reported as `rendering_required`, not silently as empty; the feed carries on.
+  A browser-rendering backend could be added behind `fetch_front_page` later.
+
+### States
+
+| State | Meaning |
+| --- | --- |
+| `healthy` | Read and headlines found (`not_modified` after a 304 also counts) |
+| `stale` | Healthy last time, but that was over 13 hours ago |
+| `blocked` | 401/403/429/451 or a bot challenge |
+| `robots_denied` | robots.txt disallows the page (or a redirect target) |
+| `timeout` | No complete response within `request_timeout` |
+| `network_error` | DNS, connection or TLS failure |
+| `http_error` | Any other 4xx/5xx, or too many redirects |
+| `parse_error` | Not HTML, too large, or unparseable |
+| `no_headlines` | Read fine, but nothing headline-like on it |
+| `rendering_required` | Script-built page; would need a browser |
+| `unsafe_url` | Points at a non-public address |
+| `disabled` | `enabled: false` |
+
+Every read is logged in `front_page_log` (status, HTTP status, final URL,
+response time, headlines, new and merged counts, ETag) and in the journal:
+
+```
+INFO source="Irish Times" method="front_page" status="healthy" http=200 headlines=50 ms=226
+WARNING source="Sky News" method="front_page" status="blocked" http=403 ms=74 error="HTTP 403"
+INFO source="Irish Times" rss=50 front_page=50 overlap=7 new_from_front_page=43
+INFO front pages: 10 attempted, 8 healthy, 2 not_modified; 353 headline(s), 0 new, 141 merged with feed articles
+```
+
+The Sources page has a "Front page" column, `headliner sources` a `FRONT PAGE`
+column and JSON object, and `/api/status` a `front_pages` section (counts by
+state and every page that is not healthy). Front-page problems are reported but
+never put the status at "attention" or raise a watchdog alert: the feed is what
+the run depends on.
+
+### Validating a front page before enabling it
+
+```bash
+# A site you are considering (generic extraction, nothing stored)
+headliner frontpages --url https://www.example.com/ --show 10
+
+# Every configured front page, as JSON
+headliner frontpages --format json
+
+# Just some
+headliner frontpages --only "Irish Times" "BBC News"
+```
+
+It reads each page (no conditional request), extracts it, opens the first
+`--follow N` articles (default 2; robots and rate limits apply, at least 2
+seconds apart per domain) and checks they load and name themselves as the
+linked URL (`<link rel=canonical>` or `og:url`). A page is **valid** when it was
+read, gives at least 5 headlines, at least 80% of its links look like article
+URLs, headlines average 20 characters or more, no more than 80% of links were
+duplicates, and at least one article could be followed. It reports
+`headline_count` (links found), `unique_headline_count`,
+`valid_article_url_count`, `accessible_article_count`, `canonical_matches`,
+`mean_headline_length`, `duplicate_rate` and `front_page_response_time`, and
+exits 1 when any page is invalid. A front page need not carry as many stories
+as the feed.
+
+### Troubleshooting
+
+- **`blocked`**: the site refuses automated readers. Leave the front page off;
+  the feed still works. Do not use `--ignore-robots` or change the user agent to
+  get round it.
+- **`rendering_required`** or **`no_headlines`**: the stories are drawn by
+  JavaScript, or sit in markup the generic layers don't recognise. Look at the
+  page source (not the browser's live DOM); if the headlines are there, add an
+  `article_selector` (and `title_selector`) as for an [HTML source](#adding-a-new-html-source).
+- **Navigation or section links among the headlines**: check with
+  `headliner frontpages --only NAME --show 30`, then add selectors, or
+  `include_url_pattern` to keep only article URLs.
+- **Kickers in titles** ("EXCLUSIVE Storm hits…"): the page puts the label in
+  the heading itself. It only affects front-page-only articles: when the feed
+  has the article, the feed's title is used.
+- **Many `new` front-page articles**: normal. Front pages carry features,
+  explainers and older stories that the feed has already dropped.
+- **The viewer says the schema is too old after a deploy**: the installer runs
+  `headliner migrate`; otherwise run it as the service user
+  (`sudo -u headliner /opt/headliner/venv/bin/headliner migrate --db /var/lib/headliner/headlines.db`).
+
 ## Storage
 
 SQLite in WAL mode, no ORM. The schema is created on first run by an idempotent
@@ -813,6 +1073,14 @@ feeds that stop updating can be spotted (see the Sources page). The upgrade
 only adds columns derived from stored data, so no backup is taken; it takes
 about 4 seconds per 100,000 revisions.
 
+Version 5 adds how each article was found (`headlines.acquisition`: `rss`,
+`html` and/or `front_page`), its last front-page position and when it was seen
+there, any section and image the front page gave, and the `front_page_log`
+table. It only adds columns and a table, so no backup is taken; existing
+articles are recorded as found by `rss`. The installer runs the upgrade as the
+service user, so the read-only viewer does not refuse the database after a
+deploy.
+
 To see what an upgrade will do first:
 
 ```bash
@@ -822,7 +1090,9 @@ headliner migrate --dry-run --db /path/to/headlines.db
 ## Being a good citizen
 
 The defaults are deliberately conservative: one request per domain per second,
-five sources at a time, `robots.txt` obeyed.
+five sources at a time, `robots.txt` obeyed. Front pages follow the same rules,
+send conditional requests, and never work around bot protection (see
+[Fetching politely and safely](#fetching-politely-and-safely)).
 
 **Put a real contact address in `user_agent` before pointing this at anyone's
 servers.** The default carries a placeholder. A site operator who sees unwanted
@@ -853,13 +1123,14 @@ headliner/
   models.py     Headline dataclass, hashing, text and URL normalisation
   fetcher.py    async http, robots.txt, retries, rate limiting
   parsers.py    rss/atom via feedparser, html via selectolax or beautifulsoup4
+  frontpage.py  live front pages: extraction, safe fetching, validation
   store.py      sqlite schema, inserts, queries
   discover.py   feed discovery for `headliner discover`
   stories.py    grouping headlines into stories across outlets
   web.py        read-only web viewer for `headliner web` (standard library WSGI)
   static/       the viewer's stylesheet
 tests/
-  fixtures/     one RSS sample, one HTML sample
+  fixtures/     an RSS sample, an HTML listing sample and a front page
 sources.yaml
 ```
 

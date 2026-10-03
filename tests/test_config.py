@@ -56,7 +56,7 @@ def test_settings_fall_back_to_defaults() -> None:
         ("sources:\n  - name: A\n    url: ftp://a.example/f\n    type: rss\n", "must be http(s)"),
         (
             "sources:\n  - name: A\n    url: https://a.example/f\n    type: gopher\n",
-            "'type' must be one of html, rss",
+            "'type' must be one of front_page, html, rss",
         ),
         (
             "sources:\n  - name: A\n    url: https://a.example/f\n    type: html\n",

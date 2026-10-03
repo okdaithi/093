@@ -134,6 +134,7 @@ mark { background: var(--mark); color: inherit; border-radius: 2px; }
 .badge.live { background: var(--bad); color: #fff; }
 .badge.minor { background: var(--chip); color: var(--muted); font-weight: 600; }
 .badge.outlets { background: var(--chip); color: var(--link); }
+.badge.fp { background: var(--chip); color: var(--muted); font-weight: 600; }
 .stories { list-style: none; margin: 0; padding: 0; }
 .story { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 0.55rem 0.8rem; margin-bottom: 0.65rem; }
 .story .meta { font-size: 0.76rem; color: var(--muted); display: flex; flex-wrap: wrap; gap: 0.15rem 0.45rem; align-items: center; }

@@ -12,8 +12,13 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 @pytest.fixture(autouse=True)
 def dns_works(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`fetch` checks DNS first; tests mock HTTP only, so every host name resolves."""
+    """`fetch` checks DNS first; tests mock HTTP only, so every host name resolves.
+
+    Front-page reads also check each host resolves to a public address: every
+    test host gets a documentation-range public address unless a test says not.
+    """
     monkeypatch.setattr("headliner.network.resolves", lambda _host: True)
+    monkeypatch.setattr("headliner.frontpage._addresses", lambda _host: ["93.184.215.14"])
 
 
 @pytest.fixture
@@ -24,6 +29,11 @@ def feed_bytes() -> bytes:
 @pytest.fixture
 def listing_bytes() -> bytes:
     return (FIXTURES / "sample_listing.html").read_bytes()
+
+
+@pytest.fixture
+def front_page_bytes() -> bytes:
+    return (FIXTURES / "front_page.html").read_bytes()
 
 
 @pytest.fixture
