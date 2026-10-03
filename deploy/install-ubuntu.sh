@@ -39,7 +39,7 @@ fi
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd -- "${script_dir}/.." && pwd)"
 
-for required_file in requirements.txt pyproject.toml deploy/headliner.service deploy/headliner-catchup.service deploy/headliner-retry.service deploy/headliner.timer deploy/headliner-web.service deploy/headliner-backup.service deploy/headliner-backup.timer deploy/sources.yaml deploy/deployment_info.py; do
+for required_file in requirements.txt pyproject.toml deploy/headliner.service deploy/headliner-catchup.service deploy/headliner-retry.service deploy/headliner.timer deploy/headliner-web.service deploy/headliner-backup.service deploy/headliner-backup.timer deploy/headliner-watchdog.service deploy/headliner-watchdog.timer deploy/sources.yaml deploy/deployment_info.py; do
     if [[ ! -f "${repo_dir}/${required_file}" ]]; then
         echo "Missing ${required_file}; run this script from a complete repository checkout." >&2
         exit 1
@@ -149,6 +149,10 @@ install -o root -g root -m 0644 \
     "${repo_dir}/deploy/headliner-backup.service" /etc/systemd/system/headliner-backup.service
 install -o root -g root -m 0644 \
     "${repo_dir}/deploy/headliner-backup.timer" /etc/systemd/system/headliner-backup.timer
+install -o root -g root -m 0644 \
+    "${repo_dir}/deploy/headliner-watchdog.service" /etc/systemd/system/headliner-watchdog.service
+install -o root -g root -m 0644 \
+    "${repo_dir}/deploy/headliner-watchdog.timer" /etc/systemd/system/headliner-watchdog.timer
 
 systemctl daemon-reload
 # Once fetching is scheduled there is data worth keeping: back it up daily.
@@ -156,6 +160,12 @@ if systemctl is-enabled --quiet headliner.timer \
     && ! systemctl is-enabled --quiet headliner-backup.timer; then
     systemctl enable --now headliner-backup.timer
     echo "Enabled daily database backups (headliner-backup.timer, 03:30)."
+fi
+# The same for the health watchdog (every 10 minutes; see "Health watchdog" in the README).
+if systemctl is-enabled --quiet headliner.timer \
+    && ! systemctl is-enabled --quiet headliner-watchdog.timer; then
+    systemctl enable --now headliner-watchdog.timer
+    echo "Enabled the health watchdog (headliner-watchdog.timer, every 10 minutes)."
 fi
 # A running viewer keeps serving the old code until restarted.
 if systemctl is-active --quiet headliner-web.service; then

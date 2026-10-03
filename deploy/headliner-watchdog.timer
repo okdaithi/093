@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the headliner health watchdog every 10 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+AccuracySec=30s
+RandomizedDelaySec=20s
+
+[Install]
+WantedBy=timers.target
