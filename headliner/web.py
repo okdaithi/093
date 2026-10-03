@@ -34,7 +34,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 from headliner import build as build_info
-from headliner import charts, local_timezone, tz_abbrev
+from headliner import charts, local_timezone, rewrites, tz_abbrev
 from headliner.backup import default_dir, list_backups
 from headliner.config import Config, ConfigError, load_config
 from headliner.markup import EMPTY, Markup, esc, join, render
@@ -109,6 +109,16 @@ BRIEFING_TOP: Final = 8
 BRIEFING_PER_COUNTRY: Final = 3
 # Days of history behind the Briefing's "typical day" line.
 BRIEFING_BASELINE_DAYS: Final = 7
+# Rewrites read at most for the kinds chart and the ?kind= filter.
+REWRITE_CHART_LIMIT: Final = 5000
+DELAY_BUCKETS: Final = (
+    ("< 15 min", timedelta(minutes=15)),
+    ("15\N{EN DASH}60 min", timedelta(hours=1)),
+    ("1\N{EN DASH}3 h", timedelta(hours=3)),
+    ("3\N{EN DASH}12 h", timedelta(hours=12)),
+    ("12\N{EN DASH}24 h", timedelta(hours=24)),
+    ("> 1 day", timedelta.max),
+)
 STORY_TIMELINE_MIN_SPAN: Final = timedelta(hours=2)
 STORY_TIMELINE_TICKS: Final = 4
 TREND_WINDOWS: Final = {"7d": 7, "14d": 14, "30d": 30}
@@ -1160,15 +1170,33 @@ or <a href="{switch}">show times in {other}</a>.
             "sources": filters.sources,
         }
         page = request.page
-        changes = list_title_changes(
-            conn,
-            **common,
-            live=live,
-            oldest_first=oldest,
-            minor=minor,
-            limit=PAGE_SIZE + 1,
-            offset=(page - 1) * PAGE_SIZE,
+        kind = request.get("kind")
+        if kind not in rewrites.KINDS:
+            kind = ""
+        # Kinds are judged in Python, so the period's changes are read in one go
+        # for the chart (and for the list when filtering by kind).
+        period = list_title_changes(
+            conn, **common, live=live, oldest_first=oldest, minor=minor, limit=REWRITE_CHART_LIMIT
         )
+        kinds = {
+            (change.url, change.new_title): rewrites.classify(change.old_title, change.new_title)
+            for change in period
+            if change.old_title is not None
+        }
+        if kind:
+            matching = [c for c in period if kinds.get((c.url, c.new_title)) == kind]
+            start = (page - 1) * PAGE_SIZE
+            changes = matching[start : start + PAGE_SIZE + 1]
+        else:
+            changes = list_title_changes(
+                conn,
+                **common,
+                live=live,
+                oldest_first=oldest,
+                minor=minor,
+                limit=PAGE_SIZE + 1,
+                offset=(page - 1) * PAGE_SIZE,
+            )
         has_more = len(changes) > PAGE_SIZE
         hidden, hidden_minor = hidden_changes(conn, **common, live=live, minor=minor)
         live_select = render(
@@ -1220,16 +1248,97 @@ or <a href="{switch}">show times in {other}</a>.
         else:
             intro = Markup("")
         return render(
-            "<h1>Rewritten headlines</h1>{form}{intro}{note}{minor_note}{items}{pager}",
+            "<h1>Rewritten headlines</h1>{form}{intro}{note}{minor_note}{charts}{items}{pager}",
             form=self.filter_form(request, filters, since="7d", extra=live_select),
             intro=intro,
             note=note,
             minor_note=minor_note,
-            items=self.change_items(request, changes[:PAGE_SIZE]),
+            charts=self.rewrite_charts(request, conn, filters, since, list(kinds.values()), kind),
+            items=self.change_items(request, changes[:PAGE_SIZE], kinds),
             pager=self.pager(request, has_more),
         )
 
-    def change_items(self, request: Request, changes: Sequence[TitleChange]) -> Markup:
+    def rewrite_charts(
+        self,
+        request: Request,
+        conn: sqlite3.Connection,
+        filters: Filters,
+        since: datetime | None,
+        kinds: Sequence[str],
+        current: str,
+    ) -> Markup:
+        """What kinds of rewrite, and how long after publication they come."""
+        if not kinds:
+            return EMPTY
+        counts = Counter(kinds)
+        chips = join(
+            render(
+                '<li><a href="{h}"{cur}><svg class="swatch" viewBox="0 0 10 10" '
+                'aria-hidden="true"><rect class="c-key k{i}" width="10" height="10"/></svg>'
+                '{k} <span class="muted">{n}</span></a></li>',
+                h=self.link(request, "/rewrites", kind=None if name == current else name),
+                cur=Markup(' aria-current="true"') if name == current else EMPTY,
+                i=index,
+                k=name,
+                n=counts[name],
+            )
+            for index, name in enumerate(rewrites.KINDS)
+        )
+        donut = charts.donut(
+            [(name, counts[name], f"k{index}") for index, name in enumerate(rewrites.KINDS)],
+            label="Likely kind of each rewrite",
+            legend=render('<ul class="key">{c}</ul>', c=chips),
+        )
+        stats = rewrite_stats(conn, since=since or utcnow() - timedelta(days=7))
+        wanted = {name.casefold() for name in filters.sources} if filters.sources else None
+        if filters.source:
+            wanted = {filters.source.casefold()}
+        delays = [
+            delay
+            for stat in stats
+            if wanted is None or stat.source.casefold() in wanted
+            for delay in stat.delays
+        ]
+        buckets = [0] * len(DELAY_BUCKETS)
+        for delay in delays:
+            index = next(
+                (i for i, (_, limit) in enumerate(DELAY_BUCKETS) if delay < limit),
+                len(DELAY_BUCKETS) - 1,
+            )
+            buckets[index] += 1
+        histogram = (
+            charts.histogram(
+                buckets,
+                [name for name, _ in DELAY_BUCKETS],
+                label="Time from first seen to first rewrite",
+            )
+            if delays
+            else EMPTY
+        )
+        rules = join(
+            render("<li><strong>{k}</strong>: {n}</li>", k=name, n=rewrites.KIND_NOTES[name])
+            for name in rewrites.KINDS
+        )
+        return render(
+            """<section class="rewrite-charts">
+<div><h2>Kinds of rewrite</h2>{donut}
+<details class="muted"><summary>How kinds are judged</summary><p>From the two titles alone,
+so treat them as likely, not certain. Click a kind to list only those.</p><ul>{rules}</ul>
+</details></div>
+<div><h2>How soon they come</h2><p class="muted">From when an article was first seen to its
+first rewrite that changed words; live blogs excluded.</p>{histogram}</div>
+</section>""",
+            donut=donut,
+            rules=rules,
+            histogram=histogram,
+        )
+
+    def change_items(
+        self,
+        request: Request,
+        changes: Sequence[TitleChange],
+        kinds: dict[tuple[str, str], str] | None = None,
+    ) -> Markup:
         if not changes:
             return Markup('<p class="empty">No title changes match.</p>')
         clock = Clock(request.utc)
@@ -1242,7 +1351,7 @@ or <a href="{switch}">show times in {other}</a>.
             items.append(
                 render(
                     """<li class="item change">
-  <div class="meta">{time} <a class="source" href="{src}">{source}</a> {live}{minor}
+  <div class="meta">{time} <a class="source" href="{src}">{source}</a> {live}{minor}{kind}
     <a class="history" href="{hist}">all titles</a> {open}</div>
   <p class="diff">{text}</p>
   {was}
@@ -1254,6 +1363,9 @@ or <a href="{switch}">show times in {other}</a>.
                     if change.is_live
                     else Markup(""),
                     minor=MINOR_BADGE if change.is_minor else Markup(""),
+                    kind=render(' <span class="badge kind">{k}</span>', k=kind)
+                    if (kind := (kinds or {}).get((change.url, change.new_title)))
+                    else EMPTY,
                     hist=self.link(request, "/article", url=change.url, live=None, oldest=None),
                     open=external_link(change.url, "open article ↗", "history"),
                     text=text,
@@ -1569,7 +1681,16 @@ or <a href="{switch}">show times in {other}</a>.
             chosen.sort(key=lambda story: (self.reach(story), story.last_seen), reverse=True)
         page = request.page
         shown = chosen[(page - 1) * STORIES_PAGE_SIZE : page * STORIES_PAGE_SIZE]
-        cards = join(self.story_card(request, conn, story) for story in shown)
+        scale = (
+            (
+                max(self.reach(story) for story in shown),
+                min(story.first_seen for story in shown),
+                max(story.last_seen for story in shown),
+            )
+            if shown
+            else None
+        )
+        cards = join(self.story_card(request, conn, story, scale=scale) for story in shown)
         options = render(
             '<label>Outlets <select name="min">{m}</select></label>'
             '<label>Order <select name="sort">{o}</select></label>',
@@ -1595,7 +1716,9 @@ or <a href="{switch}">show times in {other}</a>.
             """<h1>Stories</h1>
 {form}
 <p class="muted">{total} stories reported by {minimum} or more outlets in the last {window}.
-Headlines are grouped by shared words, so the occasional grouping is wrong.</p>
+Headlines are grouped by shared words, so the occasional grouping is wrong.
+Under each story, the dark bar is its outlets against the most on this page and the light bar
+when it was reported within the page's time span.</p>
 {cards}{pager}""",
             form=self.filter_form(
                 request, filters, since=None, extra=join([options, self.window_select(window)])
@@ -1610,7 +1733,13 @@ Headlines are grouped by shared words, so the occasional grouping is wrong.</p>
         )
 
     def story_card(
-        self, request: Request, conn: sqlite3.Connection, story: Story, *, compact: bool = False
+        self,
+        request: Request,
+        conn: sqlite3.Connection,
+        story: Story,
+        *,
+        compact: bool = False,
+        scale: tuple[int, datetime, datetime] | None = None,
     ) -> Markup:
         """One story: when, how many outlets (by tag), its title, and (unless compact) members."""
         clock = Clock(request.utc)
@@ -1629,8 +1758,9 @@ Headlines are grouped by shared words, so the occasional grouping is wrong.</p>
   <div class="meta">{first} to {last} ·
     <strong title="{note}">{n} outlets</strong> {tags}</div>
   <h3><a href="{href}">{title}</a></h3>
-  {members}
+  {spread}{members}
 </li>""",
+            spread=self.story_spread(story, scale, clock) if scale else EMPTY,
             compact=" compact" if compact else "",
             seen=_iso_or_none(min(headline.fetched_at for headline in story.headlines)),
             first=clock.time(story.first_seen, "%a %H:%M"),
@@ -1641,6 +1771,21 @@ Headlines are grouped by shared words, so the occasional grouping is wrong.</p>
             href=self.link(request, "/story", url=(story.lead or story.headlines[0]).url),
             title=story.title,
             members=members,
+        )
+
+    def story_spread(
+        self, story: Story, scale: tuple[int, datetime, datetime], clock: Clock
+    ) -> Markup:
+        most, start, end = scale
+        span = (end - start).total_seconds() or 1.0
+        lasted = story.last_seen - story.first_seen
+        return charts.spread(
+            self.reach(story) / (most or 1),
+            (story.first_seen - start).total_seconds() / span,
+            (story.last_seen - start).total_seconds() / span,
+            title=f"{self.reach(story)} of up to {most} outlets on this page; "
+            f"reported over {_duration(lasted) if lasted >= timedelta(minutes=1) else '1 min'}, "
+            f"{clock.shown(story.first_seen):%a %H:%M} to {clock.shown(story.last_seen):%a %H:%M}",
         )
 
     @staticmethod
@@ -2195,7 +2340,17 @@ schedule as much as the outlet's own rhythm.</p>
             for source, count in counts_by_source(conn, since=previous_since, until=since).items()
             if keep(source)
         }
-        heat = self.heatmap(request, per_day, live_per_day, day_list, previous)
+        relative = request.get("shade") == "row"
+        heat = render(
+            '<p class="chips shade">Shade: <a href="{a}"{ac}>compare sources</a> '
+            '<a href="{r}"{rc}>each source\'s own rhythm</a></p>{h}',
+            a=self.link(request, "/trends", shade=None),
+            ac=EMPTY if relative else Markup(' aria-current="true"'),
+            r=self.link(request, "/trends", shade="row"),
+            rc=Markup(' aria-current="true"') if relative else EMPTY,
+            h=self.heatmap(request, per_day, live_per_day, day_list, previous, relative=relative),
+        )
+        countries = self.country_heatmap(request, rows, day_list, clock)
         current_total = len(rows)
         previous_total = sum(previous.values())
         summary = render(
@@ -2297,6 +2452,10 @@ over the rest of the period. Click one to search for it.</p>
 click a cell for that day's articles. ▲/▼ compares each total with the previous {days}
 days.</p>
 {heat}
+<h3>By country</h3>
+<p class="muted">Articles from each country's outlets (by their country tag) per day. Shaded
+against each country's own busiest day, so quieter countries' peaks still show.</p>
+{countries}
 <h3>By hour of day</h3>
 <p class="muted">All articles in the period by the hour they were first fetched: gaps
 between fetch runs show as empty hours.</p>
@@ -2343,6 +2502,7 @@ source's first-ever run is left out.</p>
             zone=clock.zone,
             days=days,
             heat=heat,
+            countries=countries,
             hours=self.hour_strip(clock, rows),
             min=MIN_REWRITE_SAMPLE,
             rewrite_rows=rewrite_rows or Markup('<tr><td colspan="5">No articles yet.</td></tr>'),
@@ -2435,6 +2595,62 @@ source's first-ever run is left out.</p>
             c=join(self.story_card(request, conn, story, compact=True) for story in stories),
         )
 
+    def country_heatmap(
+        self, request: Request, rows: Sequence[FirstSeen], days: list[Any], clock: Clock
+    ) -> Markup:
+        """Articles per country tag per day, each row shaded against its own busiest day."""
+        config = self.config
+        if config is None or not rows:
+            return EMPTY
+        countries_of = {
+            source.name.casefold(): [tag for tag in source.tags if is_country(tag)]
+            for source in config.sources
+        }
+        per_day: dict[str, Counter[Any]] = {}
+        for row in rows:
+            for tag in countries_of.get(row.source.casefold(), ()):
+                per_day.setdefault(tag, Counter())[clock.shown(row.fetched_at).date()] += 1
+        if not per_day:
+            return EMPTY
+
+        def cells(tag: str, counts: Counter[Any]) -> Markup:
+            top = max(counts.values()) or 1
+            return join(
+                render(
+                    '<td class="heat h{l}"><a href="{h}" title="{n} on {d}">{n}</a></td>',
+                    l=max(1, math.ceil(HEAT_LEVELS * counts[day] / top)),
+                    h=self.link(
+                        request, "/latest", tag=tag, source=None, since=None, day=day.isoformat()
+                    ),
+                    n=counts[day],
+                    d=day.isoformat(),
+                )
+                if counts[day]
+                else Markup('<td class="heat h0"></td>')
+                for day in days
+            )
+
+        ordered = sorted(per_day.items(), key=lambda item: -sum(item[1].values()))
+        return render(
+            '<div class="scroll"><table class="heatmap"><thead><tr><th>Country</th>{d}'
+            '<th class="num">Total</th></tr></thead><tbody>{r}</tbody></table></div>',
+            d=join(
+                render('<th class="day">{d}</th>', d=f"{day.strftime('%a')} {day.day}")
+                for day in days
+            ),
+            r=join(
+                render(
+                    '<tr><th scope="row"><a href="{h}">{t}</a></th>{c}'
+                    '<td class="num">{n}</td></tr>',
+                    h=self.link(request, "/trends", tag=tag, source=None),
+                    t=tag,
+                    c=cells(tag, counts),
+                    n=sum(counts.values()),
+                )
+                for tag, counts in ordered
+            ),
+        )
+
     def heatmap(
         self,
         request: Request,
@@ -2442,17 +2658,24 @@ source's first-ever run is left out.</p>
         live_per_day: Counter[Any],
         days: list[Any],
         previous: dict[str, int] | None = None,
+        *,
+        relative: bool = False,
     ) -> Markup:
+        """Articles per source per day; `relative` shades each row against its own busiest day."""
         if not per_day:
             return Markup('<p class="empty">No articles in this period.</p>')
         previous = previous or {}
         peak = max(count for counts in per_day.values() for count in counts.values())
+        row_peak = {
+            source: max(counts.values(), default=0) or 1 for source, counts in per_day.items()
+        }
         totals_by_day: Counter[Any] = Counter()
         for counts in per_day.values():
             totals_by_day.update(counts)
 
         def cell(source: str, day: Any, count: int) -> Markup:
-            level = 0 if count == 0 else max(1, math.ceil(HEAT_LEVELS * count / peak))
+            top = row_peak[source] if relative else peak
+            level = 0 if count == 0 else max(1, math.ceil(HEAT_LEVELS * count / top))
             if not count:
                 return render('<td class="heat h{l}"></td>', l=level)
             return render(
@@ -2518,7 +2741,11 @@ source's first-ever run is left out.</p>
         main = render(
             '<div class="scroll"><table class="heatmap">{head}<tbody>{rows}</tbody>'
             "<tfoot>{footer}</tfoot></table></div>{legend}",
-            legend=heat_legend(peak, "articles a day"),
+            legend=Markup(
+                '<p class="legend">Each row is shaded against that source\'s own busiest day.</p>'
+            )
+            if relative
+            else heat_legend(peak, "articles a day"),
             head=head,
             rows=table_rows(ordered[:HEAT_TOP_ROWS]),
             footer=footer,

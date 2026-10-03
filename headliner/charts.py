@@ -211,3 +211,88 @@ def swimlanes(
         t=join(render("<span>{t}</span>", t=t) for t in ticks),
     )
     return _figure("timeline", label, render('<ol class="lanes">{r}{a}</ol>', r=rows, a=axis))
+
+
+def donut(
+    parts: Sequence[tuple[str, int, str]], *, label: str, legend: Markup | None = None
+) -> Markup:
+    """A ring split into `parts` of (name, value, css class), with a legend beside it.
+
+    Each part is a circle stroked over only its share of the ring
+    (`pathLength` makes the dash lengths percentages).
+    """
+    total = sum(value for _, value, _ in parts)
+    if total <= 0:
+        return EMPTY
+    arcs = []
+    start = 0.0
+    for name, value, css in parts:
+        if value <= 0:
+            continue
+        share = 100 * value / total
+        arcs.append(
+            render(
+                '<circle class="c-arc {c}" cx="21" cy="21" r="15.9" pathLength="100" '
+                'stroke-dasharray="{d} {g}" stroke-dashoffset="{o}" '
+                'transform="rotate(-90 21 21)"><title>{t}</title></circle>',
+                c=css,
+                d=f"{share:.2f}",
+                g=f"{100 - share:.2f}",
+                o=f"{-start:.2f}",
+                t=f"{name}: {value:,} ({share:.0f}%)",
+            )
+        )
+        start += share
+    svg = render(
+        '<svg class="donut" viewBox="0 0 42 42" role="img" aria-label="{l}">{a}</svg>',
+        l=label,
+        a=join(arcs),
+    )
+    key = legend or render(
+        '<ul class="key">{i}</ul>',
+        i=join(
+            render(
+                '<li><svg class="swatch" viewBox="0 0 10 10" aria-hidden="true">'
+                '<rect class="c-key {c}" width="10" height="10"/></svg>{n} {v}</li>',
+                c=css,
+                n=name,
+                v=f"{value:,}",
+            )
+            for name, value, css in parts
+        ),
+    )
+    return _figure("donut-chart", label, svg, key)
+
+
+def histogram(
+    counts: Sequence[int], edges: Sequence[str], *, label: str, unit: str = "articles"
+) -> Markup:
+    """Bars for counts in buckets named by `edges` (one label per bucket)."""
+    return bars(
+        counts,
+        label=label,
+        ticks=list(edges),
+        titles=[f"{edge}: {count:,} {unit}" for edge, count in zip(edges, counts, strict=True)],
+    )
+
+
+def spread(reach: float, start: float, end: float, *, title: str) -> Markup:
+    """Two thin bars for a story card: outlets (0..1 of the page's most) and lifespan.
+
+    The lifespan bar sits at `start`..`end` (0..1) of the time the page covers.
+    """
+    reach = min(max(reach, 0.0), 1.0)
+    start = min(max(start, 0.0), 1.0)
+    end = min(max(end, start), 1.0)
+    return render(
+        '<svg class="spread" viewBox="0 0 100 6" preserveAspectRatio="none" role="img" '
+        'aria-label="{t}"><title>{t}</title>'
+        '<rect class="c-track-fill" x="0" y="0" width="100" height="2"/>'
+        '<rect class="c-bar now" x="0" y="0" width="{r}" height="2"/>'
+        '<rect class="c-track-fill" x="0" y="4" width="100" height="2"/>'
+        '<rect class="c-bar" x="{s}" y="4" width="{w}" height="2"/></svg>',
+        t=title,
+        r=f"{100 * reach:.1f}",
+        s=f"{100 * start:.1f}",
+        w=f"{max(100 * (end - start), 0.8):.1f}",
+    )

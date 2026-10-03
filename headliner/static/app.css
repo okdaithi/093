@@ -284,3 +284,22 @@ li.lane-axis .axis { display: flex; }
   ol.lanes li { grid-template-columns: minmax(0, 5.5rem) 1fr; }
   ol.hbars li { grid-template-columns: minmax(0, 8rem) 1fr 2.5rem; }
 }
+.c-track-fill { fill: var(--chart-grid); }
+svg.spread { display: block; width: 100%; max-width: 20rem; height: 0.5rem; margin-top: 0.35rem; }
+svg.donut { width: 9rem; height: 9rem; flex: none; }
+.c-arc { fill: none; stroke-width: 6; }
+.c-arc.k0 { stroke: #2f7d6d; } .c-key.k0 { fill: #2f7d6d; }
+.c-arc.k1 { stroke: #8a8178; } .c-key.k1 { fill: #8a8178; }
+.c-arc.k2 { stroke: var(--chart-soft); } .c-key.k2 { fill: var(--chart-soft); }
+.c-arc.k3 { stroke: var(--chart); } .c-key.k3 { fill: var(--chart); }
+figure.donut-chart { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
+ul.key { list-style: none; padding: 0; margin: 0; font-size: 0.85rem; }
+ul.key li { margin: 0.2rem 0; }
+ul.key a[aria-current] { font-weight: 600; text-decoration: underline; }
+.chart svg.swatch, svg.swatch { display: inline-block; width: 0.75rem; height: 0.75rem; vertical-align: -0.05rem; margin-right: 0.3rem; }
+.rewrite-charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr)); gap: 0 2rem; margin-bottom: 1rem; }
+.rewrite-charts svg.bars { height: 7rem; }
+.badge.kind { background: var(--chart-grid); color: var(--text); }
+p.shade { font-size: 0.85rem; }
+p.shade a { margin-left: 0.5rem; }
+p.shade a[aria-current] { font-weight: 600; color: var(--text); text-decoration: none; }
