@@ -23,16 +23,26 @@ logger = logging.getLogger(__name__)
 
 # selectolax is the preferred HTML backend; beautifulsoup4 is the fallback.
 # Both are held as plain callables so only `_build_tree` cares which is in use.
+# selectolax 1.0 dropped its old "modest" backend (`selectolax.parser` now raises
+# ImportError), so the lexbor backend, present since 0.3, is tried first.
 _selectolax: Callable[[str], Any] | None = None
 _beautifulsoup: Callable[..., Any] | None = None
 HTML_BACKEND = "none"
 
 try:
-    from selectolax.parser import HTMLParser as _selectolax_parser
-except ImportError:  # pragma: no cover - exercised only without selectolax
-    pass
-else:
-    _selectolax = _selectolax_parser
+    from selectolax.lexbor import LexborHTMLParser as _lexbor_parser
+
+    _selectolax = _lexbor_parser
+except ImportError:  # pragma: no cover - exercised only without a recent selectolax
+    try:
+        from selectolax.parser import (
+            HTMLParser as _modest_parser,  # type: ignore[attr-defined,unused-ignore]
+        )
+
+        _selectolax = _modest_parser
+    except ImportError:
+        pass
+if _selectolax is not None:
     HTML_BACKEND = "selectolax"
 
 if _selectolax is None:  # pragma: no cover - only without selectolax
