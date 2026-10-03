@@ -77,24 +77,19 @@ sudo systemctl start headliner.service
 
 Inspect timer state with `systemctl list-timers headliner.timer` and logs with
 `journalctl -u headliner.service`. To deploy an update, rerun
-`sudo bash deploy/install-ubuntu.sh` from the updated checkout; it preserves the
-server's existing source configuration and database. The current defaults are
-written next to it as `/etc/headliner/sources.yaml.dist`, and the installer
-prints a note when the two differ so you can merge changes such as retired
-feeds:
+`sudo bash deploy/install-ubuntu.sh` from the updated checkout; it keeps the
+database and brings `/etc/headliner/sources.yaml` up to date with the shipped
+`deploy/sources.yaml`, so new sources, groups and retired feeds arrive with
+each deploy. To keep a hand-edited live file instead, pass `--keep-sources`:
+the shipped list is then only written next to it as
+`/etc/headliner/sources.yaml.dist`, with a note when the two differ:
 
 ```bash
+sudo bash deploy/install-ubuntu.sh --keep-sources
 sudo diff -u /etc/headliner/sources.yaml /etc/headliner/sources.yaml.dist
 ```
 
-To adopt the shipped list wholesale, for example after new sources are added,
-rerun the installer with `--update-sources`:
-
-```bash
-sudo bash deploy/install-ubuntu.sh --update-sources
-```
-
-This replaces the live file with the shipped one but keeps its `user_agent`
+The update replaces the live file with the shipped one but keeps its `user_agent`
 line, so your contact address survives. The previous file is saved as
 `sources.yaml.bak-<timestamp>` and the diff is printed. If the result doesn't
 load, the backup is put back and the installer stops. Other local edits are not
@@ -619,7 +614,7 @@ Business Post's advertised feeds return its HTML homepage.
 4. **Deploy.** On the server, after `git pull`:
 
    ```bash
-   sudo bash deploy/install-ubuntu.sh --update-sources
+   sudo bash deploy/install-ubuntu.sh
    ```
 
 `discover` exits `1` when any site had no usable feed, so it can be scripted.
